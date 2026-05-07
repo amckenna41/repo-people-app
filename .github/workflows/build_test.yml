@@ -1,0 +1,147 @@
+name: Building and Testing
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - LICENSE
+      - .gitignore
+      - '**/*.rst'
+  pull_request:
+    branches: [ main ]
+
+  # Allow workflow to be manually initiated from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # Run backend (pytest) tests
+  backend_tests:
+    name: Backend tests (Python ${{ matrix.python-version }})
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          # Install repo-people from GitHub (PyPI release lags behind local version)
+          pip install "repo-people @ git+https://github.com/amckenna41/repo-people.git"
+          pip install pytest pytest-asyncio httpx python-dotenv
+          pip install PyGithub requests beautifulsoup4 aiohttp
+          pip install fastapi uvicorn[standard] sse-starlette aiosqlite
+          # Use cloudrun requirements (no local file:// reference)
+          pip install -r requirements.cloudrun.txt
+
+      - name: Run backend tests
+        run: |
+          export PYTHONPATH=${{ github.workspace }}/backend
+          pytest tests/backend -v
+
+  # Run frontend (vitest) tests
+  frontend_tests:
+    name: Frontend tests (Node.js)
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test
+
+  # Security checks: Bandit and package safety
+  security_check:
+    name: Security check (Bandit + Safety)
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Create artifacts directory
+        run: mkdir artifacts
+
+      - name: Package safety check
+        run: |
+          pip install safety PyGithub requests beautifulsoup4 aiohttp
+          python3 -m safety check > artifacts/package_safety_output.txt
+          cat artifacts/package_safety_output.txt
+        continue-on-error: true
+
+      - name: Bandit security scan
+        run: |
+          pip install bandit
+          python3 -m bandit -r backend -v > artifacts/bandit_output.txt
+          cat artifacts/bandit_output.txt
+        continue-on-error: true
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security_artifacts
+          path: |
+            artifacts/package_safety_output.txt
+            artifacts/bandit_output.txt
+
+  # Python linter (flake8)
+  linter:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install flake8
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Create artifacts directory
+        run: mkdir flake8_artifacts
+
+      - name: Lint with flake8
+        run: |
+          # Fail on syntax errors or undefined names
+          flake8 backend --count --select=E9,F63,F7,F82 --show-source --statistics > flake8_artifacts/flake8_output.txt
+          # Treat all other issues as warnings
+          flake8 backend --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics >> flake8_artifacts/flake8_output.txt
+          cat flake8_artifacts/flake8_output.txt
+        continue-on-error: true
+
+      - name: Upload flake8 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake8_artifact
+          path: flake8_artifacts/flake8_output.txt
+          if-no-files-found: warn

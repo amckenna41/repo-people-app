@@ -1,0 +1,32 @@
+# Cloud Run production Dockerfile
+# Build context: repo root (repo-people-app/)
+# The repo-people package is installed from GitHub since Cloud Run cannot
+# reach the sibling local directory used in development.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps (needed by some transitive packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install repo-people from GitHub source (PyPI release lags behind local version)
+RUN pip install --no-cache-dir \
+    "repo-people @ git+https://github.com/amckenna41/repo-people.git"
+
+# Install backend Python dependencies
+COPY backend/requirements.cloudrun.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend source
+COPY backend/ /app/
+
+# Cloud Run injects $PORT (default 8080). SQLite DB is written to /tmp so it
+# survives within a running container instance (ephemeral across restarts).
+# Set max-instances=1 on the service to avoid split state across containers.
+ENV REPO_PEOPLE_DB=/tmp/repo_people_jobs.db
+
+# Cloud Run expects the container to listen on $PORT
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

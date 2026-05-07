@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply text-gray-100 antialiased;
+    background: radial-gradient(ellipse at 20% 0%, #1e1040 0%, #0d0d1a 50%, #050510 100%);
+    min-height: 100vh;
+  }
+
+  /* Subtle star-field dots */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,0.15) 0%, transparent 100%),
+      radial-gradient(1px 1px at 60% 70%, rgba(255,255,255,0.10) 0%, transparent 100%),
+      radial-gradient(1px 1px at 80% 20%, rgba(255,255,255,0.08) 0%, transparent 100%),
+      radial-gradient(1px 1px at 40% 80%, rgba(255,255,255,0.12) 0%, transparent 100%),
+      radial-gradient(1px 1px at 90% 50%, rgba(255,255,255,0.06) 0%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #root {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl p-4;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 0 0 1px rgba(139,92,246,0.08), 0 4px 24px rgba(0,0,0,0.4);
+    transition: box-shadow 0.2s;
+  }
+  .card:hover {
+    box-shadow: 0 0 0 1px rgba(139,92,246,0.18), 0 8px 32px rgba(139,92,246,0.12);
+  }
+  .btn-primary {
+    @apply font-semibold px-4 py-2 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed text-white;
+    background: linear-gradient(135deg, #7c3aed 0%, #2563eb 60%, #0ea5e9 100%);
+    box-shadow: 0 0 20px rgba(124,58,237,0.35);
+  }
+  .btn-primary:not(:disabled):hover {
+    background: linear-gradient(135deg, #6d28d9 0%, #1d4ed8 60%, #0284c7 100%);
+    box-shadow: 0 0 28px rgba(124,58,237,0.5);
+    transform: translateY(-1px);
+  }
+  .btn-secondary {
+    @apply font-medium px-4 py-2 rounded-lg transition-colors text-gray-200;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.10);
+  }
+  .btn-secondary:hover {
+    background: rgba(255,255,255,0.12);
+  }
+  .input {
+    @apply text-gray-100 rounded-lg px-3 py-2 w-full focus:outline-none placeholder-gray-500;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .input:focus {
+    border-color: rgba(139,92,246,0.6);
+    box-shadow: 0 0 0 3px rgba(139,92,246,0.15);
+  }
+  .badge {
+    @apply text-xs font-medium px-2 py-0.5 rounded-full;
+  }
+
+  .gradient-heading {
+    background: linear-gradient(90deg, #a78bfa 0%, #60a5fa 50%, #34d399 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+}
