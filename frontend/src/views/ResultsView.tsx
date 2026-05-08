@@ -1,10 +1,10 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
 import { fetchResults, fetchSummary, fetchTop, renameJob } from '../utils/api'
 import type { JobInfo, UserRecord, SummaryData } from '../types'
 import { ROLE_COLORS } from '../types'
 import UserTable from '../components/UserTable'
-import UserDrawer from '../components/UserDrawer'
-import WorldMap from '../components/WorldMap'
+const UserDrawer = lazy(() => import('../components/UserDrawer'))
+const WorldMap = lazy(() => import('../components/WorldMap'))
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend,
@@ -1147,7 +1147,9 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
           {/* World Map */}
           {users.length > 0 && (
-            <WorldMap users={users} />
+            <Suspense fallback={null}>
+              <WorldMap users={users} />
+            </Suspense>
           )}
 
           {/* Data table */}
@@ -1261,7 +1263,9 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       {selectedUser && (
         <>
           <div className="fixed inset-0 bg-black/40 z-40" onClick={() => setSelectedUser(null)} />
-          <UserDrawer user={selectedUser} onClose={() => setSelectedUser(null)} />
+          <Suspense fallback={null}>
+            <UserDrawer user={selectedUser} onClose={() => setSelectedUser(null)} />
+          </Suspense>
         </>
       )}
     </div>

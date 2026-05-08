@@ -20,6 +20,11 @@ from worker import run_fetch_job
 
 load_dotenv()
 
+# Maximum users fetchable per job on the hosted service.
+# Set FETCH_LIMIT=0 in .env to disable the cap (local installs).
+_raw_limit = os.environ.get("FETCH_LIMIT", "500")
+FETCH_LIMIT: int = int(_raw_limit) if _raw_limit.isdigit() else 500
+
 app = FastAPI(title="repo-people Explorer API", version="1.0.0")
 
 @app.on_event("startup")
@@ -52,6 +57,11 @@ async def fetch_users(
     token = ""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    # Cap the per-job fetch limit to keep hosting costs bounded.
+    # FETCH_LIMIT=0 disables the cap (local installs only).
+    if FETCH_LIMIT > 0:
+        if req.limit is None or req.limit > FETCH_LIMIT:
+            req.limit = FETCH_LIMIT
     # B4: Await DB insert before starting worker to avoid race condition.
     job_id = await create_job_async()
     background_tasks.add_task(

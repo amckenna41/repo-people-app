@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw } from 'lucide-react'
 import { postFetch, postImport, cancelJob } from '../utils/api'
 import type { JobInfo } from '../types'
@@ -32,6 +32,12 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
   const [repos, setRepos] = useState<{ owner: string; repo: string }[]>([{ owner: '', repo: '' }])
   const [token, setToken] = useState('')
   const [roles, setRoles] = useState<Set<string>>(new Set(ALL_ROLES))
+  // Hosted-service fetch cap — 0 means unlimited (local install).
+  const FETCH_LIMIT = useMemo(() => {
+    const raw = import.meta.env.VITE_FETCH_LIMIT
+    const n = parseInt(raw, 10)
+    return isNaN(n) ? 0 : n
+  }, [])
   const [limit, setLimit] = useState<string>('')
   const [excludeBots, setExcludeBots] = useState(false)
   const [includeSocial, setIncludeSocial] = useState(false)
@@ -218,7 +224,11 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
         owner,
         repo,
         roles: Array.from(roles),
-        limit: limit ? parseInt(limit, 10) : null,
+        limit: (() => {
+          const val = limit ? parseInt(limit, 10) : null
+          if (FETCH_LIMIT > 0) return (!val || val > FETCH_LIMIT) ? FETCH_LIMIT : val
+          return val
+        })(),
         exclude_bots: excludeBots,
         include_social_accounts: includeSocial,
         save_each_user: saveEachUser,
@@ -508,16 +518,42 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
         {/* Limit + workers row */}
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Limit per role (optional)</label>
+            <label className="block text-sm text-gray-400 mb-1">
+              Limit per role
+              {FETCH_LIMIT > 0 && (
+                <span className="ml-1.5 text-xs text-amber-400">(max {FETCH_LIMIT} on hosted app)</span>
+              )}
+            </label>
             <input
               type="number"
               className="input"
-              placeholder="No limit"
+              placeholder={FETCH_LIMIT > 0 ? `Max ${FETCH_LIMIT}` : 'No limit'}
               value={limit}
-              onChange={e => setLimit(e.target.value)}
+              onChange={e => {
+                const val = e.target.value
+                if (FETCH_LIMIT > 0 && val && parseInt(val, 10) > FETCH_LIMIT) {
+                  setLimit(String(FETCH_LIMIT))
+                } else {
+                  setLimit(val)
+                }
+              }}
               min={1}
+              max={FETCH_LIMIT > 0 ? FETCH_LIMIT : undefined}
               disabled={running}
             />
+            {FETCH_LIMIT > 0 && (
+              <p className="mt-1 text-xs text-gray-500">
+                Need more?{' '}
+                <a
+                  href="https://github.com/amckenna41/repo-people-app#local-development"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-brand-400 hover:underline"
+                >
+                  Run the app locally
+                </a>{' '}for unlimited fetches.
+              </p>
+            )}
           </div>
           <div>
             <label className="block text-sm text-gray-400 mb-1">Workers: {workers}</label>
