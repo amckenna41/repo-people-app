@@ -149,3 +149,9 @@ old/
 .venv
 
 __pycache__/
+
+.env
+
+ToDo.md
+
+node_modules/

@@ -51,6 +51,17 @@ async def _db():
             await conn.execute("ALTER TABLE jobs ADD COLUMN tags TEXT DEFAULT '[]'")
         except Exception:
             pass  # Column already exists
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id   TEXT PRIMARY KEY,
+                github_token TEXT NOT NULL,
+                github_login TEXT NOT NULL,
+                github_name  TEXT,
+                github_avatar TEXT,
+                created_at   TEXT DEFAULT (datetime('now')),
+                expires_at   TEXT NOT NULL
+            )
+        """)
         await conn.commit()
         yield conn
 
@@ -314,6 +325,41 @@ async def set_job_tags(job_id: str, tags: list[str]) -> bool:
     return True
 
 
+async def clear_summary_caches(job_id: str | None = None) -> int:
+    """Wipe cached summary_json from the DB for one or all jobs.
+
+    Returns the number of rows updated.
+    Intended for development / testing use only.
+    """
+    async with _db() as conn:
+        if job_id is not None:
+            cur = await conn.execute(
+                "UPDATE jobs SET summary_json = NULL WHERE job_id = ? AND summary_json IS NOT NULL",
+                (job_id,),
+            )
+        else:
+            cur = await conn.execute(
+                "UPDATE jobs SET summary_json = NULL WHERE summary_json IS NOT NULL"
+            )
+        cleared = cur.rowcount
+        await conn.commit()
+    return cleared
+
+
+async def clear_all_jobs() -> int:
+    """Delete every job from the DB and clear the runtime overlay.
+
+    Returns the number of rows deleted.
+    Intended for development / testing use only.
+    """
+    _runtime.clear()
+    async with _db() as conn:
+        cur = await conn.execute("DELETE FROM jobs")
+        deleted = cur.rowcount
+        await conn.commit()
+    return deleted
+
+
 def result_to_csv_bytes(result: dict[str, Any]) -> bytes:
     if not result:
         return b""
@@ -333,3 +379,48 @@ def result_to_csv_bytes(result: dict[str, Any]) -> bytes:
             row[k] = json.dumps(v) if isinstance(v, (list, dict)) else (v if v is not None else "")
         writer.writerow(row)
     return buf.getvalue().encode()
+
+
+# ---------------------------------------------------------------------------
+# Session store (OAuth)
+# ---------------------------------------------------------------------------
+
+async def create_session(
+    session_id: str,
+    token: str,
+    login: str,
+    name: str | None,
+    avatar: str | None,
+    ttl_days: int = 30,
+) -> None:
+    """Persist a new OAuth session. Expires after *ttl_days* days."""
+    from datetime import datetime, timedelta
+    expires_at = (datetime.utcnow() + timedelta(days=ttl_days)).isoformat()
+    async with _db() as conn:
+        await conn.execute(
+            """INSERT OR REPLACE INTO sessions
+               (session_id, github_token, github_login, github_name, github_avatar, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, token, login, name, avatar, expires_at),
+        )
+        await conn.commit()
+
+
+async def get_session(session_id: str) -> dict[str, Any] | None:
+    """Return a valid, non-expired session dict, or None."""
+    async with _db() as conn:
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime('now')",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+async def delete_session(session_id: str) -> None:
+    """Delete a session (logout)."""
+    async with _db() as conn:
+        await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await conn.commit()

@@ -5,8 +5,8 @@ import ResultsView from './views/ResultsView'
 import CompareView from './views/CompareView'
 import GlobalSearchModal from './components/GlobalSearchModal'
 import ErrorBoundary from './components/ErrorBoundary'
-import type { JobInfo, UserRecord, View } from './types'
-import { fetchJobs, deleteJob, updateJobTags } from './utils/api'
+import type { JobInfo, UserRecord, View, AuthUser } from './types'
+import { fetchJobs, deleteJob, updateJobTags, invalidateJobCache, fetchAuthMe, logoutAuth, openAuthPopup, fetchSharedJob } from './utils/api'
 
 function HelpModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
@@ -49,7 +49,23 @@ function HelpModal({ onClose }: { onClose: () => void }) {
         'Charts — role distribution bar chart and account age pie chart',
         'Top 10 leaderboard — rank users by followers, repos, account age, or stars',
         'Full data table — sort and filter by any column, click a row to open a detail drawer',
-        'Export — download the full dataset as JSON or CSV using the buttons top-right',
+        'Overlap analysis — role co-occurrence and community health score',
+        'Geographic world map — see where contributors are located globally',
+        'Email domain and social presence analysis by role',
+        'Shareable URL — copy a 24-hour read link to share results with teammates',
+        'Export — download the full dataset as JSON, CSV, Markdown, or PDF',
+      ],
+    },
+    {
+      icon: <Github size={20} />,
+      color: '#6366f1',
+      title: 'Sign in with GitHub (OAuth)',
+      desc: 'Sign in once and fetch data without managing tokens manually.',
+      bullets: [
+        'Click \"Sign in\" in the top-right header to open the GitHub OAuth popup',
+        'Authorise the app — your session is stored securely server-side for 30 days',
+        'No token copy-paste needed — the backend uses your session automatically',
+        'Sign out at any time using the button next to your avatar',
       ],
     },
     {
@@ -184,6 +200,7 @@ export default function App() {
   const [showHelp, setShowHelp] = useState(false)
   const [showGlobalSearch, setShowGlobalSearch] = useState(false)
   const [allJobUsers, setAllJobUsers] = useState<Record<string, UserRecord[]>>({})
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null)
 
   // Persist jobs to localStorage whenever they change
   useEffect(() => {
@@ -202,6 +219,51 @@ export default function App() {
     }
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  // On mount: check OAuth session
+  useEffect(() => {
+    fetchAuthMe().then(user => setAuthUser(user)).catch(() => {})
+  }, [])
+
+  // On mount: handle shared job links (#share=TOKEN)
+  useEffect(() => {
+    const hash = window.location.hash
+    if (!hash.startsWith('#share=')) return
+    const token = hash.slice('#share='.length)
+    if (!token) return
+    fetchSharedJob(token, 1, 200).then(data => {
+      const tempId = `shared-${token.slice(0, 8)}`
+      const newJob: JobInfo = {
+        job_id: tempId,
+        status: 'done',
+        label: data.job_label || `Shared result`,
+        total_fetched: data.total,
+        timestamp: new Date().toISOString(),
+        tags: [],
+      }
+      setJobs(prev => [...prev, newJob])
+      setActiveJobId(tempId)
+      setAllJobUsers(prev => ({
+        ...prev,
+        [tempId]: Object.values(data.users) as UserRecord[],
+      }))
+      setView('results')
+      window.location.hash = 'results'
+    }).catch(() => { /* invalid/expired token — ignore */ })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Listen for the popup signalling that OAuth completed.
+  useEffect(() => {
+    function onMessage(e: MessageEvent) {
+      if (e.origin !== window.location.origin) return
+      if (e.data?.type === 'oauth-success') {
+        fetchAuthMe().then(user => setAuthUser(user)).catch(() => {})
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
   }, [])
 
   // On mount: reconcile with backend to validate saved jobs
@@ -252,6 +314,7 @@ export default function App() {
 
   function removeJob(job_id: string) {
     deleteJob(job_id).catch(() => {})
+    invalidateJobCache(job_id)
     setJobs(prev => prev.filter(j => j.job_id !== job_id))
     setAllJobUsers(prev => { const next = { ...prev }; delete next[job_id]; return next })
     if (activeJobId === job_id) {
@@ -347,6 +410,37 @@ export default function App() {
               <span className="hidden sm:inline text-xs">Search users</span>
               <kbd className="hidden sm:inline text-xs px-1 py-0.5 rounded opacity-50" style={{ background: 'rgba(255,255,255,0.08)' }}>⌘K</kbd>
             </button>
+            {/* GitHub OAuth auth button */}
+            {authUser ? (
+              <div className="flex items-center gap-1.5">
+                {authUser.avatar_url && (
+                  <img
+                    src={authUser.avatar_url}
+                    alt={authUser.login}
+                    className="w-7 h-7 rounded-full"
+                    style={{ border: '1px solid rgba(139,92,246,0.4)' }}
+                  />
+                )}
+                <span className="hidden sm:inline text-xs text-gray-300">@{authUser.login}</span>
+                <button
+                  onClick={() => logoutAuth().then(() => setAuthUser(null))}
+                  title="Sign out"
+                  className="text-xs text-gray-500 hover:text-red-400 transition-colors px-1"
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => openAuthPopup()}
+                title="Sign in with GitHub"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-gray-300 hover:text-white transition-all"
+                style={{ background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(139,92,246,0.25)' }}
+              >
+                <Github size={14} />
+                <span className="hidden sm:inline text-xs">Sign in</span>
+              </button>
+            )}
             <button
               onClick={() => setShowHelp(true)}
               title="How to use"
@@ -375,10 +469,12 @@ export default function App() {
         <div className={view !== 'fetch' ? 'hidden' : ''}>
           <ErrorBoundary>
             <FetchView
+              jobs={jobs}
               onJobCreated={addJob}
               onJobUpdate={updateJob}
               onViewResults={() => setView('results')}
               onGroupJobIds={handleGroupJobIds}
+              authUser={authUser}
             />
           </ErrorBoundary>
         </div>

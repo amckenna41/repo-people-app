@@ -96,6 +96,12 @@ export interface MultiCompareResult {
 
 export type View = 'fetch' | 'results' | 'compare'
 
+export interface AuthUser {
+  login: string
+  name: string | null
+  avatar_url: string | null
+}
+
 export const ALL_ROLES = [
   'contributors',
   'maintainers',

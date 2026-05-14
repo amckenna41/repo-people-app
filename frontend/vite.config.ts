@@ -28,6 +28,9 @@ export default defineConfig({
       '/compare': 'http://localhost:8000',
       '/jobs': 'http://localhost:8000',
       '/import': 'http://localhost:8000',
+      '/clear_cache': 'http://localhost:8000',
+      '/auth': 'http://localhost:8000',
+      '/share': 'http://localhost:8000',
     },
   },
 })

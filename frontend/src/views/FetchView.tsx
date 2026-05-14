@@ -1,15 +1,18 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw } from 'lucide-react'
-import { postFetch, postImport, cancelJob } from '../utils/api'
-import type { JobInfo } from '../types'
+import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, Github, RefreshCw } from 'lucide-react'
+import { postFetch, postImport, cancelJob, openAuthPopup } from '../utils/api'
+import { friendlyFetchError } from '../utils/errors'
+import type { JobInfo, AuthUser } from '../types'
 import { ALL_ROLES, ROLE_COLORS } from '../types'
 import { useNotification } from '../hooks/useNotification'
 
 interface Props {
+  jobs: JobInfo[]
   onJobCreated: (job: JobInfo) => void
   onJobUpdate: (job_id: string, patch: Partial<JobInfo>) => void
   onViewResults: () => void
   onGroupJobIds: (ids: string[]) => void
+  authUser?: AuthUser | null
 }
 
 interface ProgressEvent {
@@ -18,20 +21,54 @@ interface ProgressEvent {
   login: string | null
   eta_seconds: number | null
   rate_limit_remaining: number | null
+  rate_limit_reset: number | null
 }
 
 interface LogLine {
   text: string
   ts: number
+  isWarning?: boolean
 }
 
 const MAX_REPOS = 5
+const MAX_HISTORY = 10
+const HISTORY_KEY = 'repo-people-search-history'
 
-export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, onGroupJobIds }: Props) {
+type HistoryEntry = { owner: string; repo: string }
+
+function loadHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch { return [] }
+}
+
+function saveHistory(entry: HistoryEntry, prev: HistoryEntry[]): HistoryEntry[] {
+  const deduped = prev.filter(h => !(h.owner === entry.owner && h.repo === entry.repo))
+  const next = [entry, ...deduped].slice(0, MAX_HISTORY)
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(next)) } catch { /* storage full */ }
+  return next
+}
+
+/** How old a completed job can be before we stop warning about re-fetching (ms). */
+const RECENT_FETCH_THRESHOLD_MS = 10 * 60 * 1000 // 10 minutes
+
+interface RecentMatch {
+  owner: string
+  repo: string
+  label: string
+  totalFetched: number
+  ageMs: number
+}
+
+export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResults, onGroupJobIds, authUser }: Props) {
   const { notify } = useNotification()
   const [repos, setRepos] = useState<{ owner: string; repo: string }[]>([{ owner: '', repo: '' }])
   const [token, setToken] = useState('')
   const [roles, setRoles] = useState<Set<string>>(new Set(ALL_ROLES))
+  const [searchHistory, setSearchHistory] = useState<HistoryEntry[]>(loadHistory)
+  const [showHistory, setShowHistory] = useState(false)
+  const historyRef = useRef<HTMLDivElement>(null)
   // Hosted-service fetch cap — 0 means unlimited (local install).
   const FETCH_LIMIT = useMemo(() => {
     const raw = import.meta.env.VITE_FETCH_LIMIT
@@ -53,6 +90,8 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
   const [done, setDone] = useState(false)
   const [showTokenModal, setShowTokenModal] = useState(false)
   const [elapsed, setElapsed] = useState(0)
+  const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([])
+  const [pendingToken, setPendingToken] = useState<string>('')
 
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
@@ -85,6 +124,16 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
       logRef.current.scrollTop = logRef.current.scrollHeight
     }
   }, [log])
+
+  useEffect(() => {
+    function onPointerDown(e: PointerEvent) {
+      if (historyRef.current && !historyRef.current.contains(e.target as Node)) {
+        setShowHistory(false)
+      }
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [])
 
   useEffect(() => {
     if (running) {
@@ -250,6 +299,11 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
             setLog(prev => [...prev, { text: `${prefix}${data.message}`, ts: Date.now() }])
           })
 
+          es.addEventListener('warning', (ev) => {
+            const data = JSON.parse(ev.data)
+            setLog(prev => [...prev, { text: `${prefix}${data.message}`, ts: Date.now(), isWarning: true }])
+          })
+
           es.addEventListener('progress', (ev) => {
             const data: ProgressEvent = JSON.parse(ev.data)
             setProgress(data)
@@ -260,7 +314,8 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
 
           es.addEventListener('error', (ev) => {
             const data = JSON.parse((ev as MessageEvent).data)
-            setLog(prev => [...prev, { text: `${prefix}Error: ${data.message}`, ts: Date.now() }])
+            const friendly = friendlyFetchError(data.message ?? '', owner, repo)
+            setLog(prev => [...prev, { text: `${prefix}Error: ${friendly}`, ts: Date.now() }])
             onJobUpdate(job_id, { status: 'error' })
             repoDone = true
             es.close()
@@ -274,6 +329,7 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
             es.close()
             currentResolveRef.current = null
             onJobUpdate(job_id, { status: 'done', total_fetched: data.total ?? 0 })
+            setSearchHistory(prev => saveHistory({ owner, repo }, prev))
             setLog(prev => [...prev, { text: `${prefix}Done: ${owner}/${repo} — ${data.total ?? 0} users fetched`, ts: Date.now() }])
             notify(stoppingRef.current ? `Fetch stopped: ${owner}/${repo}` : `Fetch complete: ${owner}/${repo}`, {
               body: `${data.total ?? 0} users fetched successfully.`,
@@ -302,7 +358,8 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
 
         connectSSE()
       }).catch(err => {
-        setLog(prev => [...prev, { text: `${prefix}Failed to start ${owner}/${repo}: ${err instanceof Error ? err.message : String(err)}`, ts: Date.now() }])
+        const msg = err instanceof Error ? err.message : String(err)
+        setLog(prev => [...prev, { text: `${prefix}Failed to start ${owner}/${repo}: ${friendlyFetchError(msg, owner, repo)}`, ts: Date.now() }])
         resolve(null)
       })
     })
@@ -347,12 +404,53 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
       setError('Please enter at least one repository owner and repository name.')
       return
     }
-    if (!token) {
+    // When logged in via OAuth, the backend uses the session token automatically.
+    if (!token && !authUser) {
       setShowTokenModal(true)
       return
     }
 
-    await runAllFetches(token)
+    const resolvedToken = authUser ? '' : token
+
+    // Check if any of the valid repos have a recent completed job (< 10 min old).
+    const now = Date.now()
+    const matches: RecentMatch[] = []
+    for (const { owner, repo } of valid) {
+      const label = `${owner.trim()}/${repo.trim()}`
+      const recent = jobs
+        .filter(j => j.status === 'done' && (j.label ?? '').toLowerCase() === label.toLowerCase())
+        .map(j => ({ job: j, ts: new Date(j.created_at ?? j.timestamp ?? 0).getTime() }))
+        .find(({ ts }) => now - ts < RECENT_FETCH_THRESHOLD_MS)
+      if (recent) {
+        matches.push({
+          owner: owner.trim(),
+          repo: repo.trim(),
+          label,
+          totalFetched: recent.job.total_fetched,
+          ageMs: now - recent.ts,
+        })
+      }
+    }
+
+    if (matches.length > 0) {
+      setRecentMatches(matches)
+      setPendingToken(resolvedToken)
+      return
+    }
+
+    await runAllFetches(resolvedToken)
+  }
+
+  function confirmRefetch() {
+    const t = pendingToken
+    setRecentMatches([])
+    setPendingToken('')
+    runAllFetches(t)
+  }
+
+  function cancelRefetch() {
+    setRecentMatches([])
+    setPendingToken('')
   }
 
   function continueWithoutToken() {
@@ -370,6 +468,16 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
   const progressPct = progress && progress.total > 0
     ? Math.round((progress.fetched / progress.total) * 100)
     : 0
+
+  function rateLimitLabel(progress: ProgressEvent | null): string | null {
+    if (!progress || progress.rate_limit_remaining === null) return null
+    const rem = progress.rate_limit_remaining
+    if (progress.rate_limit_reset) {
+      const mins = Math.max(0, Math.round((progress.rate_limit_reset * 1000 - Date.now()) / 60000))
+      return `${rem.toLocaleString()} API calls left · resets in ${mins}m`
+    }
+    return `${rem.toLocaleString()} API calls left`
+  }
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -443,43 +551,143 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
               <span className="text-xs text-gray-600 ml-0.5">({repos.length}/{MAX_REPOS})</span>
             </button>
           )}
+
+          {/* Search history dropdown */}
+          {searchHistory.length > 0 && !running && (
+            <div ref={historyRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setShowHistory(v => !v)}
+                className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+              >
+                <History size={13} />
+                Recent searches
+              </button>
+              {showHistory && (
+                <div
+                  className="absolute left-0 top-full mt-1 rounded-lg z-30 py-1 min-w-64"
+                  style={{
+                    background: 'rgba(14,10,36,0.97)',
+                    border: '1px solid rgba(139,92,246,0.3)',
+                    boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                    backdropFilter: 'blur(12px)',
+                  }}
+                >
+                  <div className="flex items-center justify-between px-3 py-1.5 border-b" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+                    <span className="text-xs text-gray-500">Recently searched</span>
+                    <button
+                      type="button"
+                      className="text-xs text-gray-600 hover:text-red-400 transition-colors"
+                      onClick={() => {
+                        setSearchHistory([])
+                        try { localStorage.removeItem(HISTORY_KEY) } catch { /* ignore */ }
+                        setShowHistory(false)
+                      }}
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  {searchHistory.map((h, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      className="w-full text-left px-3 py-2 text-sm flex items-center gap-2 transition-colors"
+                      style={{ color: '#d1d5db' }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.12)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                      onPointerDown={e => {
+                        e.preventDefault()
+                        setRepos([{ owner: h.owner, repo: h.repo }])
+                        setShowHistory(false)
+                      }}
+                    >
+                      <History size={11} className="text-gray-600 flex-shrink-0" />
+                      <span className="font-mono text-xs text-purple-300">{h.owner}</span>
+                      <span className="text-gray-600">/</span>
+                      <span className="font-mono text-xs text-blue-300">{h.repo}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Token */}
         <div>
-          <div className="flex items-center gap-1.5 mb-1">
-            <label className="text-sm text-gray-400">GitHub Personal Access Token</label>
-            <div className="relative group">
-              <Info size={13} className="text-gray-500 hover:text-gray-300 cursor-default transition-colors" />
-              <div
-                className="pointer-events-none absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-72 rounded-xl p-3 text-xs text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
-                style={{
-                  background: 'rgba(15,12,35,0.97)',
-                  border: '1px solid rgba(139,92,246,0.3)',
-                  boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-                }}
-              >
-                <p className="font-semibold text-white mb-1.5 flex items-center gap-1"><Key size={11} /> How to get a token</p>
-                <ol className="space-y-1 text-gray-400">
-                  <li><span className="text-purple-400 font-bold">1.</span> Go to <span className="text-blue-400">github.com/settings/tokens/new</span></li>
-                  <li><span className="text-purple-400 font-bold">2.</span> Give it a name &amp; set an expiry</li>
-                  <li><span className="text-purple-400 font-bold">3.</span> Select the <code className="bg-white/10 px-1 rounded">public_repo</code> scope</li>
-                  <li><span className="text-purple-400 font-bold">4.</span> Click <strong className="text-white">Generate token</strong> and paste it here</li>
-                </ol>
-                <p className="mt-1.5 text-gray-500">A token raises the rate limit from 60 to 5,000 req/hr.</p>
+          {authUser ? (
+            /* OAuth connected — token is handled server-side */
+            <div
+              className="flex items-center gap-3 p-3 rounded-xl"
+              style={{
+                background: 'rgba(16,185,129,0.08)',
+                border: '1px solid rgba(16,185,129,0.25)',
+              }}
+            >
+              {authUser.avatar_url && (
+                <img
+                  src={authUser.avatar_url}
+                  alt={authUser.login}
+                  className="w-8 h-8 rounded-full flex-shrink-0"
+                  style={{ border: '1px solid rgba(16,185,129,0.4)' }}
+                />
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-emerald-300 flex items-center gap-1.5">
+                  <Github size={13} />
+                  Signed in as <span className="font-semibold">@{authUser.login}</span>
+                </p>
+                <p className="text-xs text-gray-500 mt-0.5">Your GitHub token is used automatically — no PAT needed.</p>
               </div>
             </div>
-          </div>
-          <input
-            type="password"
-            className="input"
-            placeholder="ghp_••••••••••••••••••••"
-            value={token}
-            onChange={e => setToken(e.target.value.replace(/[^\x20-\x7E]/g, '').trim())}
-            disabled={running}
-            autoComplete="off"
-          />
-          <p className="text-xs text-gray-500 mt-1">Token is sent to your local backend only and never stored.</p>
+          ) : (
+            /* Not logged in — show PAT input */
+            <>
+              <div className="flex items-center gap-1.5 mb-1">
+                <label className="text-sm text-gray-400">GitHub Personal Access Token</label>
+                <div className="relative group">
+                  <Info size={13} className="text-gray-500 hover:text-gray-300 cursor-default transition-colors" />
+                  <div
+                    className="pointer-events-none absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-72 rounded-xl p-3 text-xs text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
+                    style={{
+                      background: 'rgba(15,12,35,0.97)',
+                      border: '1px solid rgba(139,92,246,0.3)',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                    }}
+                  >
+                    <p className="font-semibold text-white mb-1.5 flex items-center gap-1"><Key size={11} /> How to get a token</p>
+                    <ol className="space-y-1 text-gray-400">
+                      <li><span className="text-purple-400 font-bold">1.</span> Go to <span className="text-blue-400">github.com/settings/tokens/new</span></li>
+                      <li><span className="text-purple-400 font-bold">2.</span> Give it a name &amp; set an expiry</li>
+                      <li><span className="text-purple-400 font-bold">3.</span> Select the <code className="bg-white/10 px-1 rounded">public_repo</code> scope</li>
+                      <li><span className="text-purple-400 font-bold">4.</span> Click <strong className="text-white">Generate token</strong> and paste it here</li>
+                    </ol>
+                    <p className="mt-1.5 text-gray-500">A token raises the rate limit from 60 to 5,000 req/hr.</p>
+                  </div>
+                </div>
+              </div>
+              <input
+                type="password"
+                className="input"
+                placeholder="ghp_••••••••••••••••••••"
+                value={token}
+                onChange={e => setToken(e.target.value.replace(/[^\x20-\x7E]/g, '').trim())}
+                disabled={running}
+                autoComplete="off"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Or{' '}
+                <button
+                  type="button"
+                  onClick={() => openAuthPopup()}
+                  className="text-purple-400 hover:text-purple-300 transition-colors"
+                >
+                  sign in with GitHub
+                </button>
+                {' '}to use your account automatically. Token is sent to your local backend only and never stored.
+              </p>
+            </>
+          )}
         </div>
 
         {/* Roles */}
@@ -524,10 +732,45 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
                 <span className="ml-1.5 text-xs text-amber-400">(max {FETCH_LIMIT} on hosted app)</span>
               )}
             </label>
+            {/* Quick-select presets */}
+            <div className="flex gap-1.5 mb-2 flex-wrap">
+              {(FETCH_LIMIT > 0
+                ? [50, 100, FETCH_LIMIT]
+                : [50, 200, 500]
+              ).map(n => (
+                <button
+                  key={n}
+                  type="button"
+                  disabled={running}
+                  onClick={() => setLimit(String(n))}
+                  className="text-xs px-2.5 py-1 rounded-md transition-colors disabled:opacity-40"
+                  style={{
+                    background: limit === String(n) ? 'rgba(139,92,246,0.25)' : 'rgba(255,255,255,0.06)',
+                    border: `1px solid ${limit === String(n) ? 'rgba(139,92,246,0.6)' : 'rgba(255,255,255,0.10)'}`,
+                    color: limit === String(n) ? '#c4b5fd' : '#9ca3af',
+                  }}
+                >
+                  Top {n}
+                </button>
+              ))}
+              <button
+                type="button"
+                disabled={running}
+                onClick={() => setLimit('')}
+                className="text-xs px-2.5 py-1 rounded-md transition-colors disabled:opacity-40"
+                style={{
+                  background: limit === '' ? 'rgba(139,92,246,0.25)' : 'rgba(255,255,255,0.06)',
+                  border: `1px solid ${limit === '' ? 'rgba(139,92,246,0.6)' : 'rgba(255,255,255,0.10)'}`,
+                  color: limit === '' ? '#c4b5fd' : '#9ca3af',
+                }}
+              >
+                All
+              </button>
+            </div>
             <input
               type="number"
               className="input"
-              placeholder={FETCH_LIMIT > 0 ? `Max ${FETCH_LIMIT}` : 'No limit'}
+              placeholder="Custom…"
               value={limit}
               onChange={e => {
                 const val = e.target.value
@@ -617,7 +860,19 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
         {error && (
           <div className="flex items-start gap-2 text-red-400 bg-red-950 border border-red-800 rounded-lg p-3 text-sm">
             <AlertCircle size={16} className="mt-0.5 shrink-0" />
-            {error}
+            <div>
+              <p className="font-medium">{error}</p>
+              {error.toLowerCase().includes('rate limit') && (
+                <p className="text-xs text-red-300 mt-1">
+                  Add a PAT in the field above, or reduce the worker count and retry.
+                </p>
+              )}
+              {(error.toLowerCase().includes('not found') || error.toLowerCase().includes('check the owner')) && (
+                <p className="text-xs text-red-300 mt-1">
+                  Double-check the spelling at github.com/{repos[0]?.owner}/{repos[0]?.repo}
+                </p>
+              )}
+            </div>
           </div>
         )}
 
@@ -691,7 +946,9 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
                     <span>ETA: {formatTime(progress.eta_seconds)}</span>
                   )}
                   {progress.rate_limit_remaining != null && (
-                    <span>RL: {progress.rate_limit_remaining}</span>
+                    <span style={{ color: progress.rate_limit_remaining < 100 ? '#fbbf24' : '#6b7280' }}>
+                      {rateLimitLabel(progress)}
+                    </span>
                   )}
                 </span>
               </div>
@@ -705,7 +962,7 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
             style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(52,211,153,0.15)' }}
           >
             {log.map((l, i) => (
-              <div key={i}>{l.text}</div>
+              <div key={i} style={l.isWarning ? { color: '#fbbf24' } : undefined}>{l.text}</div>
             ))}
             {running && <div className="text-brand-400 animate-pulse">▋</div>}
           </div>
@@ -779,6 +1036,106 @@ export default function FetchView({ onJobCreated, onJobUpdate, onViewResults, on
           </div>
         )}
       </div>
+
+      {/* Recent-fetch confirmation modal */}
+      {recentMatches.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }}
+          onClick={cancelRefetch}
+        >
+          <div
+            className="relative w-full max-w-md rounded-2xl p-6 space-y-4"
+            style={{
+              background: 'rgba(14,10,32,0.97)',
+              border: '1px solid rgba(251,191,36,0.35)',
+              boxShadow: '0 0 40px rgba(251,191,36,0.15), 0 24px 48px rgba(0,0,0,0.6)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-start gap-3">
+              <div
+                className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center mt-0.5"
+                style={{ background: 'rgba(251,191,36,0.12)', border: '1px solid rgba(251,191,36,0.25)' }}
+              >
+                <RefreshCw size={18} style={{ color: '#fbbf24' }} />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">Recent results exist</h3>
+                <p className="text-sm text-gray-400 mt-0.5">
+                  {recentMatches.length === 1
+                    ? 'You already have fresh results for this repository.'
+                    : `You already have fresh results for ${recentMatches.length} of these repositories.`}
+                </p>
+              </div>
+              <button
+                onClick={cancelRefetch}
+                className="ml-auto shrink-0 p-1.5 rounded-lg text-gray-500 hover:text-white transition-colors"
+                style={{ background: 'rgba(255,255,255,0.06)' }}
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            {/* Matched repos */}
+            <div className="space-y-2">
+              {recentMatches.map((m) => {
+                const mins = Math.floor(m.ageMs / 60000)
+                const secs = Math.floor((m.ageMs % 60000) / 1000)
+                const age = mins > 0 ? `${mins}m ${secs}s ago` : `${secs}s ago`
+                return (
+                  <div
+                    key={m.label}
+                    className="flex items-center justify-between rounded-lg px-3 py-2 text-sm"
+                    style={{ background: 'rgba(251,191,36,0.07)', border: '1px solid rgba(251,191,36,0.15)' }}
+                  >
+                    <span className="font-mono text-gray-200">{m.label}</span>
+                    <span className="text-xs text-gray-500 shrink-0 ml-3">
+                      {m.totalFetched.toLocaleString()} users · {age}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+
+            <p className="text-xs text-gray-500">
+              Fetching again will create a new job and may use significant API quota.
+            </p>
+
+            {/* Actions */}
+            <div className="flex gap-3 pt-1">
+              <button
+                onClick={cancelRefetch}
+                className="btn-secondary flex-1"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { cancelRefetch(); onViewResults() }}
+                className="flex-1 flex items-center justify-center gap-2 rounded-xl py-2.5 px-4 text-sm font-semibold text-white transition-all"
+                style={{
+                  background: 'linear-gradient(135deg, rgba(99,102,241,0.25), rgba(139,92,246,0.15))',
+                  border: '1px solid rgba(139,92,246,0.4)',
+                }}
+              >
+                View results
+              </button>
+              <button
+                onClick={confirmRefetch}
+                className="flex-1 flex items-center justify-center gap-2 rounded-xl py-2.5 px-4 text-sm font-semibold text-white transition-all"
+                style={{
+                  background: 'linear-gradient(135deg, rgba(251,191,36,0.25), rgba(251,191,36,0.15))',
+                  border: '1px solid rgba(251,191,36,0.4)',
+                }}
+              >
+                <RefreshCw size={14} />
+                Fetch anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Token missing modal */}
       {showTokenModal && (

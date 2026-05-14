@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
-import { fetchResults, fetchSummary, fetchTop, renameJob } from '../utils/api'
+import { fetchResults, fetchResultsPage, fetchSummary, fetchTop, renameJob, createShareToken } from '../utils/api'
 import type { JobInfo, UserRecord, SummaryData } from '../types'
 import { ROLE_COLORS } from '../types'
 import UserTable from '../components/UserTable'
@@ -7,9 +7,9 @@ const UserDrawer = lazy(() => import('../components/UserDrawer'))
 const WorldMap = lazy(() => import('../components/WorldMap'))
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend,
+  PieChart, Pie, Cell, Legend, AreaChart, Area,
 } from 'recharts'
-import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock } from 'lucide-react'
+import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock, Layers, TrendingUp, Link } from 'lucide-react'
 
 interface Props {
   jobs: JobInfo[]
@@ -54,7 +54,13 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const [topBy, setTopBy] = useState('followers')
   const [selectedUser, setSelectedUser] = useState<UserRecord | null>(null)
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [currentPage, setCurrentPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalUsers, setTotalUsers] = useState(0)
   const [exporting, setExporting] = useState(false)
+  const [shareLoading, setShareLoading] = useState(false)
+  const [shareCopied, setShareCopied] = useState(false)
   const [showRoleExport, setShowRoleExport] = useState(false)
   const [exportPickerFormat, setExportPickerFormat] = useState<'json' | 'csv' | 'xlsx' | null>(null)
   const [exportPickerFields, setExportPickerFields] = useState<string[]>([])
@@ -143,11 +149,20 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     setLoading(true)
     setError(null)
     setTopUsers([])
+    setCurrentPage(1)
+    setTotalPages(1)
+    setTotalUsers(0)
     try {
-      const [result, sum] = await Promise.all([fetchResults(jobId), fetchSummary(jobId)])
-      const vals = result && typeof result === 'object' ? Object.values(result) : []
-      const loadedUsers = Array.isArray(vals) ? vals as UserRecord[] : []
+      // Load first page immediately for fast render; summary fetched in parallel.
+      const [pageData, sum] = await Promise.all([
+        fetchResultsPage(jobId, 1, 200),
+        fetchSummary(jobId),
+      ])
+      const loadedUsers = Object.values(pageData.users) as UserRecord[]
       setUsers(loadedUsers)
+      setCurrentPage(1)
+      setTotalPages(pageData.pages)
+      setTotalUsers(pageData.total)
       setSummary(sum)
       onUsersLoaded?.(jobId, loadedUsers)
       await loadTop(jobId, topBy)
@@ -158,12 +173,47 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     }
   }
 
+  async function loadMoreUsers() {
+    if (!activeJobId || loadingMore || currentPage >= totalPages) return
+    setLoadingMore(true)
+    try {
+      const nextPage = currentPage + 1
+      const pageData = await fetchResultsPage(activeJobId, nextPage, 200)
+      const newUsers = Object.values(pageData.users) as UserRecord[]
+      setUsers(prev => {
+        const combined = [...prev, ...newUsers]
+        onUsersLoaded?.(activeJobId!, combined)
+        return combined
+      })
+      setCurrentPage(nextPage)
+    } catch (_) {
+      // non-fatal
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
   async function loadTop(jobId: string, by: string) {
     try {
       const top = await fetchTop(jobId, by, 10)
       setTopUsers(Array.isArray(top) ? top : [])
     } catch (_) {
       // non-fatal
+    }
+  }
+
+  async function handleShare() {
+    if (!activeJobId) return
+    setShareLoading(true)
+    try {
+      const { url } = await createShareToken(activeJobId)
+      await navigator.clipboard.writeText(url)
+      setShareCopied(true)
+      setTimeout(() => setShareCopied(false), 3000)
+    } catch (_) {
+      // non-fatal — clipboard may be blocked
+    } finally {
+      setShareLoading(false)
     }
   }
 
@@ -489,11 +539,71 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     return { rows, signals: SIGNALS }
   }, [users])
 
+  // Overlap analysis — users that appear in 2+ roles are the most engaged.
+  const overlapData = useMemo(() => {
+    const multiRole = users
+      .filter(u => (u.roles?.length ?? 0) >= 2)
+      .sort((a, b) => (b.roles?.length ?? 0) - (a.roles?.length ?? 0))
+    // Role pair co-occurrence matrix for the heatmap data
+    const pairCounts: Record<string, number> = {}
+    users.forEach(u => {
+      const roles = u.roles ?? []
+      for (let i = 0; i < roles.length; i++) {
+        for (let j = i + 1; j < roles.length; j++) {
+          const key = [roles[i], roles[j]].sort().join('|')
+          pairCounts[key] = (pairCounts[key] ?? 0) + 1
+        }
+      }
+    })
+    const pairs = Object.entries(pairCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([key, count]) => {
+        const [a, b] = key.split('|')
+        return { pair: `${a.replace(/_/g, ' ')} + ${b.replace(/_/g, ' ')}`, count }
+      })
+    return { multiRole, pairs, totalMultiRole: multiRole.length }
+  }, [users])
+
+  // Growth over time — cumulative users by GitHub account creation month.
+  const growthData = useMemo(() => {
+    const monthCounts: Record<string, number> = {}
+    users.forEach(u => {
+      const ts = u.created_at
+      if (!ts) return
+      const month = ts.slice(0, 7) // "YYYY-MM"
+      monthCounts[month] = (monthCounts[month] ?? 0) + 1
+    })
+    const sorted = Object.entries(monthCounts).sort(([a], [b]) => a.localeCompare(b))
+    if (sorted.length < 2) return []
+    let cumulative = 0
+    return sorted.map(([month, count]) => {
+      cumulative += count
+      return { month, new: count, cumulative }
+    })
+  }, [users])
+
   if (doneJobs.length === 0) {
     return (
-      <div className="text-center text-gray-500 mt-24">
-        <Users size={40} className="mx-auto mb-3 opacity-40" />
-        <p>No completed jobs yet. Go to <strong>Fetch</strong> to get users.</p>
+      <div className="flex flex-col items-center justify-center text-center mt-24 space-y-4">
+        <div
+          className="w-16 h-16 rounded-2xl flex items-center justify-center"
+          style={{ background: 'rgba(139,92,246,0.12)', border: '1px solid rgba(139,92,246,0.2)' }}
+        >
+          <Users size={28} style={{ color: '#a78bfa' }} />
+        </div>
+        <div>
+          <h2 className="text-lg font-semibold text-gray-200">No results yet</h2>
+          <p className="text-sm text-gray-500 mt-1 max-w-xs">
+            Run a fetch to collect GitHub users from a repository. Results will appear here once complete.
+          </p>
+        </div>
+        <button
+          onClick={() => window.location.hash = 'fetch'}
+          className="btn-primary flex items-center gap-2 text-sm mt-2"
+        >
+          Go to Fetch →
+        </button>
       </div>
     )
   }
@@ -773,6 +883,21 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 className="btn-secondary flex items-center gap-1.5 text-sm"
               >
                 <FileText size={14} /> Markdown
+              </button>
+            )}
+            {/* Share (copy link) */}
+            {activeJobId && (
+              <button
+                onClick={handleShare}
+                disabled={shareLoading}
+                className="btn-secondary flex items-center gap-1.5 text-sm"
+                title="Copy a 24-hour shareable link to clipboard"
+              >
+                {shareLoading
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : shareCopied ? <Check size={14} className="text-emerald-400" /> : <Link size={14} />
+                }
+                {shareCopied ? 'Copied!' : 'Share'}
               </button>
             )}
             <button
@@ -1092,6 +1217,103 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </div>
           )}
 
+          {/* Overlap analysis + Growth over time */}
+          {(overlapData.totalMultiRole > 0 || growthData.length > 0) && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* Overlap: role pair co-occurrence */}
+              {overlapData.pairs.length > 0 && (
+                <div className="card">
+                  <h3 className="text-sm font-semibold gradient-heading mb-1 flex items-center gap-1.5">
+                    <Layers size={14} /> Overlap Analysis
+                    <ChartInfo text="Shows the most common role combinations. Users appearing in multiple roles are your most engaged community members." />
+                  </h3>
+                  <p className="text-xs text-gray-500 mb-3">
+                    {overlapData.totalMultiRole} user{overlapData.totalMultiRole !== 1 ? 's' : ''} appear in 2+ roles
+                  </p>
+                  <ResponsiveContainer width="100%" height={Math.min(overlapData.pairs.length * 28 + 20, 260)}>
+                    <BarChart data={overlapData.pairs} layout="vertical" margin={{ left: 0, right: 36, top: 2, bottom: 2 }}>
+                      <XAxis type="number" tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                      <YAxis type="category" dataKey="pair" width={190} tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                      <Tooltip contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }} />
+                      <Bar dataKey="count" fill="#a78bfa" radius={[0, 4, 4, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                  {overlapData.multiRole.length > 0 && (
+                    <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                      <p className="text-xs text-gray-500 mb-2">Most engaged (most roles):</p>
+                      <div className="flex flex-wrap gap-2">
+                        {overlapData.multiRole.slice(0, 8).map(u => (
+                          <a
+                            key={u.login}
+                            href={u.html_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs transition-colors"
+                            style={{
+                              background: 'rgba(167,139,250,0.1)',
+                              border: '1px solid rgba(167,139,250,0.25)',
+                              color: '#c4b5fd',
+                            }}
+                            onMouseEnter={e => (e.currentTarget.style.background = 'rgba(167,139,250,0.2)')}
+                            onMouseLeave={e => (e.currentTarget.style.background = 'rgba(167,139,250,0.1)')}
+                          >
+                            <img src={u.avatar_url ?? ''} alt="" className="w-4 h-4 rounded-full" />
+                            {u.login}
+                            <span className="opacity-60">×{u.roles?.length}</span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Growth over time */}
+              {growthData.length > 0 && (
+                <div className="card">
+                  <h3 className="text-sm font-semibold gradient-heading mb-1 flex items-center gap-1.5">
+                    <TrendingUp size={14} /> Growth Over Time
+                    <ChartInfo text="Cumulative count of users by their GitHub account creation date. Spikes indicate periods of high community growth." />
+                  </h3>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Cumulative user joins by GitHub account creation date
+                  </p>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <AreaChart data={growthData} margin={{ left: 0, right: 8, top: 4, bottom: 4 }}>
+                      <defs>
+                        <linearGradient id="growthGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3} />
+                          <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis
+                        dataKey="month"
+                        tick={{ fill: '#6b7280', fontSize: 9 }}
+                        tickFormatter={(v: string) => v.slice(0, 7)}
+                        interval="preserveStartEnd"
+                      />
+                      <YAxis tick={{ fill: '#9ca3af', fontSize: 10 }} width={40} />
+                      <Tooltip
+                        contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }}
+                        labelFormatter={(l: string) => `Month: ${l}`}
+                        formatter={(value: number, name: string) => [value.toLocaleString(), name === 'cumulative' ? 'Total' : 'New']}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="cumulative"
+                        stroke="#8b5cf6"
+                        strokeWidth={2}
+                        fill="url(#growthGrad)"
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Top N leaderboard */}
           <div className="card">
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -1154,8 +1376,29 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
           {/* Data table */}
           <div className="card">
-            <h3 className="text-sm font-semibold gradient-heading mb-3">All Users</h3>
+            <h3 className="text-sm font-semibold gradient-heading mb-3">
+              All Users
+              {totalUsers > users.length && (
+                <span className="ml-2 text-xs font-normal text-gray-500">
+                  (showing {users.length.toLocaleString()} of {totalUsers.toLocaleString()})
+                </span>
+              )}
+            </h3>
             <UserTable users={users} onRowClick={setSelectedUser} />
+            {currentPage < totalPages && (
+              <div className="mt-3 text-center">
+                <button
+                  onClick={loadMoreUsers}
+                  disabled={loadingMore}
+                  className="btn-secondary flex items-center gap-2 mx-auto text-sm"
+                >
+                  {loadingMore
+                    ? <><Loader2 size={14} className="animate-spin" /> Loading…</>
+                    : <><ChevronDown size={14} /> Load more ({(totalUsers - users.length).toLocaleString()} remaining)</>
+                  }
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

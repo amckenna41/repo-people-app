@@ -8,7 +8,8 @@ import {
   createColumnHelper,
   type SortingState,
 } from '@tanstack/react-table'
-import { ExternalLink, ChevronUp, ChevronDown, ChevronsUpDown, Eye, X, CheckSquare, Square } from 'lucide-react'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { ExternalLink, ChevronUp, ChevronDown, ChevronsUpDown, Eye, X, CheckSquare, Square, Filter, AlertTriangle } from 'lucide-react'
 import type { UserRecord } from '../types'
 import RoleBadges from './RoleBadges'
 
@@ -19,6 +20,65 @@ interface Props {
 
 const col = createColumnHelper<UserRecord>()
 
+const ROW_HEIGHT = 44 // px — approximate height of a single table row
+
+// ---------------------------------------------------------------------------
+// Bot-likelihood heuristic
+// ---------------------------------------------------------------------------
+// Returns a score 0–100. Score ≥ 60 = "likely bot / spam account".
+// The score is purely client-side and is only used to power the hide-bots toggle.
+
+function computeBotScore(u: UserRecord): number {
+  if (u.is_bot) return 100
+  let score = 0
+  if (!u.followers || u.followers === 0) score += 25
+  if (!u.public_repos || u.public_repos === 0) score += 20
+  if (u.account_age_days !== undefined && u.account_age_days < 180) score += 20
+  if (!u.name && !u.bio && !u.location) score += 15
+  // Looks like a generated login: lower-case word(s) followed by 6+ digits
+  if (u.login && /^[a-z][-a-z]*\d{6,}$/i.test(u.login)) score += 20
+  return Math.min(score, 100)
+}
+
+// ---------------------------------------------------------------------------
+// Advanced filter state
+// ---------------------------------------------------------------------------
+
+interface FilterState {
+  location: string
+  company: string
+  minFollowers: string
+  maxFollowers: string
+  joinedAfter: string   // YYYY-MM-DD
+  joinedBefore: string  // YYYY-MM-DD
+  hideBots: boolean
+}
+
+const COL_VIS_KEY = 'repo-people-col-visibility'
+
+const DEFAULT_COL_VISIBILITY: Record<string, boolean> = {
+  bio: false,
+  email_public: false,
+  blog: false,
+  twitter: false,
+  public_gists: false,
+  account_age_days: false,
+  followers_following_ratio: false,
+  repos_per_year: false,
+  total_public_stars_sampled: false,
+  total_public_forks_sampled: false,
+  bot_score: false,
+}
+
+function loadColVisibility(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(COL_VIS_KEY)
+    return raw ? { ...DEFAULT_COL_VISIBILITY, ...JSON.parse(raw) } : DEFAULT_COL_VISIBILITY
+  } catch {
+    return DEFAULT_COL_VISIBILITY
+  }
+}
+
 export default function UserTable({ users, onRowClick }: Props) {
   const [sorting, setSorting] = useState<SortingState>([])
   const [globalFilter, setGlobalFilter] = useState('')
@@ -27,23 +87,43 @@ export default function UserTable({ users, onRowClick }: Props) {
   const [dropdownSearch, setDropdownSearch] = useState('')
   const comboRef = useRef<HTMLDivElement>(null)
 
-  const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({
-    bio: false,
-    email_public: false,
-    blog: false,
-    twitter: false,
-    public_gists: false,
-    account_age_days: false,
-    followers_following_ratio: false,
-    repos_per_year: false,
-    total_public_stars_sampled: false,
-    total_public_forks_sampled: false,
+  // Advanced filter panel
+  const [showFilterPanel, setShowFilterPanel] = useState(false)
+  const [filters, setFilters] = useState<FilterState>({
+    location: '',
+    company: '',
+    minFollowers: '',
+    maxFollowers: '',
+    joinedAfter: '',
+    joinedBefore: '',
+    hideBots: false,
   })
+
+  function resetFilters() {
+    setFilters({ location: '', company: '', minFollowers: '', maxFollowers: '', joinedAfter: '', joinedBefore: '', hideBots: false })
+  }
+
+  // Count how many advanced filters are active (for badge on Filters button)
+  const activeFilterCount = useMemo(() => [
+    filters.location,
+    filters.company,
+    filters.minFollowers,
+    filters.maxFollowers,
+    filters.joinedAfter,
+    filters.joinedBefore,
+    filters.hideBots ? 'x' : '',
+  ].filter(Boolean).length, [filters])
+
+  const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>(loadColVisibility)
   const [showVisibilityMenu, setShowVisibilityMenu] = useState(false)
   const [visibilitySearch, setVisibilitySearch] = useState('')
   const visMenuRef = useRef<HTMLDivElement>(null)
-  const PAGE_SIZE = 50
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  const tableBodyRef = useRef<HTMLDivElement>(null)
+
+  // Persist column visibility to localStorage whenever it changes
+  useEffect(() => {
+    try { localStorage.setItem(COL_VIS_KEY, JSON.stringify(columnVisibility)) } catch { /* storage full */ }
+  }, [columnVisibility])
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -75,19 +155,52 @@ export default function UserTable({ users, onRowClick }: Props) {
     )
   }, [sortedLogins, dropdownSearch])
 
-  // Reset visible count whenever filters or sorting change
-  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [globalFilter, selectedLogin, sorting])
+  // Reset scroll position when filters or sorting change
+  useEffect(() => {
+    if (tableBodyRef.current) tableBodyRef.current.scrollTop = 0
+  }, [globalFilter, selectedLogin, sorting])
 
-  // Table data: if a specific user is selected, show only them
-  const tableData = useMemo(() =>
-    selectedLogin ? users.filter(u => u.login === selectedLogin) : users
-  , [users, selectedLogin])
+  // Table data: apply login select + advanced filters
+  const tableData = useMemo(() => {
+    let rows = selectedLogin ? users.filter(u => u.login === selectedLogin) : users
+
+    if (filters.location) {
+      const q = filters.location.toLowerCase()
+      rows = rows.filter(u => (u.location ?? '').toLowerCase().includes(q))
+    }
+    if (filters.company) {
+      const q = filters.company.toLowerCase()
+      rows = rows.filter(u => (u.company ?? '').toLowerCase().includes(q))
+    }
+    if (filters.minFollowers !== '') {
+      const min = Number(filters.minFollowers)
+      rows = rows.filter(u => (u.followers ?? 0) >= min)
+    }
+    if (filters.maxFollowers !== '') {
+      const max = Number(filters.maxFollowers)
+      rows = rows.filter(u => (u.followers ?? 0) <= max)
+    }
+    if (filters.joinedAfter) {
+      const after = new Date(filters.joinedAfter).getTime()
+      rows = rows.filter(u => u.created_at ? new Date(u.created_at).getTime() >= after : true)
+    }
+    if (filters.joinedBefore) {
+      const before = new Date(filters.joinedBefore).getTime()
+      rows = rows.filter(u => u.created_at ? new Date(u.created_at).getTime() <= before : true)
+    }
+    if (filters.hideBots) {
+      rows = rows.filter(u => computeBotScore(u) < 60)
+    }
+
+    return rows
+  }, [users, selectedLogin, filters])
 
   function clearAllFilters() {
     setSelectedLogin(null)
     setDropdownSearch('')
     setGlobalFilter('')
     setDropdownOpen(false)
+    resetFilters()
   }
 
   function selectUser(login: string) {
@@ -123,18 +236,28 @@ export default function UserTable({ users, onRowClick }: Props) {
     }),
     col.accessor('login', {
       header: 'Login',
-      cell: info => (
-        <a
-          href={info.row.original.html_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={e => e.stopPropagation()}
-          className="text-brand-400 hover:underline flex items-center gap-1"
-          style={{ color: '#a78bfa' }}
-        >
-          {info.getValue()} <ExternalLink size={10} />
-        </a>
-      ),
+      cell: info => {
+        const score = computeBotScore(info.row.original)
+        return (
+          <span className="flex items-center gap-1.5">
+            {score >= 60 && (
+              <span title={`Likely bot/spam (score ${score})`}>
+                <AlertTriangle size={11} className="text-amber-400 flex-shrink-0" />
+              </span>
+            )}
+            <a
+              href={info.row.original.html_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={e => e.stopPropagation()}
+              className="text-brand-400 hover:underline flex items-center gap-1"
+              style={{ color: '#a78bfa' }}
+            >
+              {info.getValue()} <ExternalLink size={10} />
+            </a>
+          </span>
+        )
+      },
     }),
     col.accessor('name', { header: 'Name', cell: i => i.getValue() || '–' }),
     col.accessor('location', { header: 'Location', cell: i => i.getValue() || '–' }),
@@ -180,6 +303,17 @@ export default function UserTable({ users, onRowClick }: Props) {
     col.accessor('repos_per_year', { header: 'Repos/yr', cell: i => i.getValue()?.toFixed(2) ?? '–' }),
     col.accessor('total_public_stars_sampled', { header: 'Stars', cell: i => i.getValue() ?? '–' }),
     col.accessor('total_public_forks_sampled', { header: 'Forks', cell: i => i.getValue() ?? '–' }),
+    // Computed column — bot heuristic score (0–100). Hidden by default.
+    {
+      id: 'bot_score',
+      header: 'Bot Score',
+      accessorFn: (u: UserRecord) => computeBotScore(u),
+      cell: (info: any) => {
+        const score = info.getValue() as number
+        const color = score >= 60 ? '#fbbf24' : score >= 30 ? '#94a3b8' : '#34d399'
+        return <span style={{ color, fontVariantNumeric: 'tabular-nums' }}>{score}</span>
+      },
+    },
   ], [])
 
   const table = useReactTable({
@@ -193,6 +327,16 @@ export default function UserTable({ users, onRowClick }: Props) {
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
   })
+
+  const allRows = table.getRowModel().rows
+  const virtualizer = useVirtualizer({
+    count: allRows.length,
+    getScrollElement: () => tableBodyRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 10,
+  })
+  const virtualItems = virtualizer.getVirtualItems()
+  const totalVirtualHeight = virtualizer.getTotalSize()
 
   return (
     <div className="space-y-3">
@@ -276,6 +420,25 @@ export default function UserTable({ users, onRowClick }: Props) {
           </button>
         )}
 
+        {/* Advanced filters toggle */}
+        <button
+          type="button"
+          onClick={() => setShowFilterPanel(v => !v)}
+          className="btn-secondary flex items-center gap-1.5 text-sm relative"
+          style={showFilterPanel ? { borderColor: 'rgba(139,92,246,0.5)', color: '#c4b5fd' } : {}}
+        >
+          <Filter size={13} />
+          Filters
+          {activeFilterCount > 0 && (
+            <span
+              className="absolute -top-1.5 -right-1.5 text-[10px] font-bold w-4 h-4 rounded-full flex items-center justify-center"
+              style={{ background: '#7c3aed', color: '#fff' }}
+            >
+              {activeFilterCount}
+            </span>
+          )}
+        </button>
+
         {/* Column visibility */}
         <div ref={visMenuRef} className="relative">
           <button
@@ -346,12 +509,115 @@ export default function UserTable({ users, onRowClick }: Props) {
         </div>
 
         <span className="text-sm text-gray-500 ml-auto">
-          {table.getFilteredRowModel().rows.length} users
+          {allRows.length} users
         </span>
       </div>
 
-      {/* Table */}
-      <div className="overflow-x-auto rounded-xl" style={{ border: '1px solid rgba(255,255,255,0.06)' }}>
+      {/* Advanced filter panel */}
+      {showFilterPanel && (
+        <div
+          className="rounded-xl p-4 space-y-3"
+          style={{ background: 'rgba(20,16,48,0.95)', border: '1px solid rgba(139,92,246,0.25)' }}
+        >
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Location contains</label>
+              <input
+                type="text"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+                placeholder="e.g. London"
+                value={filters.location}
+                onChange={e => setFilters(f => ({ ...f, location: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Company contains</label>
+              <input
+                type="text"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+                placeholder="e.g. Google"
+                value={filters.company}
+                onChange={e => setFilters(f => ({ ...f, company: e.target.value }))}
+              />
+            </div>
+            <div className="flex gap-2">
+              <div className="flex-1">
+                <label className="block text-xs text-gray-400 mb-1">Min followers</label>
+                <input
+                  type="number"
+                  min={0}
+                  className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+                  placeholder="0"
+                  value={filters.minFollowers}
+                  onChange={e => setFilters(f => ({ ...f, minFollowers: e.target.value }))}
+                />
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs text-gray-400 mb-1">Max followers</label>
+                <input
+                  type="number"
+                  min={0}
+                  className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+                  placeholder="∞"
+                  value={filters.maxFollowers}
+                  onChange={e => setFilters(f => ({ ...f, maxFollowers: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Joined after</label>
+              <input
+                type="date"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
+                value={filters.joinedAfter}
+                onChange={e => setFilters(f => ({ ...f, joinedAfter: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Joined before</label>
+              <input
+                type="date"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
+                value={filters.joinedBefore}
+                onChange={e => setFilters(f => ({ ...f, joinedBefore: e.target.value }))}
+              />
+            </div>
+            <div className="flex flex-col justify-end">
+              <label className="flex items-center gap-2 cursor-pointer select-none text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-amber-400"
+                  checked={filters.hideBots}
+                  onChange={e => setFilters(f => ({ ...f, hideBots: e.target.checked }))}
+                />
+                <span className="text-gray-300 flex items-center gap-1">
+                  <AlertTriangle size={12} className="text-amber-400" />
+                  Hide likely bots
+                </span>
+              </label>
+              <p className="text-[10px] text-gray-600 mt-0.5 ml-5">Hides accounts scoring ≥ 60 on the spam heuristic</p>
+            </div>
+          </div>
+          {activeFilterCount > 0 && (
+            <button
+              type="button"
+              onClick={resetFilters}
+              className="text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center gap-1"
+            >
+              <X size={11} /> Reset all filters
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Virtualised table — only visible rows are rendered in the DOM */}      <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(255,255,255,0.06)' }}>
+        {/* Fixed header */}
         <table className="w-full text-sm">
           <thead style={{ background: 'rgba(255,255,255,0.03)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
             {table.getHeaderGroups().map(hg => (
@@ -376,76 +642,63 @@ export default function UserTable({ users, onRowClick }: Props) {
               </tr>
             ))}
           </thead>
-          <tbody>
-            {(() => {
-              const allRows = table.getRowModel().rows
-              const visibleRows = allRows.slice(0, visibleCount)
-              return (
-                <>
-                  {visibleRows.map(row => (
+        </table>
+        {/* Scrollable virtual body */}
+        <div
+          ref={tableBodyRef}
+          className="overflow-y-auto overflow-x-auto"
+          style={{ maxHeight: 520 }}
+        >
+          {allRows.length === 0 ? (
+            <div className="text-center text-gray-500 py-8 text-sm">
+              No users match the current filter.
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <tbody style={{ display: 'block', height: totalVirtualHeight, position: 'relative' }}>
+                {virtualItems.map(vi => {
+                  const row = allRows[vi.index]
+                  return (
                     <tr
                       key={row.id}
+                      data-index={vi.index}
+                      ref={virtualizer.measureElement}
                       className="border-b cursor-pointer transition-colors"
-                      style={{ borderColor: 'rgba(255,255,255,0.05)' }}
+                      style={{
+                        borderColor: 'rgba(255,255,255,0.05)',
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${vi.start}px)`,
+                        display: 'table',
+                        tableLayout: 'fixed',
+                      }}
                       onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.06)')}
                       onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                       onClick={() => onRowClick(row.original)}
                     >
                       {row.getVisibleCells().map(cell => (
-                        <td key={cell.id} className="px-3 py-2.5 whitespace-nowrap">
+                        <td key={cell.id} className="px-3 py-2.5 whitespace-nowrap overflow-hidden text-ellipsis">
                           {flexRender(cell.column.columnDef.cell, cell.getContext())}
                         </td>
                       ))}
                     </tr>
-                  ))}
-                  {allRows.length === 0 && (
-                    <tr>
-                      <td colSpan={columns.length} className="text-center text-gray-500 py-8">
-                        No users match the current filter.
-                      </td>
-                    </tr>
-                  )}
-                </>
-              )
-            })()}
-          </tbody>
-        </table>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
 
-      {/* Pagination footer */}
-      {(() => {
-        const total = table.getFilteredRowModel().rows.length
-        if (total <= PAGE_SIZE) return null
-        const showing = Math.min(visibleCount, total)
-        const hasMore = visibleCount < total
-        return (
-          <div className="flex items-center justify-between pt-1">
-            <span className="text-xs text-gray-500">
-              Showing {showing} of {total} users
-            </span>
-            <div className="flex gap-2">
-              {visibleCount > PAGE_SIZE && (
-                <button
-                  type="button"
-                  onClick={() => setVisibleCount(PAGE_SIZE)}
-                  className="btn-secondary text-xs px-3 py-1.5"
-                >
-                  Show less
-                </button>
-              )}
-              {hasMore && (
-                <button
-                  type="button"
-                  onClick={() => setVisibleCount(v => Math.min(v + PAGE_SIZE, total))}
-                  className="btn-primary text-xs px-3 py-1.5"
-                >
-                  See more ({Math.min(PAGE_SIZE, total - visibleCount)} more)
-                </button>
-              )}
-            </div>
-          </div>
-        )
-      })()}
+      {allRows.length > 0 && (
+        <div className="text-xs text-gray-600 text-right pt-1">
+          {allRows.length < users.length
+            ? `Showing ${allRows.length} of ${users.length} users — scroll to navigate`
+            : `Showing all ${allRows.length} users — scroll to navigate`}
+        </div>
+      )}
     </div>
   )
 }

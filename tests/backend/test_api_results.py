@@ -325,3 +325,81 @@ class TestExportCsv:
         resp = await async_client.get(f"/results/{jid}/export/csv")
         assert resp.status_code == 200
         assert resp.content == b""
+
+
+# ===========================================================================
+# POST /results/{job_id}/share  and  GET /share/{token}
+# ===========================================================================
+
+class TestShareEndpoints:
+    @pytest.mark.asyncio
+    async def test_create_share_returns_token_and_url(self, async_client, done_job_id):
+        resp = await async_client.post(f"/results/{done_job_id}/share")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "token" in data
+        assert "url" in data
+        assert "expires_at" in data
+        assert data["token"] in data["url"]
+
+    @pytest.mark.asyncio
+    async def test_create_share_404_for_unknown_job(self, async_client):
+        resp = await async_client.post("/results/no-such-job/share")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_create_share_409_for_pending_job(self, async_client, pending_job_id):
+        resp = await async_client.post(f"/results/{pending_job_id}/share")
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_get_shared_results_returns_users(self, async_client, done_job_id):
+        create = await async_client.post(f"/results/{done_job_id}/share")
+        token = create.json()["token"]
+        resp = await async_client.get(f"/share/{token}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "users" in data
+        assert "total" in data
+        assert "page" in data
+        assert "pages" in data
+        assert "job_label" in data
+        assert "expires_at" in data
+
+    @pytest.mark.asyncio
+    async def test_get_shared_results_contains_correct_users(self, async_client, done_job_id):
+        create = await async_client.post(f"/results/{done_job_id}/share")
+        token = create.json()["token"]
+        resp = await async_client.get(f"/share/{token}")
+        users = resp.json()["users"]
+        assert "alice" in users
+        assert "bob" in users
+
+    @pytest.mark.asyncio
+    async def test_get_shared_results_paginated(self, async_client, done_job_id):
+        create = await async_client.post(f"/results/{done_job_id}/share")
+        token = create.json()["token"]
+        resp = await async_client.get(f"/share/{token}?page=1&page_size=1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["users"]) == 1
+        assert data["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_get_shared_results_404_for_bad_token(self, async_client):
+        resp = await async_client.get("/share/totally-invalid-token")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_shared_results_410_for_expired_token(self, async_client, done_job_id):
+        import main as app_module
+        # Manually insert an already-expired share token
+        expired_token = "expired-test-token-xyz"
+        app_module._share_tokens[expired_token] = {
+            "job_id": done_job_id,
+            "expires_at": 1.0,  # far in the past
+        }
+        resp = await async_client.get(f"/share/{expired_token}")
+        assert resp.status_code == 410
+        # Ensure the token was pruned
+        assert expired_token not in app_module._share_tokens

@@ -14,9 +14,27 @@ _logger = logging.getLogger(__name__)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from repo_people.users import GitHubUserInfo
 from repo_people import export as rp_export
-from github import Github, Auth
+from github import Github, Auth, GithubException
 
 from store import get_job
+
+
+def _classify_role_error(exc: Exception, role: str) -> str:
+    """Return a user-friendly warning message for a per-role fetch failure."""
+    if isinstance(exc, GithubException):
+        data_str = str(getattr(exc, 'data', '') or '').lower()
+        if exc.status == 401:
+            return f"⚠️ {role}: Authentication failed — token is invalid or expired."
+        if exc.status == 403:
+            if 'rate limit' in data_str or 'x-ratelimit' in data_str:
+                return f"⚠️ {role}: Rate limit exceeded — add a PAT or wait for reset."
+            return f"⚠️ {role}: Access denied — repository may be private or token lacks scope."
+        if exc.status == 404:
+            return f"⚠️ {role}: Repository not found — check owner/repo name."
+        if exc.status == 429:
+            return f"⚠️ {role}: Secondary rate limit hit — reduce workers or wait a moment."
+        return f"⚠️ {role}: GitHub API error {exc.status}."
+    return f"⚠️ {role}: Unexpected error — {type(exc).__name__}: {exc}"
 
 _SAVE_BLOCK = 25  # write partial checkpoint every N users when save_each_user=True
 
@@ -80,17 +98,25 @@ async def run_fetch_job(
         async def _fetch_role(role: str):
             t_role = time.monotonic()
             await emit("status", {"message": f"  → fetching {role}…"})
-            data = await loop.run_in_executor(None, role_funcs[role])
-            elapsed_role = time.monotonic() - t_role
-            await emit("status", {"message": f"  ✓ {role}: {len(data)} users ({elapsed_role:.1f}s)"})
-            return role, data
+            try:
+                data = await loop.run_in_executor(None, role_funcs[role])
+                elapsed_role = time.monotonic() - t_role
+                await emit("status", {"message": f"  ✓ {role}: {len(data)} users ({elapsed_role:.1f}s)"})
+                return role, data
+            except Exception as role_exc:
+                elapsed_role = time.monotonic() - t_role
+                _logger.warning("Role fetch failed for %s/%s [%s] after %.1fs: %s", owner, repo, role, elapsed_role, role_exc)
+                friendly = _classify_role_error(role_exc, role)
+                await emit("warning", {"message": friendly})
+                return role, []  # Continue with remaining roles
 
         role_results = await asyncio.gather(*[_fetch_role(r) for r in active_roles], return_exceptions=True)
 
         username_map: dict[str, list[str]] = {}
         for item in role_results:
             if isinstance(item, BaseException):
-                await emit("status", {"message": f"Warning: role fetch failed — {item}"})
+                # gather return_exceptions=True; individual role errors already handled above
+                await emit("warning", {"message": f"⚠️ Unexpected error during role fetch — {item}"})
             else:
                 role, data = item
                 username_map[role] = data
@@ -107,6 +133,8 @@ async def run_fetch_job(
         fetched = 0
         block_counter = 0
         start_time = time.monotonic()
+        # Track which rate-limit thresholds have already triggered a warning
+        _rl_warned_thresholds: set[int] = set()
 
         def _fetch_one(login: str) -> tuple[str, dict]:
             info = GitHubUserInfo(gh, username=login)
@@ -132,6 +160,25 @@ async def run_fetch_job(
                 elapsed = time.monotonic() - start_time
                 rate = fetched / elapsed if elapsed > 0 else 0
                 remaining_est = int((total - fetched) / rate) if rate > 0 else None
+
+                # Read rate limit from the last response headers (cached by PyGitHub)
+                rl_remaining: int | None = None
+                rl_reset: int | None = None
+                try:
+                    rl_remaining, _ = gh.rate_limiting
+                    rl_reset = gh.rate_limiting_resettime
+                    # Emit a one-time warning when approaching rate limit exhaustion
+                    for threshold in (500, 200, 100, 50):
+                        if rl_remaining <= threshold and threshold not in _rl_warned_thresholds:
+                            _rl_warned_thresholds.add(threshold)
+                            mins_left = max(0, int((rl_reset - time.time()) / 60)) if rl_reset else 0
+                            await emit("warning", {
+                                "message": f"⚠️ GitHub rate limit: {rl_remaining} API calls remaining — resets in {mins_left}m"
+                            })
+                            break
+                except Exception:
+                    pass
+
                 await emit(
                     "progress",
                     {
@@ -139,7 +186,8 @@ async def run_fetch_job(
                         "total": total,
                         "login": _login,
                         "eta_seconds": remaining_est,
-                        "rate_limit_remaining": None,
+                        "rate_limit_remaining": rl_remaining,
+                        "rate_limit_reset": rl_reset,
                     },
                 )
                 # Attach roles and apply bot filter

@@ -2,34 +2,79 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import sys
+import time
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Cookie, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from models import FetchRequest, CompareRequest, MultiCompareRequest, RenameJobRequest, TagsRequest
-from store import create_job, create_job_async, get_job, result_to_csv_bytes, load_all_jobs_into_runtime, get_job_async, delete_job, load_jobs_list, set_job_tags
+from store import (
+    create_job, create_job_async, get_job, result_to_csv_bytes,
+    load_all_jobs_into_runtime, get_job_async, delete_job, load_jobs_list,
+    set_job_tags, clear_summary_caches, clear_all_jobs,
+    create_session, get_session, delete_session,
+)
 from worker import run_fetch_job
 
-load_dotenv()
+from pathlib import Path as _Path
+load_dotenv(_Path(__file__).resolve().parent / ".env", override=True)
 
 # Maximum users fetchable per job on the hosted service.
 # Set FETCH_LIMIT=0 in .env to disable the cap (local installs).
 _raw_limit = os.environ.get("FETCH_LIMIT", "500")
 FETCH_LIMIT: int = int(_raw_limit) if _raw_limit.isdigit() else 500
 
+# ---------------------------------------------------------------------------
+# GitHub OAuth configuration
+# Read GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET from environment.
+# FRONTEND_URL: where to redirect after successful OAuth (default: Vite dev server).
+# BACKEND_URL: the publicly-reachable URL of this backend (used as redirect_uri).
+# ---------------------------------------------------------------------------
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+SESSION_COOKIE = "rp_session"
+
+# Short-lived in-memory store for OAuth state tokens (CSRF protection).
+# Maps state string → expiry timestamp (10-minute window).
+_oauth_states: dict[str, float] = {}
+
+# Short-lived in-memory store for shareable job read tokens.
+# Maps token → {job_id, expires_at (epoch float)}.
+_share_tokens: dict[str, dict[str, Any]] = {}
+
 app = FastAPI(title="repo-people Explorer API", version="1.0.0")
 
 @app.on_event("startup")
 async def startup():
     await load_all_jobs_into_runtime()
+    asyncio.create_task(_cleanup_ephemeral_stores())
+
+
+async def _cleanup_ephemeral_stores() -> None:
+    """Background task: sweep expired OAuth states and share tokens every 5 minutes."""
+    while True:
+        await asyncio.sleep(300)
+        cutoff = time.time()
+        stale_states = [k for k, ts in list(_oauth_states.items()) if ts < cutoff - 600]
+        for k in stale_states:
+            _oauth_states.pop(k, None)
+        stale_tokens = [k for k, v in list(_share_tokens.items()) if v["expires_at"] < cutoff]
+        for k in stale_tokens:
+            _share_tokens.pop(k, None)
 
 # S2: CORS origins configurable via env var (comma-separated list).
 _raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
@@ -52,11 +97,17 @@ async def fetch_users(
     req: FetchRequest,
     background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
+    rp_session: str | None = Cookie(default=None),
 ):
     # S1: Extract token from Authorization: Bearer header instead of request body.
     token = ""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    # Fall back to OAuth session token when no explicit PAT is provided.
+    if not token and rp_session:
+        session = await get_session(rp_session)
+        if session:
+            token = session["github_token"]
     # Cap the per-job fetch limit to keep hosting costs bounded.
     # FETCH_LIMIT=0 disables the cap (local installs only).
     if FETCH_LIMIT > 0:
@@ -455,6 +506,68 @@ async def export_csv(job_id: str):
 
 
 # ---------------------------------------------------------------------------
+# POST /results/{job_id}/share  — create a short-lived read token
+# ---------------------------------------------------------------------------
+
+@app.post("/results/{job_id}/share")
+async def create_share_token(job_id: str):
+    job = await get_job_async(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail="Job not complete")
+
+    token = secrets.token_urlsafe(32)
+    expires_at_epoch = time.time() + 24 * 3600  # 24-hour window
+    _share_tokens[token] = {"job_id": job_id, "expires_at": expires_at_epoch}
+
+    expires_iso = datetime.fromtimestamp(expires_at_epoch, tz=timezone.utc).isoformat()
+    return {
+        "token": token,
+        "expires_at": expires_iso,
+        "url": f"{FRONTEND_URL}/#share={token}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /share/{token}  — return paginated results for a shared token
+# ---------------------------------------------------------------------------
+
+@app.get("/share/{token}")
+async def get_shared_results(
+    token: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+):
+    entry = _share_tokens.get(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Share link not found or has expired.")
+    if time.time() > entry["expires_at"]:
+        _share_tokens.pop(token, None)
+        raise HTTPException(status_code=410, detail="Share link has expired.")
+
+    job = await get_job_async(entry["job_id"])
+    if job is None or job["status"] != "done":
+        raise HTTPException(status_code=404, detail="The shared job is no longer available.")
+
+    result: dict[str, Any] = job["result"] or {}
+    all_users = list(result.values())
+    total = len(all_users)
+    start = (page - 1) * page_size
+    page_users = {u["login"]: u for u in all_users[start: start + page_size] if isinstance(u, dict) and "login" in u}
+    expires_iso = datetime.fromtimestamp(entry["expires_at"], tz=timezone.utc).isoformat()
+    return {
+        "users": page_users,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "job_label": job.get("label", ""),
+        "expires_at": expires_iso,
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /import  — create a completed job from uploaded JSON data
 # ---------------------------------------------------------------------------
 
@@ -492,6 +605,145 @@ async def import_results(request: Request):
     job["total_fetched"] = len(result)
 
     return {"job_id": job_id, "total_imported": len(result)}
+
+
+# ---------------------------------------------------------------------------
+# GET /clear_cache  — development / testing only
+# ---------------------------------------------------------------------------
+# Deletes all jobs from the database and runtime store.
+# Hidden from the OpenAPI schema (include_in_schema=False) so it does not
+# appear in Swagger UI or generated API clients.
+# ---------------------------------------------------------------------------
+
+@app.get("/clear_cache", include_in_schema=False)
+async def dev_clear_cache():
+    deleted = await clear_all_jobs()
+    job_word = "job" if deleted == 1 else "jobs"
+    return {
+        "message": f"Cache cleared successfully. {deleted} {job_word} deleted.",
+        "deleted_jobs": deleted,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /auth/login  — start GitHub OAuth flow
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/login")
+async def auth_login():
+    if not GITHUB_CLIENT_ID:
+        raise HTTPException(503, "GitHub OAuth is not configured on this server.")
+    state = secrets.token_urlsafe(32)
+    # Store state with expiry timestamp for CSRF validation
+    _oauth_states[state] = time.time()
+    params = urlencode({
+        "client_id": GITHUB_CLIENT_ID,
+        "redirect_uri": f"{BACKEND_URL}/auth/callback",
+        "scope": "read:user user:email repo",
+        "state": state,
+    })
+    return RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
+
+
+# ---------------------------------------------------------------------------
+# GET /auth/callback  — GitHub redirects here after user authorises
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/callback")
+async def auth_callback(code: str, state: str):
+    # Validate state to prevent CSRF
+    if state not in _oauth_states:
+        raise HTTPException(400, "Invalid or expired OAuth state.")
+    del _oauth_states[state]
+
+    if not GITHUB_CLIENT_SECRET:
+        raise HTTPException(503, "GitHub OAuth is not configured on this server.")
+
+    # Exchange authorisation code for access token
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            "https://github.com/login/oauth/access_token",
+            json={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code,
+            },
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        error = token_data.get("error_description", "Unknown error from GitHub")
+        raise HTTPException(400, f"Failed to obtain access token: {error}")
+
+    # Fetch the authenticated user's profile
+    async with httpx.AsyncClient() as client:
+        user_resp = await client.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+            timeout=10,
+        )
+    if user_resp.status_code != 200:
+        raise HTTPException(502, "Failed to fetch GitHub user profile.")
+    user_data = user_resp.json()
+
+    session_id = secrets.token_urlsafe(32)
+    await create_session(
+        session_id=session_id,
+        token=access_token,
+        login=user_data["login"],
+        name=user_data.get("name"),
+        avatar=user_data.get("avatar_url"),
+    )
+
+    # Redirect to frontend with a success indicator in the hash fragment
+    response = RedirectResponse(f"{FRONTEND_URL}/#auth=success", status_code=302)
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_id,
+        httponly=True,
+        samesite="lax",
+        secure=False,   # Set to True in production (requires HTTPS)
+        max_age=30 * 24 * 3600,
+        path="/",
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /auth/me  — return current authenticated user or {authenticated: false}
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/me")
+async def auth_me(rp_session: str | None = Cookie(default=None)):
+    if not rp_session:
+        return JSONResponse({"authenticated": False})
+    session = await get_session(rp_session)
+    if not session:
+        return JSONResponse({"authenticated": False})
+    return {
+        "authenticated": True,
+        "login": session["github_login"],
+        "name": session["github_name"],
+        "avatar_url": session["github_avatar"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /auth/logout  — delete session and clear cookie
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/logout")
+async def auth_logout(rp_session: str | None = Cookie(default=None)):
+    if rp_session:
+        await delete_session(rp_session)
+    response = JSONResponse({"logged_out": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 # ---------------------------------------------------------------------------

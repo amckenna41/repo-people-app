@@ -6,6 +6,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-05-13
+
+### Added
+
+- **Paginated "Load more" for Results** (`frontend/src/views/ResultsView.tsx`, `frontend/src/utils/api.ts`) — `loadJob` now fetches only the first page of results (up to 200 users) for fast initial render. A "Load more (N remaining)" button below the table fetches successive pages on demand via `fetchResultsPage()`. The header shows "showing X of Y users" when partial data is loaded.
+- **CONTRIBUTORS.md download** (`frontend/src/views/ResultsView.tsx`) — A "CONTRIBUTORS" button in the export row generates and downloads a `CONTRIBUTORS_<repo>.md` file. Users are sorted by role count then followers and rendered as a Markdown table with avatar, name, login (linked), roles, followers, and location.
+- **Shareable job URL** (`backend/main.py`, `frontend/src/views/ResultsView.tsx`, `frontend/src/utils/api.ts`, `frontend/src/App.tsx`) — A "Share" button creates a 24-hour read-only token via `POST /results/{job_id}/share` and copies the link to the clipboard. Recipients who open the link (`#share=TOKEN`) are shown the results immediately without authentication. Tokens are stored in-memory in `_share_tokens` and automatically pruned by the background cleanup task. `GET /share/{token}` supports the same `page` / `page_size` query parameters as the main results endpoint.
+- **Rate limit display in Fetch progress** (`frontend/src/views/FetchView.tsx`) — The progress row now shows "N API calls left · resets in Xm" alongside ETA. The label turns amber when fewer than 100 calls remain.
+- **Warning log lines** (`frontend/src/views/FetchView.tsx`) — A new `warning` SSE event type is handled client-side and rendered in amber in the live log panel.
+- **Column visibility localStorage persistence** (`frontend/src/components/UserTable.tsx`) — The user's column show/hide choices are saved to `localStorage` under the key `repo-people-col-visibility` and restored on next visit. Unknown keys in storage are merged with the current defaults.
+- **Improved empty state in Results view** (`frontend/src/views/ResultsView.tsx`) — When no completed jobs exist, a centred card with an icon and "Go to Fetch →" button replaces the previous plain text message.
+- **OAuth help step in Help modal** (`frontend/src/App.tsx`) — A new "Sign in with GitHub (OAuth)" step explains the popup OAuth flow, session duration, and how to sign out.
+- **Extended "Explore Results" bullets** (`frontend/src/App.tsx`) — The existing step now lists overlap analysis, geographic world map, email/social analysis, CONTRIBUTORS.md export, and shareable URL as available capabilities.
+
+### Changed
+
+- **`fetchResults` in `api.ts`** — Remains available for full transparent fetch but is now supplemented by `fetchResultsPage` for incremental loading.
+- **`_cleanup_ephemeral_stores` background task** (`backend/main.py`) — The startup event now spawns a background coroutine that sweeps expired `_oauth_states` (>10 min) and `_share_tokens` (past `expires_at`) every 5 minutes. This replaces the previous inline pruning in `/auth/login`.
+
+### Fixed
+
+- **`_oauth_states` memory leak** (`backend/main.py`) — Inline state pruning on every `/auth/login` call is removed; expiry is handled exclusively by the background cleanup task.
+- **Per-role fetch error isolation** (`backend/worker.py`) — Role-level exceptions are caught inside `_fetch_role`, classified with `_classify_role_error()`, and emitted as `warning` SSE events. The overall fetch continues with remaining roles rather than aborting. Friendly messages cover 401, 403, 404, 429, and generic errors.
+- **Rate limit tracking in worker** (`backend/worker.py`) — `_fetch_with_sem` reads `gh.rate_limiting` and `gh.rate_limiting_resettime` after each user fetch and emits `warning` SSE events when remaining calls cross the 500, 200, 100, and 50 thresholds. The `progress` event now includes `rate_limit_remaining` and `rate_limit_reset`.
+
+### Tests
+
+- **Backend — `tests/backend/test_api_results.py`** (`TestShareEndpoints`) — 8 async integration tests covering `POST /results/{id}/share` (200 with token/url/expires_at, 404 missing job, 409 non-done job) and `GET /share/{token}` (200 with users/total/pages, correct user content, pagination, 404 bad token, 410 expired token with auto-prune verification).
+
+---
+
+## [Unreleased] — 2026-05-12
+
+### Added
+
+- **Fetch limit presets** (`frontend/src/views/FetchView.tsx`) — Quick-select buttons (Top 50 / Top 200 / Top 500 / All) above the custom limit input let users jump to common fetch sizes in one click. The active preset is highlighted; "All" clears the limit field. The hosted-app cap is still respected when the `VITE_FETCH_LIMIT` environment variable is set.
+- **Advanced client-side filter panel** (`frontend/src/components/UserTable.tsx`) — A "Filters" button above the table opens a collapsible panel with six filter inputs: location (contains), company (contains), minimum followers, maximum followers, joined-after date, and joined-before date. An active-filter count badge appears on the button when any filter is set. A "Reset all filters" link clears every input at once. The table footer shows "Showing X of Y users" whenever a filter reduces the visible set.
+- **Bot / spam heuristic detection** (`frontend/src/components/UserTable.tsx`, `frontend/src/utils/errors.ts`) — `computeBotScore()` assigns a 0–100 risk score based on five signals: zero followers (+25), zero public repos (+20), account age under 180 days (+20), missing name/bio/location (+15), and a generated-username pattern (+20). Accounts already flagged `is_bot` by the backend receive 100 automatically. Accounts scoring ≥ 60 show an amber ⚠ icon next to their login name. A "Hide likely bots" toggle in the filter panel removes flagged accounts from view. A `bot_score` column (hidden by default) can be enabled via the Columns picker.
+- **Improved error messages** (`frontend/src/utils/errors.ts`, `frontend/src/views/FetchView.tsx`) — `friendlyFetchError()` in the new `src/utils/errors.ts` module maps HTTP status codes and error keywords to actionable user messages: 401 / bad credentials → PAT expiry guidance; 429 / secondary rate limit → wait + reduce workers; 403 + rate limit → rate limit with PAT upsell; 403 forbidden → access denied with scope hint; 404 / repository not found → spelling check; 422 → invalid characters; 503 → GitHub unavailable; network errors → backend connectivity check. The fetch form error area now shows contextual sub-hints for rate-limit and not-found cases.
+- **`GET /clear_cache` dev endpoint** (`backend/main.py`, `backend/store.py`) — Dev-only endpoint (excluded from the OpenAPI schema) that deletes every job from the database and clears the in-memory runtime overlay via `clear_all_jobs()`. The JSON response reports how many jobs were deleted with correct singular/plural wording. Visiting `http://localhost:5173/clear_cache` in the browser also clears `sessionStorage`, `localStorage` (jobs + search history), and redirects to the app root — wired via a Vite dev-proxy rule (`vite.config.ts`) and a pre-mount intercept in `main.tsx`.
+
+### Tests
+
+- **Frontend — `src/tests/components/UserTable.test.ts`** — 11 unit tests for `computeBotScore`. Covers: backend-flagged bots (→100), legitimate popular users (→0), each individual signal contribution (followers, repos, account age, profile completeness, login pattern), score cap at 100, confirmed spam accounts score ≥ 60, and legitimate low-follower developers score < 60.
+- **Frontend — `src/tests/utils/errors.test.ts`** — 16 unit tests for `friendlyFetchError`. Covers all mapped error patterns (401, 403, 404, 422, 429, 503, secondary rate limit, network errors) and the passthrough case for unknown messages. Tests include owner/repo interpolation and the absence of `undefined` in error text when owner/repo are omitted.
+
+---
+
 ## [Unreleased] — 2026-05-06
 
 ### Security
@@ -77,3 +125,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Backend — `tests/backend/test_api_jobs.py`**: Updated `TestPostFetch` — removed `token` from JSON bodies, added `test_no_token_in_header_still_accepted`, `test_token_in_auth_header_accepted`, and `test_invalid_owner_chars_returns_422`. Updated `TestRenameJob` — replaced tests for permissive behaviour (truncation, empty string, missing field) with correct `HTTP 422` assertions that reflect the new `RenameJobRequest` validation.
 - **Backend — `tests/backend/test_api_import.py`**: Updated comment to reflect `create_job_async()` usage.
 - **Frontend — `src/tests/api.test.ts`**: Updated `postFetch` tests — calls now pass the token as a second argument; added `sends token as Authorization Bearer header` and `omits Authorization header when no token provided` test cases; asserted `body.token` is `undefined`. Updated `fetchResults` tests — mocks now return the paginated envelope format; added `merges multiple pages into a single dict` test. Added `postImport` describe block with 5 test cases covering the happy path, typed return, `HTTP 413`, and `HTTP 500`.
+
+---
+
+## [Unreleased] — 2026-05-19
+
+### Added
+
+- **Search history** (`frontend/src/views/FetchView.tsx`): Recently searched `owner/repo` pairs are persisted in `localStorage` under `repo-people-search-history` (max 10 entries). A "Recent searches" dropdown appears below the repo inputs, allowing one-click re-population of the form. Entries are saved on successful fetch completion and can be cleared via a "Clear all" button.
+- **Overlap analysis** (`frontend/src/views/ResultsView.tsx`): New "Overlap Analysis" card showing role pair co-occurrence counts as a bar chart and a "Most engaged" chip list of users appearing in two or more roles (e.g. starred and forked and contributed).
+- **Growth over time chart** (`frontend/src/views/ResultsView.tsx`): New "Growth Over Time" area chart plotting cumulative user count by GitHub account creation month, revealing when community interest surged.
+- **Virtual scrolling in `UserTable`** (`frontend/src/components/UserTable.tsx`): Replaced the manual `visibleCount`/`PAGE_SIZE` pagination footer with `@tanstack/react-virtual`. Only rows in the visible viewport are rendered in the DOM; the scrollable container has a fixed 520 px max-height with `overscan: 10` for smooth scrolling.
+- **Client-side result caching** (`frontend/src/utils/api.ts`): `fetchResults` and `fetchSummary` now cache responses in `sessionStorage` with a 5-minute TTL (keys: `rp:{jobId}:{endpoint}`). Switching between jobs within a session avoids redundant API calls. `invalidateJobCache(jobId)` clears all cached entries for a job and is called automatically when a job is deleted.
+
+### Tests
+
+- **Frontend — `src/tests/api.test.ts`**: Added `sessionStorage.clear()` to `beforeEach` to prevent cache bleed between tests. Added `invalidateJobCache` to the import list. Added cache-hit tests for `fetchResults` and `fetchSummary` (second call must not issue a new network request). Added `invalidateJobCache` describe block with two test cases: verifying cache entries are removed for the specified job and that entries for other jobs are left intact.

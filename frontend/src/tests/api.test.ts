@@ -15,6 +15,7 @@ import {
   fetchResults,
   fetchSummary,
   fetchTop,
+  invalidateJobCache,
   postCompare,
   postCompareMulti,
   postFetch,
@@ -23,9 +24,10 @@ import {
   updateJobTags,
 } from '../utils/api'
 
-// Re-enable fetch mocks before each test
+// Re-enable fetch mocks and clear the session-storage cache before each test
 beforeEach(() => {
   fetchMocker.resetMocks()
+  sessionStorage.clear()
 })
 
 // ---------------------------------------------------------------------------
@@ -121,6 +123,16 @@ describe('fetchResults', () => {
     fetchMocker.mockResponseOnce(JSON.stringify({ detail: 'Job status: pending' }), { status: 409 })
     await expect(fetchResults('job-1')).rejects.toThrow('Job status: pending')
   })
+
+  it('returns cached result on second call without fetching', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({
+      users: { alice: { login: 'alice' } }, total: 1, page: 1, page_size: 200, pages: 1,
+    }))
+    await fetchResults('job-cached')
+    const requestCountAfterFirst = fetchMocker.requests().length
+    await fetchResults('job-cached') // should hit cache
+    expect(fetchMocker.requests().length).toBe(requestCountAfterFirst) // no new request
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -143,6 +155,14 @@ describe('fetchSummary', () => {
   it('throws on 404', async () => {
     fetchMocker.mockResponseOnce(JSON.stringify({ detail: 'Job not found' }), { status: 404 })
     await expect(fetchSummary('bad-id')).rejects.toThrow('Job not found')
+  })
+
+  it('returns cached result on second call without fetching', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({ total: 3, bots: 1, humans: 2 }))
+    await fetchSummary('job-cached-sum')
+    const requestCountAfterFirst = fetchMocker.requests().length
+    await fetchSummary('job-cached-sum') // should hit cache
+    expect(fetchMocker.requests().length).toBe(requestCountAfterFirst) // no new request
   })
 })
 
@@ -356,5 +376,40 @@ describe('postImport', () => {
   it('throws HTTP error when no detail field', async () => {
     fetchMocker.mockResponseOnce('{}', { status: 500 })
     await expect(postImport({ x: {} })).rejects.toThrow('HTTP 500')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// invalidateJobCache
+// ---------------------------------------------------------------------------
+
+describe('invalidateJobCache', () => {
+  it('removes cached results and summary for the given job', async () => {
+    // Populate cache via real function calls
+    fetchMocker.mockResponseOnce(JSON.stringify({
+      users: { alice: { login: 'alice' } }, total: 1, page: 1, page_size: 200, pages: 1,
+    }))
+    fetchMocker.mockResponseOnce(JSON.stringify({ total: 1 }))
+    await fetchResults('job-del')
+    await fetchSummary('job-del')
+
+    // Verify entries are present
+    const keysBefore = Object.keys(sessionStorage).filter(k => k.startsWith('rp:job-del:'))
+    expect(keysBefore.length).toBeGreaterThan(0)
+
+    invalidateJobCache('job-del')
+
+    const keysAfter = Object.keys(sessionStorage).filter(k => k.startsWith('rp:job-del:'))
+    expect(keysAfter.length).toBe(0)
+  })
+
+  it('does not remove cache entries for other jobs', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({ total: 5 }))
+    await fetchSummary('job-keep')
+
+    invalidateJobCache('job-other')
+
+    const keysAfter = Object.keys(sessionStorage).filter(k => k.startsWith('rp:job-keep:'))
+    expect(keysAfter.length).toBeGreaterThan(0)
   })
 })
