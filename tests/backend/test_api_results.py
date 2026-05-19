@@ -383,7 +383,7 @@ class TestShareEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["users"]) == 1
-        assert data["total"] == 2
+        assert data["total"] == len(SAMPLE_USERS)
 
     @pytest.mark.asyncio
     async def test_get_shared_results_404_for_bad_token(self, async_client):
