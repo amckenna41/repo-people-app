@@ -19,6 +19,7 @@
     { "src": "/compare(.*)", "dest": "/backend/main.py" },
     { "src": "/jobs(.*)",    "dest": "/backend/main.py" },
     { "src": "/import(.*)",  "dest": "/backend/main.py" },
+    { "src": "/auth(.*)",    "dest": "/backend/main.py" },
     { "handle": "filesystem" },
     { "src": "/(.*)", "dest": "/frontend/index.html" }
   ]
