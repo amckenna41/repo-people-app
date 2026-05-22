@@ -1,0 +1,22 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - -f
+      - Dockerfile.cloudrun
+      - -t
+      - ${_IMAGE}
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - ${_IMAGE}
+
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/$PROJECT_ID/repo-people/backend:latest
+
+images:
+  - ${_IMAGE}
