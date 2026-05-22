@@ -3,7 +3,7 @@
  */
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import RoleBadges from '../../components/RoleBadges'
+import RoleBadges from '../../../frontend/src/components/RoleBadges'
 
 describe('RoleBadges', () => {
   it('renders nothing when roles is empty', () => {

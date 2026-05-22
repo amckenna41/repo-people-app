@@ -1,7 +1,6 @@
 # Cloud Run production Dockerfile
 # Build context: repo root (repo-people-app/)
-# The repo-people package is installed from GitHub since Cloud Run cannot
-# reach the sibling local directory used in development.
+# Installs repo-people from PyPI for non-interactive cloud builds.
 
 FROM python:3.11-slim
 
@@ -11,11 +10,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
   && rm -rf /var/lib/apt/lists/*
-
-# Install repo-people v1.0.0 from GitHub (not yet published to PyPI).
-# Pinned to commit 909038a (v1.0.0 HEAD) for reproducible builds.
-RUN pip install --no-cache-dir \
-    "repo-people @ git+https://github.com/amckenna41/repo-people.git"
 
 # Install backend Python dependencies
 COPY backend/requirements.cloudrun.txt ./requirements.txt

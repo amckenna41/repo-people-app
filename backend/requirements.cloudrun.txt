@@ -3,5 +3,4 @@ uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
 sse-starlette>=2.1.0
 aiosqlite>=0.19.0
-# repo-people is installed separately in Dockerfile.cloudrun from GitHub source.
-# This file intentionally omits the local file:// reference used in development.
+repo-people>=1.0.0

@@ -22,7 +22,7 @@ import {
   postImport,
   renameJob,
   updateJobTags,
-} from '../utils/api'
+} from '../../frontend/src/utils/api'
 
 // Re-enable fetch mocks and clear the session-storage cache before each test
 beforeEach(() => {
