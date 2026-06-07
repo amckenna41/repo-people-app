@@ -35,7 +35,6 @@ A full-stack web application that uses the `repo-people` Python package to explo
 **repo-people** provides a single-call pipeline to collect every GitHub user associated with a repository across 9 role categories, fetch 30+ profile fields for each person from the GitHub API, and export the results to JSON, CSV, or Markdown. It is designed for research, open-source community analysis, and developer intelligence workflows.
 
 Key features:
-- **Live progress streaming** — SSE-powered log updates during collection so you can watch results arrive in real time
 - **Role-aware collection** — fetches contributors across 9 role categories (stargazers, forkers, watchers, contributors, and more) in a single job
 - **Rich profile data** — 30+ fields per user including bio, location, company, followers, organisations, and languages
 - **Analytics dashboard** — summary cards, role distribution chart, account age donut chart, and a top-N leaderboard sortable by any numeric field

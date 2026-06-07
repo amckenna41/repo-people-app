@@ -31,9 +31,13 @@ steps:
       - --timeout=3600
 
 substitutions:
-  _IMAGE: europe-west1-docker.pkg.dev/$PROJECT_ID/repo-people/backend:latest
-  _SERVICE_NAME: repo-people-app
+  # These values are intentionally left as placeholders.
+  # Set the real values in the Cloud Build trigger substitutions in GCP Console,
+  # or pass them via: gcloud builds submit --substitutions=_REGION=...,_AR_REPO=...
   _REGION: europe-west1
+  _AR_REPO: repo-people
+  _SERVICE_NAME: repo-people-app
+  _IMAGE: ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
 
 options:
   logging: CLOUD_LOGGING_ONLY
