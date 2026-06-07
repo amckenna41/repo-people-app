@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install backend Python dependencies (including repo-people from PyPI)
 COPY backend/requirements.cloudrun.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+  && python -c "import fastapi, uvicorn, httpx, sse_starlette, aiosqlite"
 
 # Copy backend source
 COPY backend/ /app/
