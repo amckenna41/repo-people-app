@@ -15,8 +15,25 @@ steps:
       - push
       - ${_IMAGE}
 
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --max-instances=1
+      - --min-instances=0
+      - --timeout=3600
+
 substitutions:
-  _IMAGE: us-central1-docker.pkg.dev/$PROJECT_ID/repo-people/backend:latest
+  _IMAGE: europe-west1-docker.pkg.dev/$PROJECT_ID/repo-people/backend:latest
+  _SERVICE_NAME: repo-people-app
+  _REGION: europe-west1
 
 images:
   - ${_IMAGE}
