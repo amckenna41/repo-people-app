@@ -6,14 +6,14 @@ steps:
       - -f
       - Dockerfile.cloudrun
       - -t
-      - ${_IMAGE}
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
       - .
 
   - name: gcr.io/cloud-builders/docker
     id: Push
     args:
       - push
-      - ${_IMAGE}
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     id: Deploy
@@ -22,7 +22,7 @@ steps:
       - run
       - deploy
       - ${_SERVICE_NAME}
-      - --image=${_IMAGE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
       - --region=${_REGION}
       - --platform=managed
       - --allow-unauthenticated
@@ -31,16 +31,14 @@ steps:
       - --timeout=3600
 
 substitutions:
-  # These values are intentionally left as placeholders.
-  # Set the real values in the Cloud Build trigger substitutions in GCP Console,
-  # or pass them via: gcloud builds submit --substitutions=_REGION=...,_AR_REPO=...
+  # Set real values in the Cloud Build trigger substitutions in GCP Console,
+  # or pass via: gcloud builds submit --substitutions=_REGION=...,_AR_REPO=...
   _REGION: europe-west1
   _AR_REPO: repo-people
   _SERVICE_NAME: repo-people-app
-  _IMAGE: ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
 
 options:
   logging: CLOUD_LOGGING_ONLY
 
 images:
-  - ${_IMAGE}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/backend:latest
