@@ -35,5 +35,8 @@ substitutions:
   _SERVICE_NAME: repo-people-app
   _REGION: europe-west1
 
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 images:
   - ${_IMAGE}
