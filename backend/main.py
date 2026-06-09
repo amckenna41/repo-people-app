@@ -48,6 +48,16 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 SESSION_COOKIE = "rp_session"
 
+
+def _backend_base_url(request: Request) -> str:
+    """Return the externally reachable backend base URL for OAuth callbacks."""
+    configured = (BACKEND_URL or "").strip().rstrip("/")
+    if configured and configured != "http://localhost:8000":
+        return configured
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
 # Short-lived in-memory store for OAuth state tokens (CSRF protection).
 # Maps state string → expiry timestamp (10-minute window).
 _oauth_states: dict[str, float] = {}
@@ -630,15 +640,16 @@ async def dev_clear_cache():
 # ---------------------------------------------------------------------------
 
 @app.get("/auth/login")
-async def auth_login():
+async def auth_login(request: Request):
     if not GITHUB_CLIENT_ID:
         raise HTTPException(503, "GitHub OAuth is not configured on this server.")
     state = secrets.token_urlsafe(32)
     # Store state with expiry timestamp for CSRF validation
     _oauth_states[state] = time.time()
+    backend_base_url = _backend_base_url(request)
     params = urlencode({
         "client_id": GITHUB_CLIENT_ID,
-        "redirect_uri": f"{BACKEND_URL}/auth/callback",
+        "redirect_uri": f"{backend_base_url}/auth/callback",
         "scope": "read:user user:email repo",
         "state": state,
     })

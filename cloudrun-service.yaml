@@ -9,6 +9,10 @@
 #                     e.g. us-central1-docker.pkg.dev/PROJECT_ID/repo-people/backend:latest
 #   CORS_ORIGINS:     comma-separated list of your frontend URL(s)
 #                     e.g. https://repo-people.vercel.app
+#   BACKEND_URL:      your public Cloud Run service URL (no trailing slash)
+#                     e.g. https://repo-people-app-xxxxx-ew.a.run.app
+#   FRONTEND_URL:     your Vercel app URL (no trailing slash)
+#                     e.g. https://repo-people.vercel.app
 
 apiVersion: serving.knative.dev/v1
 kind: Service
@@ -40,6 +44,10 @@ spec:
           env:
             - name: CORS_ORIGINS
               value: "CORS_ORIGINS"  # substituted by CI/CD from GH secret FRONTEND_URL
+            - name: BACKEND_URL
+              value: "BACKEND_URL"
+            - name: FRONTEND_URL
+              value: "FRONTEND_URL"
           resources:
             limits:
               cpu: "1"
