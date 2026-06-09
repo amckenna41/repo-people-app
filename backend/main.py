@@ -48,6 +48,15 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 SESSION_COOKIE = "rp_session"
 
+# In production the frontend (Vercel) and backend (Cloud Run) are on different
+# domains, so the session cookie must use SameSite=None; Secure=True to be sent
+# in cross-origin fetch requests (credentials: 'include').
+# In local development both run on localhost so SameSite=Lax is fine.
+_is_cross_origin = (
+    FRONTEND_URL.startswith("https://")
+    and "localhost" not in FRONTEND_URL
+)
+
 
 def _backend_base_url(request: Request) -> str:
     """Return the externally reachable backend base URL for OAuth callbacks."""
@@ -717,8 +726,8 @@ async def auth_callback(code: str, state: str):
         SESSION_COOKIE,
         session_id,
         httponly=True,
-        samesite="lax",
-        secure=False,   # Set to True in production (requires HTTPS)
+        samesite="none" if _is_cross_origin else "lax",
+        secure=_is_cross_origin,
         max_age=30 * 24 * 3600,
         path="/",
     )
