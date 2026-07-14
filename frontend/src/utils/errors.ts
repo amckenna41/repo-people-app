@@ -29,7 +29,11 @@ export function friendlyFetchError(msg: string, owner?: string, repo?: string): 
     return 'GitHub is temporarily unavailable. Try again in a few minutes.'
   }
   if (m.includes('network') || m.includes('failed to fetch') || m.includes('load failed') || m.includes('econnrefused')) {
-    return 'Could not reach the backend. Check your internet connection and that the backend server is running.'
+    const base = import.meta.env.VITE_API_BASE_URL
+    const target = base
+      ? `the backend at ${base}`
+      : 'the backend (VITE_API_BASE_URL is not set, so requests go to this site’s own origin)'
+    return `Could not reach ${target}. Confirm the Cloud Run service is deployed and running, that VITE_API_BASE_URL points at its URL, and that your network/CORS allows the request.`
   }
   return msg
 }

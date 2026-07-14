@@ -1,0 +1,133 @@
+name: Deploy — Cloud Run (backend)
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'GCP region'
+        required: false
+        default: 'europe-west1'
+        type: string
+      service:
+        description: 'Cloud Run service name'
+        required: false
+        default: 'repo-people-app'
+        type: string
+      image_tag:
+        description: 'Docker image tag (leave blank to use git SHA)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve build variables
+        id: vars
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.sha }}"
+
+          REGION="${{ inputs.region }}"
+          SERVICE="${{ inputs.service }}"
+          PROJECT="${{ secrets.GCP_PROJECT_ID }}"
+          AR_REPO="repo-people"
+
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${AR_REPO}/backend:${TAG}"
+          LATEST="${REGION}-docker.pkg.dev/${PROJECT}/${AR_REPO}/backend:latest"
+
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "region=$REGION"   >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE"     >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST"   >> "$GITHUB_OUTPUT"
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ steps.vars.outputs.region }}-docker.pkg.dev --quiet
+
+      - name: Ensure Artifact Registry repo exists
+        run: |
+          gcloud artifacts repositories describe repo-people \
+            --location=${{ steps.vars.outputs.region }} \
+            --project=${{ steps.vars.outputs.project }} 2>/dev/null || \
+          gcloud artifacts repositories create repo-people \
+            --location=${{ steps.vars.outputs.region }} \
+            --repository-format=docker \
+            --description="repo-people Docker images" \
+            --project=${{ steps.vars.outputs.project }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f Dockerfile.cloudrun \
+            -t "${{ steps.vars.outputs.image }}" \
+            -t "${{ steps.vars.outputs.latest }}" \
+            .
+
+      - name: Push to Artifact Registry
+        run: |
+          docker push "${{ steps.vars.outputs.image }}"
+          docker push "${{ steps.vars.outputs.latest }}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          # ponytail: min=1 would keep SQLite warm; matches cloudbuild.yaml (scale-to-zero)
+          CORS="${{ secrets.CORS_ORIGINS }}"
+          CORS="${CORS:-https://repo-people.vercel.app}"
+
+          gcloud run deploy "${{ steps.vars.outputs.service }}" \
+            --image="${{ steps.vars.outputs.image }}" \
+            --region="${{ steps.vars.outputs.region }}" \
+            --project="${{ steps.vars.outputs.project }}" \
+            --platform=managed \
+            --allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=1 \
+            --timeout=3600 \
+            --set-env-vars="CORS_ORIGINS=${CORS}"
+
+      - name: Get Cloud Run service URL
+        id: service_url
+        run: |
+          URL=$(gcloud run services describe "${{ steps.vars.outputs.service }}" \
+            --region="${{ steps.vars.outputs.region }}" \
+            --project="${{ steps.vars.outputs.project }}" \
+            --format='value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Cloud Run URL: $URL"
+
+      - name: Job summary
+        if: always()
+        env:
+          SERVICE_URL: ${{ steps.service_url.outputs.url }}
+        run: |
+          {
+            echo "## Cloud Run Deployment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Service** | \`${{ steps.vars.outputs.service }}\` |"
+            echo "| **URL** | ${SERVICE_URL:-_deploy step failed_} |"
+            echo "| **Region** | \`${{ steps.vars.outputs.region }}\` |"
+            echo "| **Project** | \`${{ steps.vars.outputs.project }}\` |"
+            echo "| **Image tag** | \`${{ steps.vars.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

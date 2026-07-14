@@ -88,6 +88,9 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
   const [progress, setProgress] = useState<ProgressEvent | null>(null)
   const [log, setLog] = useState<LogLine[]>([])
   const [done, setDone] = useState(false)
+  // Whether the just-finished run produced at least one usable result (job id).
+  // If the backend was unreachable, this stays false and View Results is disabled.
+  const [hasResults, setHasResults] = useState(false)
   const [showTokenModal, setShowTokenModal] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([])
@@ -382,6 +385,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
       doneRef.current = true
       setRunning(false)
       setDone(true)
+      setHasResults(fetchedJobIds.length > 0)
       stoppingRef.current = false
       setStopping(false)
       // stoppedByUser is intentionally left unchanged here so the label persists
@@ -971,7 +975,9 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
             <button
               type="button"
               onClick={onViewResults}
-              className="btn-primary w-full flex items-center justify-center gap-2"
+              disabled={!hasResults}
+              title={hasResults ? undefined : 'No results to show — the collection did not return any data.'}
+              className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               View Results →
             </button>
