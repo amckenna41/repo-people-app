@@ -84,7 +84,7 @@ export default function GlobalSearchModal({ allJobUsers, jobs, onClose, onSelect
           <Search size={18} className="text-gray-500 shrink-0" />
           <input
             ref={inputRef}
-            className="flex-1 bg-transparent outline-none text-sm text-white placeholder-gray-500"
+            className="flex-1 bg-transparent outline-hidden text-sm text-white placeholder-gray-500"
             placeholder={`Search across ${totalUsers.toLocaleString()} users from ${Object.keys(allJobUsers).length} job${Object.keys(allJobUsers).length !== 1 ? 's' : ''}…`}
             value={query}
             onChange={e => setQuery(e.target.value)}
@@ -128,7 +128,7 @@ export default function GlobalSearchModal({ allJobUsers, jobs, onClose, onSelect
                   {user.location && <span>{user.location}</span>}
                   {user.company && <span>{user.company}</span>}
                   <span
-                    className="px-1.5 py-0.5 rounded text-xs font-mono"
+                    className="px-1.5 py-0.5 rounded-sm text-xs font-mono"
                     style={{ background: 'rgba(139,92,246,0.15)', color: '#a78bfa' }}
                   >
                     {label}

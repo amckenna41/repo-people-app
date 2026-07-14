@@ -50,7 +50,7 @@ export default class ErrorBoundary extends Component<Props, State> {
           <AlertTriangle size={32} className="text-red-400" />
           <div>
             <p className="text-white font-semibold mb-1">Something went wrong</p>
-            <p className="text-sm text-gray-400 max-w-sm break-words">{this.state.errorMessage}</p>
+            <p className="text-sm text-gray-400 max-w-sm wrap-break-word">{this.state.errorMessage}</p>
           </div>
           <button
             onClick={this.handleReset}

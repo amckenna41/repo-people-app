@@ -144,7 +144,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
             >
               <div className="flex items-center gap-3 mb-2">
                 {/* Step number badge */}
-                <div className="flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold text-white flex-shrink-0"
+                <div className="flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold text-white shrink-0"
                   style={{ background: `linear-gradient(135deg, ${step.color}99, ${step.color}44)`, border: `1px solid ${step.color}55` }}>
                   {i + 1}
                 </div>
@@ -157,7 +157,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
               <ul className="space-y-1.5 ml-10">
                 {step.bullets.map((b, j) => (
                   <li key={j} className="flex items-start gap-2 text-sm text-gray-300">
-                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: step.color }} />
+                    <span className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0" style={{ background: step.color }} />
                     {b}
                   </li>
                 ))}
@@ -366,7 +366,7 @@ export default function App() {
         backdropFilter: 'blur(16px)',
         boxShadow: '0 0 40px rgba(124,58,237,0.08)',
       }}>
-        <div className="max-w-screen-xl mx-auto px-4 h-14 flex items-center">
+        <div className="max-w-(--breakpoint-xl) mx-auto px-4 h-14 flex items-center">
           {/* Left: logo */}
           <div className="flex-1 flex items-center">
             <button
@@ -427,7 +427,7 @@ export default function App() {
             >
               <Search size={14} />
               <span className="hidden sm:inline text-xs">Search users</span>
-              <kbd className="hidden sm:inline text-xs px-1 py-0.5 rounded opacity-50" style={{ background: 'rgba(255,255,255,0.08)' }}>⌘K</kbd>
+              <kbd className="hidden sm:inline text-xs px-1 py-0.5 rounded-sm opacity-50" style={{ background: 'rgba(255,255,255,0.08)' }}>⌘K</kbd>
             </button>
             {/* GitHub OAuth auth button */}
             {authUser ? (
@@ -484,7 +484,7 @@ export default function App() {
       )}
 
       {/* Main content */}
-      <main className="flex-1 max-w-screen-xl mx-auto w-full px-4 py-6">
+      <main className="flex-1 max-w-(--breakpoint-xl) mx-auto w-full px-4 py-6">
         <div className={view !== 'fetch' ? 'hidden' : ''}>
           <ErrorBoundary>
             <FetchView

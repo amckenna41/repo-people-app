@@ -535,7 +535,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                       onClick={() => removeRepo(i)}
                       disabled={running}
                       title="Remove this repo"
-                      className="flex-shrink-0 p-2 rounded-lg text-gray-500 hover:text-red-400 transition-colors disabled:opacity-40"
+                      className="shrink-0 p-2 rounded-lg text-gray-500 hover:text-red-400 transition-colors disabled:opacity-40"
                       style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
                     >
                       <Trash2 size={14} />
@@ -606,7 +606,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                         setShowHistory(false)
                       }}
                     >
-                      <History size={11} className="text-gray-600 flex-shrink-0" />
+                      <History size={11} className="text-gray-600 shrink-0" />
                       <span className="font-mono text-xs text-purple-300">{h.owner}</span>
                       <span className="text-gray-600">/</span>
                       <span className="font-mono text-xs text-blue-300">{h.repo}</span>
@@ -633,7 +633,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                 <img
                   src={authUser.avatar_url}
                   alt={authUser.login}
-                  className="w-8 h-8 rounded-full flex-shrink-0"
+                  className="w-8 h-8 rounded-full shrink-0"
                   style={{ border: '1px solid rgba(16,185,129,0.4)' }}
                 />
               )}
@@ -664,7 +664,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                     <ol className="space-y-1 text-gray-400">
                       <li><span className="text-purple-400 font-bold">1.</span> Go to <span className="text-blue-400">github.com/settings/tokens/new</span></li>
                       <li><span className="text-purple-400 font-bold">2.</span> Give it a name &amp; set an expiry</li>
-                      <li><span className="text-purple-400 font-bold">3.</span> Select the <code className="bg-white/10 px-1 rounded">public_repo</code> scope</li>
+                      <li><span className="text-purple-400 font-bold">3.</span> Select the <code className="bg-white/10 px-1 rounded-sm">public_repo</code> scope</li>
                       <li><span className="text-purple-400 font-bold">4.</span> Click <strong className="text-white">Generate token</strong> and paste it here</li>
                     </ol>
                     <p className="mt-1.5 text-gray-500">A token raises the rate limit from 60 to 5,000 req/hr.</p>
@@ -996,7 +996,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
           <h2 className="text-sm font-semibold text-gray-200">Import Previously Exported Data</h2>
         </div>
         <p className="text-xs text-gray-500">
-          Upload a <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'rgba(255,255,255,0.07)' }}>.json</code> file
+          Upload a <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.07)' }}>.json</code> file
           exported from a previous collection to visualise the data without re-running a collection.
         </p>
 
@@ -1171,7 +1171,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
 
               {/* Header */}
               <div className="flex items-start gap-3">
-                <div className="rounded-xl p-2 mt-0.5 flex-shrink-0" style={{ background: 'rgba(251,191,36,0.12)' }}>
+                <div className="rounded-xl p-2 mt-0.5 shrink-0" style={{ background: 'rgba(251,191,36,0.12)' }}>
                   <ShieldAlert size={22} className="text-amber-400" />
                 </div>
                 <div>
@@ -1192,19 +1192,19 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                 </div>
                 <ol className="space-y-2 text-sm text-gray-300">
                   <li className="flex gap-2">
-                    <span className="flex-shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>1</span>
+                    <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>1</span>
                     <span>Go to <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener noreferrer" className="underline decoration-dotted hover:text-white inline-flex items-center gap-0.5" style={{ color: '#60a5fa' }}>github.com/settings/tokens/new <ExternalLink size={11} /></a></span>
                   </li>
                   <li className="flex gap-2">
-                    <span className="flex-shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>2</span>
-                    <span>Give it a name (e.g. <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'rgba(255,255,255,0.08)' }}>repo-people-explorer</code>) and set an expiry.</span>
+                    <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>2</span>
+                    <span>Give it a name (e.g. <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>repo-people-explorer</code>) and set an expiry.</span>
                   </li>
                   <li className="flex gap-2">
-                    <span className="flex-shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>3</span>
-                    <span>Select the <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'rgba(255,255,255,0.08)' }}>public_repo</code> scope (read-only access to public repos is all that's needed).</span>
+                    <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>3</span>
+                    <span>Select the <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>public_repo</code> scope (read-only access to public repos is all that's needed).</span>
                   </li>
                   <li className="flex gap-2">
-                    <span className="flex-shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>4</span>
+                    <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>4</span>
                     <span>Click <strong className="text-white">Generate token</strong>, then copy it and paste it into the token field.</span>
                   </li>
                 </ol>

@@ -242,7 +242,7 @@ export default function UserTable({ users, onRowClick }: Props) {
           <span className="flex items-center gap-1.5">
             {score >= 60 && (
               <span title={`Likely bot/spam (score ${score})`}>
-                <AlertTriangle size={11} className="text-amber-400 flex-shrink-0" />
+                <AlertTriangle size={11} className="text-amber-400 shrink-0" />
               </span>
             )}
             <a
@@ -351,7 +351,7 @@ export default function UserTable({ users, onRowClick }: Props) {
             onClick={() => { setDropdownOpen(true); }}
           >
             <input
-              className="flex-1 bg-transparent outline-none text-sm py-2 min-w-0"
+              className="flex-1 bg-transparent outline-hidden text-sm py-2 min-w-0"
               placeholder={selectedLogin ? '' : 'Filter users…'}
               value={dropdownSearch}
               onChange={e => { setDropdownSearch(e.target.value); setDropdownOpen(true); setSelectedLogin(null) }}
@@ -365,7 +365,7 @@ export default function UserTable({ users, onRowClick }: Props) {
             {(selectedLogin || dropdownSearch) && (
               <button
                 type="button"
-                className="text-gray-500 hover:text-gray-200 flex-shrink-0 transition-colors"
+                className="text-gray-500 hover:text-gray-200 shrink-0 transition-colors"
                 onPointerDown={e => { e.preventDefault(); clearAllFilters() }}
               >
                 <X size={13} />
@@ -400,7 +400,7 @@ export default function UserTable({ users, onRowClick }: Props) {
                     onMouseLeave={e => { if (selectedLogin !== u.login) (e.currentTarget as HTMLElement).style.background = '' }}
                     onPointerDown={e => { e.preventDefault(); selectUser(u.login) }}
                   >
-                    <span className="font-mono text-xs text-gray-400 flex-shrink-0">{u.login}</span>
+                    <span className="font-mono text-xs text-gray-400 shrink-0">{u.login}</span>
                     {u.name && <span className="text-gray-500 text-xs truncate">{u.name}</span>}
                   </button>
                 ))
@@ -459,7 +459,7 @@ export default function UserTable({ users, onRowClick }: Props) {
                 placeholder="Search columns…"
                 value={visibilitySearch}
                 onChange={e => setVisibilitySearch(e.target.value)}
-                className="w-full bg-transparent outline-none text-xs px-2 py-1.5 rounded-md"
+                className="w-full bg-transparent outline-hidden text-xs px-2 py-1.5 rounded-md"
                 style={{
                   background: 'rgba(255,255,255,0.06)',
                   border: '1px solid rgba(255,255,255,0.10)',
@@ -524,7 +524,7 @@ export default function UserTable({ users, onRowClick }: Props) {
               <label className="block text-xs text-gray-400 mb-1">Location contains</label>
               <input
                 type="text"
-                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
                 placeholder="e.g. London"
                 value={filters.location}
@@ -535,7 +535,7 @@ export default function UserTable({ users, onRowClick }: Props) {
               <label className="block text-xs text-gray-400 mb-1">Company contains</label>
               <input
                 type="text"
-                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
                 placeholder="e.g. Google"
                 value={filters.company}
@@ -548,7 +548,7 @@ export default function UserTable({ users, onRowClick }: Props) {
                 <input
                   type="number"
                   min={0}
-                  className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                  className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                   style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
                   placeholder="0"
                   value={filters.minFollowers}
@@ -560,7 +560,7 @@ export default function UserTable({ users, onRowClick }: Props) {
                 <input
                   type="number"
                   min={0}
-                  className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                  className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                   style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
                   placeholder="∞"
                   value={filters.maxFollowers}
@@ -572,7 +572,7 @@ export default function UserTable({ users, onRowClick }: Props) {
               <label className="block text-xs text-gray-400 mb-1">Joined after</label>
               <input
                 type="date"
-                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
                 value={filters.joinedAfter}
                 onChange={e => setFilters(f => ({ ...f, joinedAfter: e.target.value }))}
@@ -582,7 +582,7 @@ export default function UserTable({ users, onRowClick }: Props) {
               <label className="block text-xs text-gray-400 mb-1">Joined before</label>
               <input
                 type="date"
-                className="w-full text-sm rounded-md px-2 py-1.5 outline-none"
+                className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
                 value={filters.joinedBefore}
                 onChange={e => setFilters(f => ({ ...f, joinedBefore: e.target.value }))}

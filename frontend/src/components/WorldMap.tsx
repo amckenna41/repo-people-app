@@ -711,7 +711,7 @@ export default function WorldMap({ users }: Props) {
         <select
           value={highlightedNum ?? ''}
           onChange={e => setHighlightedNum(e.target.value ? Number(e.target.value) : null)}
-          className="w-full text-xs rounded-lg px-3 py-2 text-gray-200 transition-all focus:outline-none focus:ring-1 focus:ring-purple-500"
+          className="w-full text-xs rounded-lg px-3 py-2 text-gray-200 transition-all focus:outline-hidden focus:ring-1 focus:ring-purple-500"
           style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)' }}
         >
           <option value="">All countries ({countryOptions.length})</option>
@@ -731,7 +731,7 @@ export default function WorldMap({ users }: Props) {
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2 text-xs text-gray-500">
           <span>0</span>
-          <div className="w-32 h-2 rounded" style={{
+          <div className="w-32 h-2 rounded-sm" style={{
             background: 'linear-gradient(to right, #1e1b4b, #7c3aed)',
           }} />
           <span>{maxCount} users</span>
@@ -740,18 +740,18 @@ export default function WorldMap({ users }: Props) {
           <button
             onClick={zoomOut}
             disabled={zoom <= MIN_ZOOM}
-            className="w-7 h-7 rounded flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-base leading-none"
+            className="w-7 h-7 rounded-sm flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-base leading-none"
             title="Zoom out"
           >−</button>
           <button
             onClick={resetZoom}
-            className="px-2 h-7 rounded text-xs text-gray-400 hover:text-white hover:bg-white/10 transition-all font-mono"
+            className="px-2 h-7 rounded-sm text-xs text-gray-400 hover:text-white hover:bg-white/10 transition-all font-mono"
             title="Reset zoom"
           >{zoom.toFixed(1)}×</button>
           <button
             onClick={zoomIn}
             disabled={zoom >= MAX_ZOOM}
-            className="w-7 h-7 rounded flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-base leading-none"
+            className="w-7 h-7 rounded-sm flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-base leading-none"
             title="Zoom in"
           >+</button>
         </div>
@@ -863,8 +863,8 @@ export default function WorldMap({ users }: Props) {
                   className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-all group"
                 >
                   {u.avatar_url
-                    ? <img src={u.avatar_url} alt={u.login} className="w-8 h-8 rounded-full flex-shrink-0 opacity-90 group-hover:opacity-100" />
-                    : <div className="w-8 h-8 rounded-full flex-shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{u.login[0].toUpperCase()}</div>
+                    ? <img src={u.avatar_url} alt={u.login} className="w-8 h-8 rounded-full shrink-0 opacity-90 group-hover:opacity-100" />
+                    : <div className="w-8 h-8 rounded-full shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{u.login[0].toUpperCase()}</div>
                   }
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-white font-medium truncate group-hover:text-purple-300 transition-colors">
@@ -872,7 +872,7 @@ export default function WorldMap({ users }: Props) {
                     </div>
                     <div className="text-xs text-gray-500 truncate">@{u.login}{u.company_normalized ? ` · ${u.company_normalized}` : ''}</div>
                   </div>
-                  <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                  <div className="flex flex-col items-end gap-1 shrink-0">
                     {u.followers != null && (
                       <span className="text-xs text-gray-500">{u.followers.toLocaleString()} followers</span>
                     )}

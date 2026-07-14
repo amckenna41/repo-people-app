@@ -725,7 +725,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 setRefreshing(false)
               }
             }}
-            className="p-1.5 rounded text-gray-600 hover:text-blue-400 transition-colors disabled:opacity-40"
+            className="p-1.5 rounded-sm text-gray-600 hover:text-blue-400 transition-colors disabled:opacity-40"
             style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
           >
             <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
@@ -740,7 +740,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 onJobDelete?.(activeJobId)
               }
             }}
-            className="p-1.5 rounded text-gray-600 hover:text-red-400 transition-colors"
+            className="p-1.5 rounded-sm text-gray-600 hover:text-red-400 transition-colors"
             style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
           >
             <Trash2 size={13} />
@@ -765,14 +765,14 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
               <button
                 onClick={commitRename}
                 title="Save name"
-                className="p-1 rounded text-green-400 hover:text-green-300 transition-colors"
+                className="p-1 rounded-sm text-green-400 hover:text-green-300 transition-colors"
               >
                 <Check size={14} />
               </button>
               <button
                 onClick={() => setRenamingJobId(null)}
                 title="Cancel"
-                className="p-1 rounded text-gray-500 hover:text-gray-300 transition-colors"
+                className="p-1 rounded-sm text-gray-500 hover:text-gray-300 transition-colors"
               >
                 <XIcon size={14} />
               </button>
@@ -785,7 +785,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 setRenameValue(current)
                 setRenamingJobId(activeJobId)
               }}
-              className="p-1.5 rounded text-gray-500 hover:text-gray-300 transition-colors"
+              className="p-1.5 rounded-sm text-gray-500 hover:text-gray-300 transition-colors"
               style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
             >
               <Pencil size={13} />
@@ -824,10 +824,10 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                       if (e.key === 'Escape') { setTaggingJobId(null); setTagInput('') }
                     }}
                   />
-                  <button onClick={commitTags} title="Save tags" className="p-1 rounded text-green-400 hover:text-green-300 transition-colors">
+                  <button onClick={commitTags} title="Save tags" className="p-1 rounded-sm text-green-400 hover:text-green-300 transition-colors">
                     <Check size={14} />
                   </button>
-                  <button onClick={() => { setTaggingJobId(null); setTagInput('') }} title="Cancel" className="p-1 rounded text-gray-500 hover:text-gray-300 transition-colors">
+                  <button onClick={() => { setTaggingJobId(null); setTagInput('') }} title="Cancel" className="p-1 rounded-sm text-gray-500 hover:text-gray-300 transition-colors">
                     <XIcon size={14} />
                   </button>
                 </div>
@@ -983,7 +983,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 { label: 'avg followers', value: String(healthScore.avgFollowers), bg: '#b45309' },
                 { label: 'avg repos', value: String(healthScore.avgRepos), bg: '#6d28d9' },
               ] as { label: string; value: string; bg: string }[]).map(b => (
-                <div key={b.label} className="flex items-stretch rounded overflow-hidden text-xs font-mono select-none">
+                <div key={b.label} className="flex items-stretch rounded-sm overflow-hidden text-xs font-mono select-none">
                   <div className="px-2 py-1 bg-gray-700 text-gray-300">{b.label}</div>
                   <div className="px-2 py-1 text-white font-bold" style={{ background: b.bg }}>{b.value}</div>
                 </div>
@@ -1065,7 +1065,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                     <ChartInfo text="A composite score (0–100) reflecting the community’s activity level, average account age, followers, and public repo count." />
                   </h3>
                   <div className="flex items-center gap-6">
-                    <div className="relative flex-shrink-0">
+                    <div className="relative shrink-0">
                       <svg width="100" height="100" viewBox="0 0 100 100">
                         <circle cx="50" cy="50" r="40" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="9" />
                         <circle cx="50" cy="50" r="40" fill="none"
@@ -1110,8 +1110,8 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                     {funnelData.map((d, i) => (
                       <div key={d.role} className="flex items-center gap-2 text-xs">
                         <span className="text-gray-400 w-24 text-right truncate capitalize">{d.role.replace(/_/g, ' ')}</span>
-                        <div className="flex-1 h-5 rounded overflow-hidden" style={{ background: 'rgba(255,255,255,0.05)' }}>
-                          <div className="h-full rounded" style={{ width: `${d.pct}%`, background: FUNNEL_COLORS[i % FUNNEL_COLORS.length] }} />
+                        <div className="flex-1 h-5 rounded-sm overflow-hidden" style={{ background: 'rgba(255,255,255,0.05)' }}>
+                          <div className="h-full rounded-sm" style={{ width: `${d.pct}%`, background: FUNNEL_COLORS[i % FUNNEL_COLORS.length] }} />
                         </div>
                         <span className="text-gray-300 w-10 text-right font-mono">{d.count.toLocaleString()}</span>
                       </div>
@@ -1491,7 +1491,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                     onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = checked ? 'rgba(139,92,246,0.1)' : 'transparent' }}
                   >
                     <div
-                      className="w-4 h-4 rounded flex-shrink-0 flex items-center justify-center border"
+                      className="w-4 h-4 rounded-sm shrink-0 flex items-center justify-center border"
                       style={{
                         borderColor: checked ? '#7c3aed' : 'rgba(255,255,255,0.15)',
                         background: checked ? '#7c3aed' : 'transparent',
@@ -1574,7 +1574,7 @@ function SummaryCard({
 
 function ChartInfo({ text }: { text: string }) {
   return (
-    <div className="relative group ml-auto flex-shrink-0">
+    <div className="relative group ml-auto shrink-0">
       <Info size={12} className="text-gray-500 hover:text-gray-300 cursor-default transition-colors" />
       <div
         className="pointer-events-none absolute z-50 right-0 bottom-full mb-2 w-56 rounded-xl p-3 text-xs text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"

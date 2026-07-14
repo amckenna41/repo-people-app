@@ -87,7 +87,7 @@ export default function UserDrawer({ user, onClose }: Props) {
               if (val === null || val === undefined || val === '') return null
               return (
                 <div key={key} className="flex gap-2">
-                  <dt className="text-gray-500 w-52 shrink-0 break-words">{key}</dt>
+                  <dt className="text-gray-500 w-52 shrink-0 wrap-break-word">{key}</dt>
                   <dd className="text-gray-200 break-all min-w-0">{String(val)}</dd>
                 </div>
               )
@@ -95,7 +95,7 @@ export default function UserDrawer({ user, onClose }: Props) {
             {/* Social accounts */}
             {user.social_accounts && (
               <div className="flex gap-2">
-                <dt className="text-gray-500 w-52 shrink-0 break-words">social_accounts</dt>
+                <dt className="text-gray-500 w-52 shrink-0 wrap-break-word">social_accounts</dt>
                 <dd className="text-gray-200 break-all min-w-0">{JSON.stringify(user.social_accounts)}</dd>
               </div>
             )}

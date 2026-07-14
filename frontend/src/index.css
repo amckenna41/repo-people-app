@@ -1,6 +1,107 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme {
+  --color-brand-50: #f5f3ff;
+  --color-brand-100: #ede9fe;
+  --color-brand-400: #a78bfa;
+  --color-brand-500: #8b5cf6;
+  --color-brand-600: #7c3aed;
+  --color-brand-700: #6d28d9;
+
+  --background-image-gradient-brand: linear-gradient(
+    135deg,
+    #7c3aed 0%,
+    #2563eb 60%,
+    #0ea5e9 100%
+  );
+  --background-image-gradient-text: linear-gradient(
+    90deg,
+    #a78bfa 0%,
+    #60a5fa 50%,
+    #34d399 100%
+  );
+
+  --shadow-glow: 0 0 20px rgba(124, 58, 237, 0.4);
+  --shadow-glow-sm: 0 0 10px rgba(124, 58, 237, 0.25);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility card {
+  @apply rounded-xl p-4;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(12px);
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.08),
+    0 4px 24px rgba(0, 0, 0, 0.4);
+  transition: box-shadow 0.2s;
+  &:hover {
+    box-shadow:
+      0 0 0 1px rgba(139, 92, 246, 0.18),
+      0 8px 32px rgba(139, 92, 246, 0.12);
+  }
+}
+
+@utility btn-primary {
+  @apply font-semibold px-4 py-2 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed text-white;
+  background: linear-gradient(135deg, #7c3aed 0%, #2563eb 60%, #0ea5e9 100%);
+  box-shadow: 0 0 20px rgba(124, 58, 237, 0.35);
+  &:not(:disabled):hover {
+    background: linear-gradient(135deg, #6d28d9 0%, #1d4ed8 60%, #0284c7 100%);
+    box-shadow: 0 0 28px rgba(124, 58, 237, 0.5);
+    transform: translateY(-1px);
+  }
+}
+
+@utility btn-secondary {
+  @apply font-medium px-4 py-2 rounded-lg transition-colors text-gray-200;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  &:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
+}
+
+@utility input {
+  @apply text-gray-100 rounded-lg px-3 py-2 w-full focus:outline-hidden placeholder-gray-500;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s;
+  &:focus {
+    border-color: rgba(139, 92, 246, 0.6);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+  }
+}
+
+@utility badge {
+  @apply text-xs font-medium px-2 py-0.5 rounded-full;
+}
+
+@utility gradient-heading {
+  background: linear-gradient(90deg, #a78bfa 0%, #60a5fa 50%, #34d399 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
 
 @layer base {
   body {
@@ -27,57 +128,5 @@
   #root {
     position: relative;
     z-index: 1;
-  }
-}
-
-@layer components {
-  .card {
-    @apply rounded-xl p-4;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    backdrop-filter: blur(12px);
-    box-shadow: 0 0 0 1px rgba(139,92,246,0.08), 0 4px 24px rgba(0,0,0,0.4);
-    transition: box-shadow 0.2s;
-  }
-  .card:hover {
-    box-shadow: 0 0 0 1px rgba(139,92,246,0.18), 0 8px 32px rgba(139,92,246,0.12);
-  }
-  .btn-primary {
-    @apply font-semibold px-4 py-2 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed text-white;
-    background: linear-gradient(135deg, #7c3aed 0%, #2563eb 60%, #0ea5e9 100%);
-    box-shadow: 0 0 20px rgba(124,58,237,0.35);
-  }
-  .btn-primary:not(:disabled):hover {
-    background: linear-gradient(135deg, #6d28d9 0%, #1d4ed8 60%, #0284c7 100%);
-    box-shadow: 0 0 28px rgba(124,58,237,0.5);
-    transform: translateY(-1px);
-  }
-  .btn-secondary {
-    @apply font-medium px-4 py-2 rounded-lg transition-colors text-gray-200;
-    background: rgba(255,255,255,0.07);
-    border: 1px solid rgba(255,255,255,0.10);
-  }
-  .btn-secondary:hover {
-    background: rgba(255,255,255,0.12);
-  }
-  .input {
-    @apply text-gray-100 rounded-lg px-3 py-2 w-full focus:outline-none placeholder-gray-500;
-    background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.10);
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-  .input:focus {
-    border-color: rgba(139,92,246,0.6);
-    box-shadow: 0 0 0 3px rgba(139,92,246,0.15);
-  }
-  .badge {
-    @apply text-xs font-medium px-2 py-0.5 rounded-full;
-  }
-
-  .gradient-heading {
-    background: linear-gradient(90deg, #a78bfa 0%, #60a5fa 50%, #34d399 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
   }
 }
