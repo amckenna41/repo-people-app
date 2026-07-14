@@ -6,6 +6,9 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
+      // Tests live outside frontend/, so pin React (and its jsx runtime subpaths) to frontend/node_modules.
+      'react': path.resolve(__dirname, 'node_modules/react'),
+      'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
       '@testing-library/jest-dom': path.resolve(__dirname, 'node_modules/@testing-library/jest-dom'),
       '@testing-library/react': path.resolve(__dirname, 'node_modules/@testing-library/react'),
       'vitest-fetch-mock': path.resolve(__dirname, 'node_modules/vitest-fetch-mock'),

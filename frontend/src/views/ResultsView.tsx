@@ -1214,7 +1214,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                   <XAxis
                     dataKey="role"
                     interval={0}
-                    tick={(props: { x: number; y: number; payload: { value: string } }) => (
+                    tick={(props: any) => (
                       <g transform={`translate(${props.x},${props.y})`}>
                         <text
                           x={0} y={0} dy={4}
@@ -1230,7 +1230,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                   />
                   <YAxis tickFormatter={(v: number) => `${v}%`} tick={{ fill: '#9ca3af', fontSize: 10 }} domain={[0, 100]} />
                   <Tooltip
-                    formatter={(value: number, name: string) => [`${value}%`, name]}
+                    formatter={(value: any, name: any) => [`${value}%`, name]}
                     contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }}
                   />
                   <Legend wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
@@ -1320,8 +1320,8 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                       <YAxis tick={{ fill: '#9ca3af', fontSize: 10 }} width={40} />
                       <Tooltip
                         contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }}
-                        labelFormatter={(l: string) => `Month: ${l}`}
-                        formatter={(value: number, name: string) => [value.toLocaleString(), name === 'cumulative' ? 'Total' : 'New']}
+                        labelFormatter={(l: any) => `Month: ${l}`}
+                        formatter={(value: any, name: any) => [Number(value).toLocaleString(), name === 'cumulative' ? 'Total' : 'New']}
                       />
                       <Area
                         type="monotone"

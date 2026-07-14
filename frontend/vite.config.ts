@@ -9,11 +9,13 @@ export default defineConfig({
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
-        manualChunks: {
-          'vendor-react': ['react', 'react-dom'],
-          'vendor-recharts': ['recharts'],
-          'vendor-maps': ['react-simple-maps'],
-          'vendor-table': ['@tanstack/react-table'],
+        // Vite 8 / Rolldown only accepts the function form of manualChunks.
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/[/\\]node_modules[/\\](react|react-dom|scheduler)[/\\]/.test(id)) return 'vendor-react'
+          if (id.includes('recharts')) return 'vendor-recharts'
+          if (id.includes('react-simple-maps')) return 'vendor-maps'
+          if (id.includes('@tanstack/react-table')) return 'vendor-table'
         },
       },
     },
