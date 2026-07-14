@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, Github, RefreshCw } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw } from 'lucide-react'
+import { Github } from '../components/GithubIcon'
 import { postFetch, postImport, cancelJob, openAuthPopup } from '../utils/api'
 import { friendlyFetchError } from '../utils/errors'
 import type { JobInfo, AuthUser } from '../types'
