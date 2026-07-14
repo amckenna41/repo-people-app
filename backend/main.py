@@ -49,6 +49,7 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 SESSION_COOKIE = "rp_session"
 ANON_COOKIE = "rp_client"
 
+<<<<<<< HEAD
 # Cookie flags. Secure is auto-enabled when the backend is served over HTTPS.
 # COOKIE_SAMESITE=none is required when the frontend and backend are on
 # different origins (e.g. Vercel frontend + Cloud Run backend); it forces Secure.
@@ -56,6 +57,30 @@ _cookie_secure = BACKEND_URL.startswith("https")
 _cookie_samesite = os.environ.get("COOKIE_SAMESITE", "lax").lower()
 if _cookie_samesite == "none":
     _cookie_secure = True
+=======
+# In production the frontend (Vercel) and backend (Cloud Run) are on different
+# domains, so the session cookie must use SameSite=None; Secure=True to be sent
+# in cross-origin fetch requests (credentials: 'include').
+# In local development both run on localhost so SameSite=Lax is fine.
+_is_cross_origin = (
+    FRONTEND_URL.startswith("https://")
+    and "localhost" not in FRONTEND_URL
+)
+
+
+def _backend_base_url(request: Request) -> str:
+    """Return the externally reachable backend base URL for OAuth callbacks."""
+    configured = (BACKEND_URL or "").strip().rstrip("/")
+    if configured and configured != "http://localhost:8000":
+        return configured
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
+# Short-lived in-memory store for OAuth state tokens (CSRF protection).
+# Maps state string → expiry timestamp (10-minute window).
+_oauth_states: dict[str, float] = {}
+>>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
 
 # Per-caller rate limit for expensive endpoints (/fetch, /import).
 # ponytail: in-memory per-instance window; move to Redis if you run >1 instance.
@@ -808,15 +833,21 @@ async def dev_clear_cache():
 # ---------------------------------------------------------------------------
 
 @app.get("/auth/login")
-async def auth_login():
+async def auth_login(request: Request):
     if not GITHUB_CLIENT_ID:
         raise HTTPException(503, "GitHub OAuth is not configured on this server.")
     state = secrets.token_urlsafe(32)
+<<<<<<< HEAD
     # Persist state (10-min TTL) for CSRF validation on callback.
     await add_oauth_state(state, ttl_seconds=600)
+=======
+    # Store state with expiry timestamp for CSRF validation
+    _oauth_states[state] = time.time()
+    backend_base_url = _backend_base_url(request)
+>>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
     params = urlencode({
         "client_id": GITHUB_CLIENT_ID,
-        "redirect_uri": f"{BACKEND_URL}/auth/callback",
+        "redirect_uri": f"{backend_base_url}/auth/callback",
         "scope": "read:user user:email repo",
         "state": state,
     })
@@ -883,8 +914,13 @@ async def auth_callback(code: str, state: str):
         SESSION_COOKIE,
         session_id,
         httponly=True,
+<<<<<<< HEAD
         samesite=_cookie_samesite,
         secure=_cookie_secure,   # auto-enabled when BACKEND_URL is https / SameSite=None
+=======
+        samesite="none" if _is_cross_origin else "lax",
+        secure=_is_cross_origin,
+>>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
         max_age=30 * 24 * 3600,
         path="/",
     )

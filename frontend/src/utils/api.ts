@@ -291,8 +291,9 @@ export function openAuthPopup(): Window | null {
   const w = 600, h = 700
   const left = Math.round(window.screenX + (window.outerWidth - w) / 2)
   const top = Math.round(window.screenY + (window.outerHeight - h) / 2)
+  const loginUrl = `${BASE}/auth/login`
   return window.open(
-    '/auth/login',
+    loginUrl,
     'github-oauth',
     `popup,width=${w},height=${h},left=${left},top=${top}`,
   )

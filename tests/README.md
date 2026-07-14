@@ -2,6 +2,8 @@
 
 This directory contains unit and integration tests for the **backend** (Python/FastAPI) and **frontend** (TypeScript/Vitest) of the repo-people Explorer.
 
+**250 tests total** — 173 backend (pytest) + 77 frontend (Vitest).
+
 ---
 
 ## Structure

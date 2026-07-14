@@ -2,7 +2,7 @@
  * errors.test.ts — Unit tests for src/utils/errors.ts
  */
 import { describe, expect, it } from 'vitest'
-import { friendlyFetchError } from '../../utils/errors'
+import { friendlyFetchError } from '../../../frontend/src/utils/errors'
 
 describe('friendlyFetchError', () => {
   it('maps HTTP 401 to an authentication failure message', () => {

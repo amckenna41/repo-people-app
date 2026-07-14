@@ -7,7 +7,7 @@
  * a component module.
  */
 import { describe, expect, it } from 'vitest'
-import type { UserRecord } from '../../types'
+import type { UserRecord } from '../../../frontend/src/types'
 
 // ---------------------------------------------------------------------------
 // Re-implement computeBotScore so we can test the logic without importing the

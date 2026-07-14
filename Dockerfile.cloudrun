@@ -1,14 +1,28 @@
 # Cloud Run production Dockerfile
 # Build context: repo root (repo-people-app/)
+<<<<<<< HEAD
+=======
+# Installs repo-people from PyPI for non-interactive cloud builds.
+>>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
+<<<<<<< HEAD
 # Install backend Python dependencies, including repo-people (the data engine),
 # all pinned to exact versions in requirements.cloudrun.txt for reproducible builds.
+=======
+# System deps (needed by some transitive packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install backend Python dependencies
+>>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
 COPY backend/requirements.cloudrun.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+  && python -c "import fastapi, uvicorn, httpx, sse_starlette, aiosqlite"
 
 # Copy backend source
 COPY backend/ /app/
