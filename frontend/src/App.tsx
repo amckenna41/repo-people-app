@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Github, BarChart2, GitCompare, Search, HelpCircle, X, Key, PlayCircle, BarChart, GitCompare as GitCompareIcon, Download } from 'lucide-react'
+import { BarChart2, GitCompare, Search, HelpCircle, X, Key, PlayCircle, BarChart, GitCompare as GitCompareIcon, Download } from 'lucide-react'
+import { Github } from './components/GithubIcon'
 import FetchView from './views/FetchView'
 import ResultsView from './views/ResultsView'
 import CompareView from './views/CompareView'
