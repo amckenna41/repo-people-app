@@ -150,6 +150,11 @@ old/
 
 __pycache__/
 
+# SQLite job store — contains harvested data and OAuth tokens; never commit.
+*.db
+*.db-wal
+*.db-shm
+
 .env
 
 ToDo.md

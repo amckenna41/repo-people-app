@@ -6,6 +6,61 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — 2026-07-14
+
+### Security
+
+- **Jobs are now scoped to their creator (IDOR fix).** Previously every endpoint was unauthenticated and `GET /jobs` listed *all* jobs to *all* visitors, so anyone could read, export, compare, rename, or delete anyone else's harvested data. A new `owner_key` column (`backend/store.py`) scopes each job to its creator — the GitHub login for OAuth users, or an anonymous httponly `rp_client` cookie otherwise. `GET /jobs` filters to the caller (`load_jobs_list(owner_key)`); `/results`, `/summary`, `/top`, `/export/*`, `/compare`, `/compare/multi`, `/share`, `DELETE`, `PATCH`, `/cancel`, and `/stream` all resolve jobs through `_get_owned_job()` and return `404` for jobs the caller doesn't own (existence is not leaked). Legacy jobs with a `NULL` owner remain public for back-compat.
+- **`GET /clear_cache` (destructive) replaced by a guarded `POST`.** The old endpoint was a prefetchable `GET` that ran `DELETE FROM jobs` with no auth — any crawler, link prefetch, or `<img>` could wipe the database. It is now `POST /clear_cache`, disabled unless `ALLOW_DEV_CLEAR=1` (returns `403` otherwise). `main.tsx` updated to `POST`.
+- **Stored-XSS guard on import.** `POST /import` accepted arbitrary records that the frontend later rendered in `href`/`src`. `_sanitise_urls()` (`backend/main.py`) now blanks any non-`http(s)` `html_url`/`avatar_url`/`blog` value (e.g. `javascript:`, `data:`) before storage.
+- **Import size-limit bypass closed.** The 5 MB cap previously trusted the `Content-Length` header (omit it and the body was read unbounded). `_read_capped_body()` now streams the request and aborts at 5 MB regardless of headers.
+- **Session cookie flags are environment-driven.** The OAuth session cookie was hardcoded `secure=False`. `Secure` is now auto-enabled when `BACKEND_URL` is HTTPS, and `SameSite` is configurable via `COOKIE_SAMESITE` (`lax` default; `none` forces `Secure`) for cross-origin frontend/backend deployments. The anonymous `rp_client` cookie uses the same flags.
+- **Per-caller rate limiting.** `POST /fetch` and `POST /import` are limited to `FETCH_RATE_LIMIT` (default 20) requests per minute per `owner_key` via an in-memory sliding window (`_rate_check`), returning `429` when exceeded.
+- **SQLite job store removed from version control.** `backend/repo_people_jobs.db` (which contained harvested results *and* the `sessions` table of raw GitHub OAuth tokens) plus six committed `.pyc` files are now untracked; `*.db` added to `.gitignore`. **Rotate any GitHub tokens that were stored in the committed DB — git history still contains them.**
+
+### Added
+
+- **`POST /jobs/{job_id}/refresh`** (`backend/main.py`, `frontend/src/utils/api.ts`, `frontend/src/views/ResultsView.tsx`, `frontend/src/App.tsx`) — Re-runs a job with its original fetch parameters as a new owned job. Fetch parameters (no secrets) are stored in a new `params_json` column at creation time. A refresh button in the Results toolbar starts the re-fetch; `App.handleJobRefresh` adds the new running job and attaches an SSE listener to flip it to *done*. *Scheduled/cron refresh deferred — requires a durable scheduler and job execution.*
+- **DB-backed OAuth state and share tokens** (`backend/store.py`) — New `oauth_states` and `share_tokens` tables with `add_oauth_state`/`consume_oauth_state` and `add_share_token`/`get_share_token` helpers replace the in-memory `_oauth_states`/`_share_tokens` dicts, so CSRF state and share links survive restarts and multiple instances. Expiry is enforced in Python (ISO timestamps) with an inline sweep on access.
+- **`persist_job()` store helper** (`backend/store.py`) — Writes several job fields (`result`, `status`, `total_fetched`, …) in a single awaited `UPDATE`, used for terminal state transitions in the worker and import path.
+- **`owner_key` / `params_json` columns** (`backend/store.py`) — Added to the `jobs` table via idempotent `ALTER TABLE` migrations; `create_job_async(owner_key, params)` and `_insert_job` persist them; `_row_to_job` surfaces them.
+- **`refreshJob()` API client** (`frontend/src/utils/api.ts`) — Typed `POST /jobs/{id}/refresh` with optional `Authorization: Bearer` token.
+
+### Changed
+
+- **All frontend API calls send credentials.** A `req()` wrapper in `api.ts` sets `credentials: 'include'` on every request so the scoping cookie is transmitted; the refresh-job `EventSource` uses `withCredentials: true`.
+- **Worker terminal writes are atomic** (`backend/worker.py`) — The success and partial-salvage completion paths now call `persist_job(...)` once instead of three fire-and-forget `_JobProxy` writes, fixing a race where `status="done"` could persist before `result`.
+- **`POST /import` reads a capped stream** (`backend/main.py`) — Signature/body handling changed to stream-read with a hard byte cap and persist the completed job via `persist_job` (owner-scoped).
+- **Startup no longer spawns `_cleanup_ephemeral_stores`** (`backend/main.py`) — The in-memory sweep task is removed; expired OAuth state and share tokens are pruned inline by their DB helpers.
+
+### Fixed
+
+- **`export_maintainers` called with keyword arguments** (`backend/worker.py`) — The positional `False, False` (`skip_codeowners`, `skip_collaborators`) are now passed by name, guarding against signature drift.
+- **Build-breaking stray file removed** (`frontend/src/error_test.ts`) — This file (`const a: number = 'string';`, committed in v1.1.0) failed `tsc` and therefore `npm run build`. Deleted; it was unreferenced.
+- **Share-link expiry date comparison** (`backend/store.py`) — Expiry checks use consistent ISO timestamps rather than mixing `isoformat()` with SQLite `datetime('now')` (whose differing separators broke string comparison).
+- **`httpx` missing from `backend/requirements.cloudrun.txt`** — `backend/main.py` imports `httpx` (GitHub OAuth token/profile exchange), but the Cloud Run requirements file omitted it, so OAuth would `ImportError` at runtime on Cloud Run. Added `httpx>=0.27.0`.
+- **Misleading dependency comments corrected** — `backend/requirements.txt` no longer claims a `file://` local install; `Dockerfile.cloudrun` no longer claims a non-existent commit pin or that `repo-people` is unpublished (1.0.0 and 1.0.1 are on PyPI).
+
+### Removed
+
+- **Dead store helpers deleted** (`backend/store.py`) — Unused `all_job_ids()` and `clear_summary_caches()` removed.
+- **In-memory `_oauth_states` / `_share_tokens` dicts** (`backend/main.py`) — Replaced by the DB-backed tables above.
+
+### Dependencies
+
+- **`repo-people` pinned to `==1.0.1` across all four install paths.** `repo-people` is the data engine (role fetchers and profile lookups in `backend/worker.py`), but it was installed inconsistently: `backend/requirements.txt` used `>=1.0.0` (PyPI), while `Dockerfile.cloudrun` and `.github/workflows/build_test.yml` installed from **unpinned** `git+https://…/repo-people.git` (default branch HEAD) — so Vercel/local and Cloud Run/CI could run different versions, and git builds were not reproducible despite a comment claiming a commit pin. All four now install `repo-people==1.0.1` from PyPI (verified to expose every export function the worker calls). Bump deliberately.
+- **`.github/dependabot.yml`** (new) — Weekly update PRs for `pip` (`/backend`), `npm` (`/frontend`), and `github-actions`, so a new `repo-people` (or any dependency) release surfaces as a reviewable PR instead of silently changing at build time.
+- **`Dockerfile.cloudrun` simplified** — Removed the separate unpinned `git+https` install of `repo-people` and the now-unneeded `git` apt layer; the image installs everything (including pinned `repo-people`) from `requirements.cloudrun.txt`.
+- **`.github/workflows/build_test.yml`** — CI now installs runtime deps from `requirements.cloudrun.txt` (the same file Cloud Run uses) plus test-only `pytest`/`pytest-asyncio`, instead of an ad-hoc list topped by the unpinned git install — so CI tests the exact version that ships.
+
+### Tests
+
+- **Backend — `tests/backend/test_api_ownership.py`** (new) — 8 tests: owners see their own jobs in the list; other callers don't; other callers get `404` on read/delete; legacy `NULL`-owner jobs stay public; `/import` mints an anonymous cookie; refresh returns `409` without saved params and `404` for non-owners.
+- **Backend — `tests/backend/test_api_import.py`** — Added `test_unsafe_urls_are_stripped` asserting `javascript:`/`data:` URL fields are blanked while `https` URLs survive.
+- **Backend — `tests/backend/test_api_results.py`** — `TestShareEndpoints` expired-token test updated to the DB-backed store (expired tokens now return `404` and are pruned on access); the paginated-share assertion corrected to `len(SAMPLE_USERS)`.
+
+---
+
 ## [Unreleased] — 2026-05-13
 
 ### Added

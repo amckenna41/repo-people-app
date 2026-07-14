@@ -94,3 +94,23 @@ class TestImport:
         # API requires a non-empty dict
         resp = await async_client.post("/import", json={})
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_unsafe_urls_are_stripped(self, async_client):
+        # Stored-XSS guard: non-http(s) URL fields must be blanked on import so
+        # the frontend can't render javascript:/data: links in href/src.
+        payload = {
+            "mallory": {
+                "login": "mallory",
+                "html_url": "javascript:alert(1)",
+                "avatar_url": "data:text/html;base64,PHNjcmlwdD4=",
+                "blog": "https://legit.example.com",
+            }
+        }
+        imp = await async_client.post("/import", json=payload)
+        jid = imp.json()["job_id"]
+        results = (await async_client.get(f"/results/{jid}")).json()["users"]
+        assert results["mallory"]["html_url"] == ""
+        assert results["mallory"]["avatar_url"] == ""
+        # Legitimate https URLs are preserved.
+        assert results["mallory"]["blog"] == "https://legit.example.com"

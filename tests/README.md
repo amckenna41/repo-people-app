@@ -14,7 +14,8 @@ tests/
     ├── test_api_jobs.py     # Integration tests for /jobs, /fetch, cancel, rename, tags
     ├── test_api_results.py  # Integration tests for /results, /summary, /top, exports
     ├── test_api_compare.py  # Integration tests for /compare and /compare/multi
-    └── test_api_import.py   # Integration tests for POST /import
+    ├── test_api_import.py   # Integration tests for POST /import (incl. URL sanitisation)
+    └── test_api_ownership.py # Job scoping: owners-only list/read/mutate, refresh
 
 frontend/src/tests/
 ├── setup.ts             # Vitest global setup (fetch mock, DOM env)

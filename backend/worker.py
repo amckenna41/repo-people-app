@@ -16,7 +16,7 @@ from repo_people.users import GitHubUserInfo
 from repo_people import export as rp_export
 from github import Github, Auth, GithubException
 
-from store import get_job
+from store import get_job, persist_job
 
 
 def _classify_role_error(exc: Exception, role: str) -> str:
@@ -83,7 +83,7 @@ async def run_fetch_job(
         _tmp = tempfile.gettempdir()  # B5/BE3: use system temp dir, not hardcoded /tmp
         role_funcs: dict[str, Any] = {
             "contributors":   lambda: rp_export.export_contributors(owner, repo, _token, _tmp, return_data=True),
-            "maintainers":    lambda: rp_export.export_maintainers(owner, repo, _token, _tmp, False, False, return_data=True),
+            "maintainers":    lambda: rp_export.export_maintainers(owner, repo, _token, _tmp, skip_codeowners=False, skip_collaborators=False, return_data=True),
             "stargazers":     lambda: rp_export.export_stargazers(owner, repo, _token, _tmp, return_data=True),
             "watchers":       lambda: rp_export.export_watchers(owner, repo, _token, _tmp, return_data=True),
             "issue_authors":  lambda: rp_export.export_issue_authors(owner, repo, _token, _tmp, return_data=True),
@@ -224,9 +224,9 @@ async def run_fetch_job(
         finally:
             watcher.cancel()
 
-        job["result"] = results
-        job["status"] = "done"
-        job["total_fetched"] = len(results)
+        # B3: persist the terminal state in one awaited write so result/status/total
+        # can't land out of order via fire-and-forget _JobProxy writes.
+        await persist_job(job_id, result=results, status="done", total_fetched=len(results))
 
         if job.get("cancelled"):
             await emit("status", {"message": f"Fetch stopped by user. {len(results)} users saved."})
@@ -247,9 +247,7 @@ async def run_fetch_job(
         # If save_each_user is enabled, try to salvage partial results rather than failing
         if save_each_user:
             if results:
-                job["result"] = results
-                job["status"] = "done"
-                job["total_fetched"] = len(results)
+                await persist_job(job_id, result=results, status="done", total_fetched=len(results))
                 await emit("status", {"message": f"Fetch interrupted. Using {len(results)} users fetched so far."})
                 await emit("done", {"total": len(results)})
                 return
@@ -257,15 +255,12 @@ async def run_fetch_job(
                 try:
                     with open(partial_path) as pf:
                         partial_results = json.load(pf)
-                    job["result"] = partial_results
-                    job["status"] = "done"
-                    job["total_fetched"] = len(partial_results)
+                    await persist_job(job_id, result=partial_results, status="done", total_fetched=len(partial_results))
                     await emit("status", {"message": f"Fetch failed. Restored {len(partial_results)} users from last saved checkpoint."})
                     await emit("done", {"total": len(partial_results)})
                     return
                 except Exception:
                     pass
-        job["status"] = "error"
-        job["message"] = sanitised_message
+        await persist_job(job_id, status="error", message=sanitised_message)
         await emit("error", {"message": sanitised_message})
         await emit("done", {})

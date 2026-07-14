@@ -7,8 +7,10 @@ import './index.css'
 // Visiting /clear_cache calls the backend to delete all jobs, wipes
 // client-side storage, then redirects to the app root.
 if (window.location.pathname === '/clear_cache') {
-  fetch('/clear_cache')
-    .catch(() => {/* backend may already be empty — continue regardless */})
+  // Dev-only reset. The backend endpoint is a guarded POST (enabled via
+  // ALLOW_DEV_CLEAR); it 403s in production, which we ignore here.
+  fetch('/clear_cache', { method: 'POST' })
+    .catch(() => {/* backend may already be empty or disabled — continue regardless */})
     .finally(() => {
       sessionStorage.clear()
       localStorage.removeItem('repo-people-jobs')

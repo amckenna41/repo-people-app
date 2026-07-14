@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
-import { fetchResults, fetchResultsPage, fetchSummary, fetchTop, renameJob, createShareToken } from '../utils/api'
+import { fetchResults, fetchResultsPage, fetchSummary, fetchTop, renameJob, createShareToken, refreshJob } from '../utils/api'
 import type { JobInfo, UserRecord, SummaryData } from '../types'
 import { ROLE_COLORS } from '../types'
 import UserTable from '../components/UserTable'
@@ -9,7 +9,7 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend, AreaChart, Area,
 } from 'recharts'
-import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock, Layers, TrendingUp, Link } from 'lucide-react'
+import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock, Layers, TrendingUp, Link, RefreshCw } from 'lucide-react'
 
 interface Props {
   jobs: JobInfo[]
@@ -20,6 +20,7 @@ interface Props {
   onJobUpdate?: (job_id: string, patch: Partial<JobInfo>) => void
   onJobDelete?: (job_id: string) => void
   onJobTagsUpdate?: (job_id: string, tags: string[]) => void
+  onJobRefresh?: (newJobId: string, label: string) => void
 }
 
 function relativeTime(iso?: string): string {
@@ -47,7 +48,7 @@ const TOP_BY_OPTIONS = [
   { key: 'total_public_stars_sampled', label: 'Stars' },
 ]
 
-export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJobIds, onUsersLoaded, onJobUpdate, onJobDelete, onJobTagsUpdate }: Props) {
+export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJobIds, onUsersLoaded, onJobUpdate, onJobDelete, onJobTagsUpdate, onJobRefresh }: Props) {
   const [users, setUsers] = useState<UserRecord[]>([])
   const [summary, setSummary] = useState<SummaryData | null>(null)
   const [topUsers, setTopUsers] = useState<UserRecord[]>([])
@@ -67,6 +68,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const [error, setError] = useState<string | null>(null)
   const [renamingJobId, setRenamingJobId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
   const [tagFilter, setTagFilter] = useState<string[]>([])
   const [taggingJobId, setTaggingJobId] = useState<string | null>(null)
   const [tagInput, setTagInput] = useState('')
@@ -706,6 +708,29 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
           ) : null
         })()
         }
+        {/* Refresh active job — re-run with its original fetch parameters */}
+        {activeJobId && onJobRefresh && (
+          <button
+            title="Refresh — re-fetch this repository with the same settings"
+            disabled={refreshing}
+            onClick={async () => {
+              const job = doneJobs.find(j => j.job_id === activeJobId)
+              setRefreshing(true)
+              try {
+                const { job_id } = await refreshJob(activeJobId)
+                onJobRefresh(job_id, job?.label ?? activeJobId)
+              } catch (e) {
+                alert(e instanceof Error ? e.message : 'Refresh failed. Imported jobs cannot be refreshed.')
+              } finally {
+                setRefreshing(false)
+              }
+            }}
+            className="p-1.5 rounded text-gray-600 hover:text-blue-400 transition-colors disabled:opacity-40"
+            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
+          >
+            <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
+          </button>
+        )}
         {/* Delete active job */}
         {activeJobId && (
           <button

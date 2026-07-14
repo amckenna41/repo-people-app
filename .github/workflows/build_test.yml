@@ -36,13 +36,11 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          # Install repo-people from GitHub (PyPI release lags behind local version)
-          pip install "repo-people @ git+https://github.com/amckenna41/repo-people.git"
-          pip install pytest pytest-asyncio httpx python-dotenv
-          pip install PyGithub requests beautifulsoup4 aiohttp
-          pip install fastapi uvicorn[standard] sse-starlette aiosqlite
-          # Use cloudrun requirements (no local file:// reference)
+          # Install runtime deps (incl. repo-people, pinned) from the same file
+          # Cloud Run uses, so CI tests the exact version that ships.
           pip install -r requirements.cloudrun.txt
+          # Test-only tooling not needed at runtime.
+          pip install pytest pytest-asyncio
 
       - name: Run backend tests
         run: |

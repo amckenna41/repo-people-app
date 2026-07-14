@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Backend Python deps — opens a PR when a new repo-people (or other) release ships.
+  # Covers both requirements.txt and requirements.cloudrun.txt in this directory.
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - backend
+
+  # Frontend npm deps.
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - frontend
+
+  # Keep GitHub Actions pinned versions current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci

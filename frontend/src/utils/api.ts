@@ -2,6 +2,13 @@
 // In production builds, VITE_API_BASE_URL points at the Cloud Run service URL.
 const BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
+// All API calls must send cookies so the backend can scope jobs to this
+// browser/session (the rp_client / rp_session cookies). Cross-origin cookies
+// additionally require the backend to set SameSite=None; Secure.
+function req(url: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(url, { credentials: 'include', ...init })
+}
+
 // ---------------------------------------------------------------------------
 // Session-storage cache (TTL = 5 minutes)
 // ---------------------------------------------------------------------------
@@ -76,7 +83,7 @@ export async function postFetch(body: object, token?: string): Promise<{ job_id:
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }
-  const res = await fetch(url, {
+  const res = await req(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -98,7 +105,7 @@ export async function fetchResults(jobId: string): Promise<Record<string, unknow
 
   // P3: Backend now returns paginated response. Transparently fetch all pages.
   const url = `${BASE}/results/${jobId}`
-  const res = await fetch(url)
+  const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => undefined)
     logHttpError(url, res.status, res.statusText, body)
@@ -111,7 +118,7 @@ export async function fetchResults(jobId: string): Promise<Record<string, unknow
     const allUsers: Record<string, unknown> = { ...data.users }
     const totalPages: number = data.pages ?? 1
     for (let page = 2; page <= totalPages; page++) {
-      const pageRes = await fetch(`${url}?page=${page}`)
+      const pageRes = await req(`${url}?page=${page}`)
       if (!pageRes.ok) break
       const pageData = await pageRes.json()
       Object.assign(allUsers, pageData.users ?? {})
@@ -131,7 +138,7 @@ export async function fetchResultsPage(
   pageSize: number = 200,
 ): Promise<{ users: Record<string, unknown>; total: number; page: number; pages: number }> {
   const url = `${BASE}/results/${jobId}?page=${page}&page_size=${pageSize}`
-  const res = await fetch(url)
+  const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => undefined)
     logHttpError(url, res.status, res.statusText, body)
@@ -143,7 +150,7 @@ export async function fetchResultsPage(
 /** Create a short-lived (24h) shareable read token for a job. */
 export async function createShareToken(jobId: string): Promise<{ token: string; url: string; expires_at: string }> {
   const url = `${BASE}/results/${jobId}/share`
-  const res = await fetch(url, { method: 'POST' })
+  const res = await req(url, { method: 'POST' })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
@@ -158,7 +165,7 @@ export async function fetchSharedJob(
   pageSize: number = 200,
 ): Promise<{ users: Record<string, unknown>; total: number; page: number; pages: number; job_label: string; expires_at: string }> {
   const url = `${BASE}/share/${token}?page=${page}&page_size=${pageSize}`
-  const res = await fetch(url)
+  const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
@@ -167,7 +174,7 @@ export async function fetchSharedJob(
 }
 
 export async function postImport(data: Record<string, unknown>): Promise<{ job_id: string; total_imported: number }> {
-  const res = await fetch(`${BASE}/import`, {
+  const res = await req(`${BASE}/import`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -186,7 +193,7 @@ export async function fetchSummary(jobId: string) {
   if (cached) return cached
 
   const url = `${BASE}/results/${jobId}/summary`
-  const res = await fetch(url)
+  const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => undefined)
     logHttpError(url, res.status, res.statusText, body)
@@ -199,7 +206,7 @@ export async function fetchSummary(jobId: string) {
 
 export async function fetchTop(jobId: string, by: string, n: number) {
   const url = `${BASE}/results/${jobId}/top?by=${by}&n=${n}`
-  const res = await fetch(url)
+  const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => undefined)
     logHttpError(url, res.status, res.statusText, body)
@@ -209,7 +216,7 @@ export async function fetchTop(jobId: string, by: string, n: number) {
 }
 
 export async function postCompare(jobIdA: string, jobIdB: string) {
-  const res = await fetch(`${BASE}/compare`, {
+  const res = await req(`${BASE}/compare`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ job_id_a: jobIdA, job_id_b: jobIdB }),
@@ -219,7 +226,7 @@ export async function postCompare(jobIdA: string, jobIdB: string) {
 }
 
 export async function postCompareMulti(jobIds: string[]) {
-  const res = await fetch(`${BASE}/compare/multi`, {
+  const res = await req(`${BASE}/compare/multi`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ job_ids: jobIds }),
@@ -232,17 +239,17 @@ export async function postCompareMulti(jobIds: string[]) {
 }
 
 export async function fetchJobs() {
-  const res = await fetch(`${BASE}/jobs`)
+  const res = await req(`${BASE}/jobs`)
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return res.json()
 }
 
 export async function cancelJob(jobId: string): Promise<void> {
-  await fetch(`${BASE}/fetch/${jobId}/cancel`, { method: 'POST' }).catch(() => {})
+  await req(`${BASE}/fetch/${jobId}/cancel`, { method: 'POST' }).catch(() => {})
 }
 
 export async function renameJob(jobId: string, label: string): Promise<void> {
-  await fetch(`${BASE}/jobs/${jobId}`, {
+  await req(`${BASE}/jobs/${jobId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ label }),
@@ -250,11 +257,23 @@ export async function renameJob(jobId: string, label: string): Promise<void> {
 }
 
 export async function deleteJob(jobId: string): Promise<void> {
-  await fetch(`${BASE}/jobs/${jobId}`, { method: 'DELETE' })
+  await req(`${BASE}/jobs/${jobId}`, { method: 'DELETE' })
+}
+
+/** Re-run a job with its original fetch parameters, returning the new job. */
+export async function refreshJob(jobId: string, token?: string): Promise<{ job_id: string; refreshed_from: string }> {
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  const res = await req(`${BASE}/jobs/${jobId}/refresh`, { method: 'POST', headers })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail ?? `HTTP ${res.status}`)
+  }
+  return res.json()
 }
 
 export async function updateJobTags(jobId: string, tags: string[]): Promise<void> {
-  await fetch(`${BASE}/jobs/${jobId}/tags`, {
+  await req(`${BASE}/jobs/${jobId}/tags`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tags }),
@@ -281,7 +300,7 @@ export function openAuthPopup(): Window | null {
 
 /** Fetch the currently authenticated user, or null if not logged in. */
 export async function fetchAuthMe(): Promise<AuthUser | null> {
-  const res = await fetch(`${BASE}/auth/me`, { credentials: 'include' })
+  const res = await req(`${BASE}/auth/me`, { credentials: 'include' })
   if (!res.ok) return null
   const data = await res.json()
   if (!data.authenticated) return null
@@ -290,5 +309,5 @@ export async function fetchAuthMe(): Promise<AuthUser | null> {
 
 /** Log out the current session. */
 export async function logoutAuth(): Promise<void> {
-  await fetch(`${BASE}/auth/logout`, { method: 'POST', credentials: 'include' })
+  await req(`${BASE}/auth/logout`, { method: 'POST', credentials: 'include' })
 }

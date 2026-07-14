@@ -6,7 +6,6 @@ import secrets
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -21,10 +20,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 from models import FetchRequest, CompareRequest, MultiCompareRequest, RenameJobRequest, TagsRequest
 from store import (
-    create_job, create_job_async, get_job, result_to_csv_bytes,
+    create_job_async, get_job, result_to_csv_bytes,
     load_all_jobs_into_runtime, get_job_async, delete_job, load_jobs_list,
-    set_job_tags, clear_summary_caches, clear_all_jobs,
+    set_job_tags, clear_all_jobs, persist_job,
     create_session, get_session, delete_session,
+    add_oauth_state, consume_oauth_state, add_share_token, get_share_token,
 )
 from worker import run_fetch_job
 
@@ -47,34 +47,83 @@ GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 SESSION_COOKIE = "rp_session"
+ANON_COOKIE = "rp_client"
 
-# Short-lived in-memory store for OAuth state tokens (CSRF protection).
-# Maps state string → expiry timestamp (10-minute window).
-_oauth_states: dict[str, float] = {}
+# Cookie flags. Secure is auto-enabled when the backend is served over HTTPS.
+# COOKIE_SAMESITE=none is required when the frontend and backend are on
+# different origins (e.g. Vercel frontend + Cloud Run backend); it forces Secure.
+_cookie_secure = BACKEND_URL.startswith("https")
+_cookie_samesite = os.environ.get("COOKIE_SAMESITE", "lax").lower()
+if _cookie_samesite == "none":
+    _cookie_secure = True
 
-# Short-lived in-memory store for shareable job read tokens.
-# Maps token → {job_id, expires_at (epoch float)}.
-_share_tokens: dict[str, dict[str, Any]] = {}
+# Per-caller rate limit for expensive endpoints (/fetch, /import).
+# ponytail: in-memory per-instance window; move to Redis if you run >1 instance.
+_RATE_LIMIT = int(os.environ.get("FETCH_RATE_LIMIT", "20"))   # requests per window
+_RATE_WINDOW = 60                                             # seconds
+_rate_hits: dict[str, list[float]] = defaultdict(list)
 
 app = FastAPI(title="repo-people Explorer API", version="1.0.0")
 
 @app.on_event("startup")
 async def startup():
     await load_all_jobs_into_runtime()
-    asyncio.create_task(_cleanup_ephemeral_stores())
 
 
-async def _cleanup_ephemeral_stores() -> None:
-    """Background task: sweep expired OAuth states and share tokens every 5 minutes."""
-    while True:
-        await asyncio.sleep(300)
-        cutoff = time.time()
-        stale_states = [k for k, ts in list(_oauth_states.items()) if ts < cutoff - 600]
-        for k in stale_states:
-            _oauth_states.pop(k, None)
-        stale_tokens = [k for k, v in list(_share_tokens.items()) if v["expires_at"] < cutoff]
-        for k in stale_tokens:
-            _share_tokens.pop(k, None)
+# ---------------------------------------------------------------------------
+# Ownership + rate-limiting helpers
+# ---------------------------------------------------------------------------
+
+async def _reader_key(rp_session: str | None, rp_client: str | None) -> str | None:
+    """Identify the caller for read access without minting a cookie.
+    OAuth users are keyed by GitHub login; anonymous users by their browser cookie."""
+    if rp_session:
+        s = await get_session(rp_session)
+        if s:
+            return f"gh:{s['github_login']}"
+    if rp_client:
+        return f"anon:{rp_client}"
+    return None
+
+
+async def _owner_key(response: Response, rp_session: str | None, rp_client: str | None) -> str:
+    """Identify the caller for job creation, minting an anonymous cookie if needed."""
+    key = await _reader_key(rp_session, rp_client)
+    if key:
+        return key
+    tok = secrets.token_urlsafe(24)
+    response.set_cookie(
+        ANON_COOKIE, tok, httponly=True, samesite=_cookie_samesite,
+        secure=_cookie_secure, max_age=365 * 24 * 3600, path="/",
+    )
+    return f"anon:{tok}"
+
+
+def _can_access(job: dict, key: str | None) -> bool:
+    """A job is accessible if it has no owner (legacy) or the caller owns it."""
+    owner = job.get("owner_key")
+    return owner is None or owner == key
+
+
+async def _get_owned_job(job_id: str, rp_session: str | None, rp_client: str | None):
+    """Return the job only if the caller may access it, else None (missing OR forbidden —
+    callers raise 404 without leaking which)."""
+    job = await get_job_async(job_id)
+    if job is None:
+        return None
+    key = await _reader_key(rp_session, rp_client)
+    if not _can_access(job, key):
+        return None
+    return job
+
+
+def _rate_check(key: str) -> None:
+    now = time.time()
+    hits = [t for t in _rate_hits[key] if t > now - _RATE_WINDOW]
+    if len(hits) >= _RATE_LIMIT:
+        raise HTTPException(429, f"Rate limit exceeded — max {_RATE_LIMIT} requests per minute.")
+    hits.append(now)
+    _rate_hits[key] = hits
 
 # S2: CORS origins configurable via env var (comma-separated list).
 _raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
@@ -92,29 +141,20 @@ app.add_middleware(
 # POST /fetch
 # ---------------------------------------------------------------------------
 
-@app.post("/fetch")
-async def fetch_users(
-    req: FetchRequest,
-    background_tasks: BackgroundTasks,
-    authorization: str | None = Header(default=None),
-    rp_session: str | None = Cookie(default=None),
-):
-    # S1: Extract token from Authorization: Bearer header instead of request body.
-    token = ""
+async def _resolve_token(authorization: str | None, rp_session: str | None) -> str:
+    """Extract the GitHub token: explicit Bearer PAT, else the OAuth session token."""
     if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-    # Fall back to OAuth session token when no explicit PAT is provided.
-    if not token and rp_session:
+        tok = authorization[7:].strip()
+        if tok:
+            return tok
+    if rp_session:
         session = await get_session(rp_session)
         if session:
-            token = session["github_token"]
-    # Cap the per-job fetch limit to keep hosting costs bounded.
-    # FETCH_LIMIT=0 disables the cap (local installs only).
-    if FETCH_LIMIT > 0:
-        if req.limit is None or req.limit > FETCH_LIMIT:
-            req.limit = FETCH_LIMIT
-    # B4: Await DB insert before starting worker to avoid race condition.
-    job_id = await create_job_async()
+            return session["github_token"]
+    return ""
+
+
+def _start_fetch(background_tasks: BackgroundTasks, job_id: str, req: FetchRequest, token: str) -> None:
     background_tasks.add_task(
         run_fetch_job,
         job_id=job_id,
@@ -128,7 +168,60 @@ async def fetch_users(
         workers=req.workers,
         save_each_user=req.save_each_user,
     )
+
+
+@app.post("/fetch")
+async def fetch_users(
+    req: FetchRequest,
+    background_tasks: BackgroundTasks,
+    response: Response,
+    authorization: str | None = Header(default=None),
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    # S1: Extract token from Authorization: Bearer header instead of request body.
+    token = await _resolve_token(authorization, rp_session)
+    # Scope this job to its creator and rate-limit per caller.
+    owner_key = await _owner_key(response, rp_session, rp_client)
+    _rate_check(owner_key)
+    # Cap the per-job fetch limit to keep hosting costs bounded.
+    # FETCH_LIMIT=0 disables the cap (local installs only).
+    if FETCH_LIMIT > 0:
+        if req.limit is None or req.limit > FETCH_LIMIT:
+            req.limit = FETCH_LIMIT
+    # B4: Await DB insert before starting worker to avoid race condition.
+    # Store params (no secrets) so the job can be refreshed later.
+    job_id = await create_job_async(owner_key=owner_key, params=req.model_dump())
+    _start_fetch(background_tasks, job_id, req, token)
     return {"job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{job_id}/refresh  — re-run a job with its original parameters
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/refresh")
+async def refresh_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    response: Response,
+    authorization: str | None = Header(default=None),
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(job_id, rp_session, rp_client)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    params = job.get("params")
+    if not params:
+        raise HTTPException(status_code=409, detail="This job has no saved parameters and cannot be refreshed.")
+    req = FetchRequest(**params)
+    token = await _resolve_token(authorization, rp_session)
+    owner_key = await _owner_key(response, rp_session, rp_client)
+    _rate_check(owner_key)
+    new_id = await create_job_async(owner_key=owner_key, params=params)
+    _start_fetch(background_tasks, new_id, req, token)
+    return {"job_id": new_id, "refreshed_from": job_id}
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +229,13 @@ async def fetch_users(
 # ---------------------------------------------------------------------------
 
 @app.get("/fetch/{job_id}/stream")
-async def stream_job(job_id: str):
+async def stream_job(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -165,7 +264,13 @@ async def stream_job(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/fetch/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -178,9 +283,13 @@ async def cancel_job(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/jobs")
-async def list_jobs():
-    # P1: Single SELECT — no N+1 per-job queries.
-    return await load_jobs_list()
+async def list_jobs(
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    # P1: Single SELECT — no N+1 per-job queries. Scoped to the caller's jobs.
+    key = await _reader_key(rp_session, rp_client)
+    return await load_jobs_list(owner_key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +297,14 @@ async def list_jobs():
 # ---------------------------------------------------------------------------
 
 @app.delete("/jobs/{job_id}")
-async def remove_job(job_id: str):
-    existed = await delete_job(job_id)
-    if not existed:
+async def remove_job(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    if await _get_owned_job(job_id, rp_session, rp_client) is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    await delete_job(job_id)
     return {"deleted": True}
 
 
@@ -200,7 +313,14 @@ async def remove_job(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.patch("/jobs/{job_id}/tags")
-async def update_job_tags(job_id: str, body: TagsRequest):
+async def update_job_tags(
+    job_id: str,
+    body: TagsRequest,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     # BE2: Validated TagsRequest model (max 10 tags, max 50 chars each).
     cleaned = sorted({t.strip().lower() for t in body.tags if t.strip()})
     ok = await set_job_tags(job_id, cleaned)
@@ -214,9 +334,14 @@ async def update_job_tags(job_id: str, body: TagsRequest):
 # ---------------------------------------------------------------------------
 
 @app.patch("/jobs/{job_id}")
-async def rename_job(job_id: str, body: RenameJobRequest):
+async def rename_job(
+    job_id: str,
+    body: RenameJobRequest,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
     # BE1: Typed RenameJobRequest model. H4/B1: use get_job_async to avoid stale proxy.
-    job = await get_job_async(job_id)
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     job["label"] = body.label
@@ -232,9 +357,11 @@ async def get_results(
     job_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=1000),
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
 ):
     # P3: Paginated results endpoint — avoids serialising huge JSON blobs in one shot.
-    job = await get_job_async(job_id)
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -260,8 +387,12 @@ async def get_results(
 # ---------------------------------------------------------------------------
 
 @app.get("/results/{job_id}/summary")
-async def get_summary(job_id: str):
-    job = await get_job_async(job_id)
+async def get_summary(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -337,8 +468,10 @@ async def get_top(
     job_id: str,
     by: str = Query("followers", description="Field to rank by"),
     n: int = Query(10, ge=1, le=100),
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
 ):
-    job = await get_job_async(job_id)
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -365,9 +498,13 @@ async def get_top(
 # ---------------------------------------------------------------------------
 
 @app.post("/compare")
-async def compare(req: CompareRequest):
-    job_a = await get_job_async(req.job_id_a)
-    job_b = await get_job_async(req.job_id_b)
+async def compare(
+    req: CompareRequest,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job_a = await _get_owned_job(req.job_id_a, rp_session, rp_client)
+    job_b = await _get_owned_job(req.job_id_b, rp_session, rp_client)
 
     if job_a is None:
         raise HTTPException(status_code=404, detail=f"Job A not found: {req.job_id_a}")
@@ -409,7 +546,11 @@ async def compare(req: CompareRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/compare/multi")
-async def compare_multi(req: MultiCompareRequest):
+async def compare_multi(
+    req: MultiCompareRequest,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
     if len(req.job_ids) < 2:
         raise HTTPException(status_code=422, detail="Need at least 2 job IDs")
     if len(req.job_ids) > 5:
@@ -417,7 +558,7 @@ async def compare_multi(req: MultiCompareRequest):
 
     jobs_data: list[dict] = []
     for jid in req.job_ids:
-        job = await get_job_async(jid)
+        job = await _get_owned_job(jid, rp_session, rp_client)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job not found: {jid}")
         if job["status"] != "done":
@@ -470,8 +611,12 @@ async def compare_multi(req: MultiCompareRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/results/{job_id}/export/json")
-async def export_json(job_id: str):
-    job = await get_job_async(job_id)
+async def export_json(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -490,8 +635,12 @@ async def export_json(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/results/{job_id}/export/csv")
-async def export_csv(job_id: str):
-    job = await get_job_async(job_id)
+async def export_csv(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -510,18 +659,19 @@ async def export_csv(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/results/{job_id}/share")
-async def create_share_token(job_id: str):
-    job = await get_job_async(job_id)
+async def create_share_token(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail="Job not complete")
 
     token = secrets.token_urlsafe(32)
-    expires_at_epoch = time.time() + 24 * 3600  # 24-hour window
-    _share_tokens[token] = {"job_id": job_id, "expires_at": expires_at_epoch}
-
-    expires_iso = datetime.fromtimestamp(expires_at_epoch, tz=timezone.utc).isoformat()
+    expires_iso = await add_share_token(token, job_id, ttl_seconds=24 * 3600)
     return {
         "token": token,
         "expires_at": expires_iso,
@@ -539,12 +689,9 @@ async def get_shared_results(
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=1000),
 ):
-    entry = _share_tokens.get(token)
+    entry = await get_share_token(token)
     if not entry:
         raise HTTPException(status_code=404, detail="Share link not found or has expired.")
-    if time.time() > entry["expires_at"]:
-        _share_tokens.pop(token, None)
-        raise HTTPException(status_code=410, detail="Share link has expired.")
 
     job = await get_job_async(entry["job_id"])
     if job is None or job["status"] != "done":
@@ -555,7 +702,7 @@ async def get_shared_results(
     total = len(all_users)
     start = (page - 1) * page_size
     page_users = {u["login"]: u for u in all_users[start: start + page_size] if isinstance(u, dict) and "login" in u}
-    expires_iso = datetime.fromtimestamp(entry["expires_at"], tz=timezone.utc).isoformat()
+    expires_iso = entry["expires_at"]
     return {
         "users": page_users,
         "total": total,
@@ -571,38 +718,65 @@ async def get_shared_results(
 # POST /import  — create a completed job from uploaded JSON data
 # ---------------------------------------------------------------------------
 
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+
+
+async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
+    """Read the request body, aborting if it exceeds max_bytes — regardless of
+    whether a Content-Length header was sent (S6: header can be omitted/lied about)."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > max_bytes:
+            raise HTTPException(status_code=413, detail="Payload too large — maximum 5 MB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _sanitise_urls(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop non-http(s) URL values so imported data can't inject javascript:/data: links
+    that the frontend later renders in href/src attributes (stored-XSS guard)."""
+    for field in ("html_url", "avatar_url", "blog"):
+        v = record.get(field)
+        if isinstance(v, str) and v and not v.lower().startswith(("http://", "https://")):
+            record[field] = ""
+    return record
+
+
 @app.post("/import")
-async def import_results(request: Request):
+async def import_results(
+    request: Request,
+    response: Response,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
     """
     Accept a JSON object (mapping login → user record, the same format
     exported by /results/{job_id}/export/json) and register it as a
     completed job so it can be visualised in the Results view.
     """
-    # S6: Reject payloads larger than 5 MB before deserialising.
-    MAX_IMPORT_BYTES = 5 * 1024 * 1024
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_IMPORT_BYTES:
-        raise HTTPException(status_code=413, detail="Payload too large — maximum 5 MB")
+    owner_key = await _owner_key(response, rp_session, rp_client)
+    _rate_check(owner_key)
 
+    raw = await _read_capped_body(request, MAX_IMPORT_BYTES)
     try:
-        payload: Any = await request.json()
+        payload: Any = json.loads(raw)
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid JSON body")
 
     if not isinstance(payload, dict) or not payload:
         raise HTTPException(status_code=422, detail="Payload must be a non-empty JSON object mapping logins to user records.")
 
-    # Sanitise: keep only dict values (skip any top-level metadata scalars)
-    result: dict[str, Any] = {k: v for k, v in payload.items() if isinstance(v, dict)}
+    # Keep only dict values (skip top-level scalars) and neutralise unsafe URLs.
+    result: dict[str, Any] = {k: _sanitise_urls(v) for k, v in payload.items() if isinstance(v, dict)}
     if not result:
         raise HTTPException(status_code=422, detail="No valid user records found in the uploaded file.")
 
-    # B4: Await DB insert before updating job fields.
-    job_id = await create_job_async()
-    job = get_job(job_id)
-    job["status"] = "done"
-    job["result"] = result
-    job["total_fetched"] = len(result)
+    # B4: Await DB insert, then persist the done state atomically (avoids the
+    # out-of-order fire-and-forget writes the _JobProxy would otherwise make).
+    job_id = await create_job_async(owner_key=owner_key)
+    await persist_job(job_id, status="done", result=result, total_fetched=len(result))
 
     return {"job_id": job_id, "total_imported": len(result)}
 
@@ -615,8 +789,12 @@ async def import_results(request: Request):
 # appear in Swagger UI or generated API clients.
 # ---------------------------------------------------------------------------
 
-@app.get("/clear_cache", include_in_schema=False)
+@app.post("/clear_cache", include_in_schema=False)
 async def dev_clear_cache():
+    # Guarded: a global wipe is dev-only. Must be a POST (not a prefetchable GET)
+    # and explicitly enabled via ALLOW_DEV_CLEAR=1, else it stays disabled in prod.
+    if os.environ.get("ALLOW_DEV_CLEAR", "").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=403, detail="Cache clearing is disabled on this server.")
     deleted = await clear_all_jobs()
     job_word = "job" if deleted == 1 else "jobs"
     return {
@@ -634,8 +812,8 @@ async def auth_login():
     if not GITHUB_CLIENT_ID:
         raise HTTPException(503, "GitHub OAuth is not configured on this server.")
     state = secrets.token_urlsafe(32)
-    # Store state with expiry timestamp for CSRF validation
-    _oauth_states[state] = time.time()
+    # Persist state (10-min TTL) for CSRF validation on callback.
+    await add_oauth_state(state, ttl_seconds=600)
     params = urlencode({
         "client_id": GITHUB_CLIENT_ID,
         "redirect_uri": f"{BACKEND_URL}/auth/callback",
@@ -651,10 +829,9 @@ async def auth_login():
 
 @app.get("/auth/callback")
 async def auth_callback(code: str, state: str):
-    # Validate state to prevent CSRF
-    if state not in _oauth_states:
+    # Validate state to prevent CSRF (single-use, DB-backed).
+    if not await consume_oauth_state(state):
         raise HTTPException(400, "Invalid or expired OAuth state.")
-    del _oauth_states[state]
 
     if not GITHUB_CLIENT_SECRET:
         raise HTTPException(503, "GitHub OAuth is not configured on this server.")
@@ -706,8 +883,8 @@ async def auth_callback(code: str, state: str):
         SESSION_COOKIE,
         session_id,
         httponly=True,
-        samesite="lax",
-        secure=False,   # Set to True in production (requires HTTPS)
+        samesite=_cookie_samesite,
+        secure=_cookie_secure,   # auto-enabled when BACKEND_URL is https / SameSite=None
         max_age=30 * 24 * 3600,
         path="/",
     )

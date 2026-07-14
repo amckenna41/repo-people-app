@@ -383,7 +383,7 @@ class TestShareEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["users"]) == 1
-        assert data["total"] == 2
+        assert data["total"] == len(SAMPLE_USERS)  # all seeded users, across pages
 
     @pytest.mark.asyncio
     async def test_get_shared_results_404_for_bad_token(self, async_client):
@@ -391,15 +391,12 @@ class TestShareEndpoints:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_get_shared_results_410_for_expired_token(self, async_client, done_job_id):
-        import main as app_module
-        # Manually insert an already-expired share token
+    async def test_get_shared_results_404_for_expired_token(self, async_client, done_job_id):
+        import store
+        # Insert an already-expired share token (negative TTL) into the DB store.
         expired_token = "expired-test-token-xyz"
-        app_module._share_tokens[expired_token] = {
-            "job_id": done_job_id,
-            "expires_at": 1.0,  # far in the past
-        }
+        await store.add_share_token(expired_token, done_job_id, ttl_seconds=-1)
         resp = await async_client.get(f"/share/{expired_token}")
-        assert resp.status_code == 410
-        # Ensure the token was pruned
-        assert expired_token not in app_module._share_tokens
+        assert resp.status_code == 404
+        # Expired token is pruned from the store on access.
+        assert await store.get_share_token(expired_token) is None

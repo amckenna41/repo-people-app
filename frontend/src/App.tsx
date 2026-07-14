@@ -323,6 +323,24 @@ export default function App() {
     }
   }
 
+  // Refresh: a new running job was started server-side with the old job's
+  // params. Track it and stream its completion so the card flips to done.
+  function handleJobRefresh(newJobId: string, label: string) {
+    addJob({ job_id: newJobId, status: 'running', total_fetched: 0, label: `🔄 ${label}` })
+    setView('fetch')
+    const base = import.meta.env.VITE_API_BASE_URL ?? ''
+    const es = new EventSource(`${base}/fetch/${newJobId}/stream`, { withCredentials: true })
+    es.addEventListener('done', (ev) => {
+      const data = JSON.parse((ev as MessageEvent).data)
+      updateJob(newJobId, { status: 'done', total_fetched: data.total ?? 0 })
+      es.close()
+    })
+    es.addEventListener('error', () => {
+      updateJob(newJobId, { status: 'error' })
+      es.close()
+    })
+  }
+
   function handleGroupJobIds(ids: string[]) {
     setGroupJobIds(ids)
     if (ids.length > 0) setActiveJobId(ids[0])
@@ -480,7 +498,7 @@ export default function App() {
         </div>
         <div className={view !== 'results' ? 'hidden' : ''}>
           <ErrorBoundary>
-            <ResultsView jobs={jobs} activeJobId={activeJobId} setActiveJobId={setActiveJobId} groupJobIds={groupJobIds} onUsersLoaded={handleUsersLoaded} onJobUpdate={updateJob} onJobDelete={removeJob} onJobTagsUpdate={updateJobTagsHandler} />
+            <ResultsView jobs={jobs} activeJobId={activeJobId} setActiveJobId={setActiveJobId} groupJobIds={groupJobIds} onUsersLoaded={handleUsersLoaded} onJobUpdate={updateJob} onJobDelete={removeJob} onJobTagsUpdate={updateJobTagsHandler} onJobRefresh={handleJobRefresh} />
           </ErrorBoundary>
         </div>
         <div className={view !== 'compare' ? 'hidden' : ''}>

@@ -113,7 +113,8 @@ docker compose up --build
 | POST | `/fetch` | Start a new fetch job (token via `Authorization: Bearer` header) |
 | GET | `/fetch/{job_id}/stream` | SSE progress stream for a running job |
 | POST | `/fetch/{job_id}/cancel` | Cancel a running job |
-| GET | `/jobs` | List all jobs |
+| POST | `/jobs/{job_id}/refresh` | Re-run a job with its original fetch parameters (returns a new job) |
+| GET | `/jobs` | List the caller's jobs |
 | DELETE | `/jobs/{job_id}` | Delete a job |
 | PATCH | `/jobs/{job_id}` | Rename a job (body: `{"label": "..."}`) |
 | PATCH | `/jobs/{job_id}/tags` | Update tags on a job (body: `{"tags": [...]}`) |
@@ -124,7 +125,9 @@ docker compose up --build
 | POST | `/compare/multi` | Compare more than two jobs |
 | GET | `/results/{job_id}/export/json` | Download results as JSON |
 | GET | `/results/{job_id}/export/csv` | Download results as CSV |
-| POST | `/import` | Import a previously exported JSON file (max 5 MB) |
+| POST | `/import` | Import a previously exported JSON file (max 5 MB; unsafe URLs stripped) |
+
+> **Job scoping.** Jobs are private to the caller — identified by the GitHub login for OAuth users, or an anonymous `rp_client` cookie otherwise. `GET /jobs` returns only your jobs, and every job-specific endpoint returns `404` for jobs you don't own (legacy jobs created before scoping have no owner and remain public). `/fetch` and `/import` are rate-limited per caller. Send credentials (cookies) with every request; for a cross-origin frontend/backend split set `COOKIE_SAMESITE=none`.
 
 ## Stack
 
@@ -234,6 +237,19 @@ gcloud run services replace - --region us-central1
 cd frontend
 npm run build   # output in frontend/dist/ — deploy to Vercel / Firebase Hosting / etc.
 ```
+
+## Backend environment variables
+
+| Name | Default | Purpose |
+|---|---|---|
+| `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated allowed origins |
+| `FETCH_LIMIT` | `500` | Max users per job on the hosted service; `0` = unlimited (local installs) |
+| `FETCH_RATE_LIMIT` | `20` | Max `/fetch` + `/import` requests per caller per minute (in-memory, per instance) |
+| `COOKIE_SAMESITE` | `lax` | Set to `none` for a cross-origin frontend/backend split (forces `Secure`) |
+| `ALLOW_DEV_CLEAR` | _(unset)_ | Set to `1` to enable the guarded `POST /clear_cache` dev endpoint |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | _(unset)_ | Enable GitHub OAuth sign-in |
+| `FRONTEND_URL` / `BACKEND_URL` | localhost dev URLs | OAuth redirect targets; `BACKEND_URL` over HTTPS auto-enables `Secure` cookies |
+| `REPO_PEOPLE_DB` | `backend/repo_people_jobs.db` | SQLite job-store path |
 
 ## Views
 
