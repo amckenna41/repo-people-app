@@ -19,7 +19,7 @@
     "lucide-react": "^1.24.0",
     "prop-types": "^15.8.1",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7",
+    "react-dom": "^19.2.8",
     "react-simple-maps": "^3.0.0",
     "recharts": "^3.9.2",
     "xlsx": "^0.18.5"
