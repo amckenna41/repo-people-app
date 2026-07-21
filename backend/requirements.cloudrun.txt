@@ -1,7 +1,7 @@
 fastapi>=0.139.0
 uvicorn[standard]>=0.51.0
 python-dotenv>=1.2.2
-sse-starlette>=3.4.5
+sse-starlette>=3.4.6
 aiosqlite>=0.19.0
 httpx>=0.28.1
 # repo-people is the data engine — pinned to an exact PyPI release so Cloud Run
