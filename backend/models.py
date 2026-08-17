@@ -45,6 +45,18 @@ class MultiCompareRequest(BaseModel):
     job_ids: list[str]
 
 
+class CreateScheduleRequest(BaseModel):
+    """Re-run a job's saved fetch parameters on a fixed interval."""
+    job_id: str
+    # 1 hour to 30 days. Anything shorter would burn API quota faster than a
+    # repo's membership realistically changes.
+    interval_hours: int = Field(default=168, ge=1, le=720)
+
+
+class UpdateScheduleRequest(BaseModel):
+    enabled: bool
+
+
 class JobStatus(BaseModel):
     job_id: str
     status: str  # "pending" | "running" | "done" | "error"

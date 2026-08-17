@@ -7,7 +7,7 @@ import CompareView from './views/CompareView'
 import GlobalSearchModal from './components/GlobalSearchModal'
 import ErrorBoundary from './components/ErrorBoundary'
 import type { JobInfo, UserRecord, View, AuthUser } from './types'
-import { fetchJobs, deleteJob, updateJobTags, invalidateJobCache, fetchAuthMe, logoutAuth, openAuthPopup, fetchSharedJob } from './utils/api'
+import { fetchJobs, deleteJob, updateJobTags, invalidateJobCache, fetchAuthMe, logoutAuth, openAuthPopup, fetchSharedJob, openJobStream } from './utils/api'
 
 function HelpModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
@@ -187,9 +187,18 @@ function hashToView(hash: string): View {
   return VALID_VIEWS.includes(v) ? v : 'fetch'
 }
 
+// The share token has to be read at module load. The view-sync effect below
+// writes `window.location.hash = view` on mount, which runs *before* the effect
+// that reads the token and so used to overwrite it — every shared link landed
+// on the Fetch page instead of the shared results.
+const INITIAL_HASH = window.location.hash
+const INITIAL_SHARE_TOKEN = INITIAL_HASH.startsWith('#share=')
+  ? INITIAL_HASH.slice('#share='.length)
+  : ''
+
 export default function App() {
   // FE1: Hash-based URL routing so views are bookmarkable and browser back/forward work.
-  const [view, setView] = useState<View>(() => hashToView(window.location.hash))
+  const [view, setView] = useState<View>(() => hashToView(INITIAL_HASH))
   const [jobs, setJobs] = useState<JobInfo[]>(() => {
     try {
       const saved = localStorage.getItem('repo-people-jobs')
@@ -229,9 +238,7 @@ export default function App() {
 
   // On mount: handle shared job links (#share=TOKEN)
   useEffect(() => {
-    const hash = window.location.hash
-    if (!hash.startsWith('#share=')) return
-    const token = hash.slice('#share='.length)
+    const token = INITIAL_SHARE_TOKEN
     if (!token) return
     fetchSharedJob(token, 1, 200).then(data => {
       const tempId = `shared-${token.slice(0, 8)}`
@@ -329,8 +336,7 @@ export default function App() {
   function handleJobRefresh(newJobId: string, label: string) {
     addJob({ job_id: newJobId, status: 'running', total_fetched: 0, label: `🔄 ${label}` })
     setView('fetch')
-    const base = import.meta.env.VITE_API_BASE_URL ?? ''
-    const es = new EventSource(`${base}/fetch/${newJobId}/stream`, { withCredentials: true })
+    const es = openJobStream(newJobId)
     es.addEventListener('done', (ev) => {
       const data = JSON.parse((ev as MessageEvent).data)
       updateJob(newJobId, { status: 'done', total_fetched: data.total ?? 0 })

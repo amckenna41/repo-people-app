@@ -1,25 +1,13 @@
 # Cloud Run production Dockerfile
 # Build context: repo root (repo-people-app/)
-<<<<<<< HEAD
-=======
-# Installs repo-people from PyPI for non-interactive cloud builds.
->>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
+# Installs repo-people from PyPI (no VCS checkout), so no git in the image.
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
-<<<<<<< HEAD
 # Install backend Python dependencies, including repo-people (the data engine),
 # all pinned to exact versions in requirements.cloudrun.txt for reproducible builds.
-=======
-# System deps (needed by some transitive packages)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-  && rm -rf /var/lib/apt/lists/*
-
-# Install backend Python dependencies
->>>>>>> 32cffe0d1aa4b60a00721432483cf4c048363492
 COPY backend/requirements.cloudrun.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
   && python -c "import fastapi, uvicorn, httpx, sse_starlette, aiosqlite"
@@ -27,10 +15,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # Copy backend source
 COPY backend/ /app/
 
-# Cloud Run injects $PORT (default 8080). SQLite DB is written to /tmp so it
-# survives within a running container instance (ephemeral across restarts).
-# Set max-instances=1 on the service to avoid split state across containers.
+# Storage. Set DATABASE_URL to a Postgres connection string for durable,
+# multi-instance storage. Without it the app falls back to SQLite at
+# REPO_PEOPLE_DB — which on Cloud Run lives in /tmp and is WIPED on every
+# cold start, so only use the fallback for throwaway deployments.
 ENV REPO_PEOPLE_DB=/tmp/repo_people_jobs.db
+
+# Drop root — nothing here needs to write outside /tmp.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
 
 # Cloud Run expects the container to listen on $PORT
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

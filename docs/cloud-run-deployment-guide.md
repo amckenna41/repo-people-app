@@ -198,8 +198,24 @@ Set these on the Cloud Run service after first deploy (Cloud Console → Cloud R
 | `REPO_PEOPLE_DB` | `/tmp/repo_people_jobs.db` (SQLite database path for Cloud Run) |
 | `GITHUB_CLIENT_ID` | Set via Secret Manager (see GitHub OAuth App Setup section) |
 | `GITHUB_CLIENT_SECRET` | Set via Secret Manager (see GitHub OAuth App Setup section) |
+| `SESSION_TOKEN_KEY` | Set via Secret Manager — Fernet key encrypting stored OAuth tokens (see below) |
 
 > **Note:** OAuth credentials should be stored in Secret Manager, not as plain environment variables. See the **GitHub OAuth App Setup** section below for detailed instructions.
+
+### Session token encryption key
+
+`sessions.github_token` holds a live GitHub OAuth token for up to 30 days, so it
+is encrypted at rest. Generate a key and store it in Secret Manager:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" \
+  | gcloud secrets create repo-people-session-key --data-file=-
+```
+
+Then reference it from the service (see the commented block in
+`cloudrun-service.yaml`). If `SESSION_TOKEN_KEY` is unset the app generates an
+ephemeral key per process — still safe, but every user is signed out whenever
+the instance restarts. Rotating the key has the same effect.
 
 ---
 

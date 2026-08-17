@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
 import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw } from 'lucide-react'
 import { Github } from '../components/GithubIcon'
-import { postFetch, postImport, cancelJob, openAuthPopup } from '../utils/api'
+import { postFetch, postImport, cancelJob, openAuthPopup, openJobStream, beaconCancelJob } from '../utils/api'
 import { friendlyFetchError } from '../utils/errors'
 import type { JobInfo, AuthUser } from '../types'
 import { ALL_ROLES, ROLE_COLORS } from '../types'
@@ -116,7 +116,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
     const handleUnload = () => {
       if (currentJobIdRef.current) {
         // Use sendBeacon so the request fires even as the page unloads
-        navigator.sendBeacon(`/fetch/${currentJobIdRef.current}/cancel`)
+        beaconCancelJob(currentJobIdRef.current)
       }
     }
     window.addEventListener('beforeunload', handleUnload)
@@ -295,7 +295,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
         const MAX_RECONNECT = 3
 
         function connectSSE() {
-          const es = new EventSource(`/fetch/${job_id}/stream`)
+          const es = openJobStream(job_id)
           esRef.current = es
 
           es.addEventListener('status', (ev) => {

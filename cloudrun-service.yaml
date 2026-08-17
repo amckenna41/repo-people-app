@@ -25,9 +25,18 @@ spec:
   template:
     metadata:
       annotations:
-        # Keep exactly one instance so the in-process SQLite store is consistent.
-        # Scale-to-zero is still enabled (min=0) to avoid idle charges.
-        autoscaling.knative.dev/minScale: "0"
+        # maxScale=1 is required ONLY while running on the SQLite fallback,
+        # which keeps state in-process. Once DATABASE_URL points at Postgres the
+        # store is shared, and this can be raised (and minScale set to 1 to keep
+        # the scheduled-refetch runner alive between requests).
+        # minScale=1 keeps one instance warm. Required: the scheduled re-fetch
+        # runner (_schedule_loop in main.py) is an in-process asyncio loop, so
+        # at minScale=0 the service scales to zero, the loop dies with it, and
+        # schedules silently never fire while the UI still shows them enabled.
+        # Set this back to "0" only if you drop the scheduling feature, or move
+        # it to Cloud Scheduler hitting an authenticated endpoint. Note that a
+        # warm instance bills continuously.
+        autoscaling.knative.dev/minScale: "1"
         autoscaling.knative.dev/maxScale: "1"
         # Gen2 execution environment — better performance and full Linux syscalls
         run.googleapis.com/execution-environment: gen2
@@ -48,6 +57,19 @@ spec:
               value: "BACKEND_URL"
             - name: FRONTEND_URL
               value: "FRONTEND_URL"
+            # Durable storage. Without this the app falls back to SQLite in
+            # /tmp, which is wiped on every cold start. Store the real value in
+            # Secret Manager and reference it here rather than inlining it.
+            # - name: DATABASE_URL
+            #   valueFrom:
+            #     secretKeyRef: { name: repo-people-db-url, key: latest }
+            # Fernet key encrypting OAuth session tokens at rest. Generate with:
+            #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+            # Without it the app falls back to a per-process ephemeral key, which
+            # is still safe but signs every user out on each restart.
+            # - name: SESSION_TOKEN_KEY
+            #   valueFrom:
+            #     secretKeyRef: { name: repo-people-session-key, key: latest }
           resources:
             limits:
               cpu: "1"
@@ -55,14 +77,14 @@ spec:
           # Liveness probe — restart container if it stops responding
           livenessProbe:
             httpGet:
-              path: /docs
+              path: /healthz
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
           # Startup probe — give uvicorn time to boot before traffic is sent
           startupProbe:
             httpGet:
-              path: /docs
+              path: /healthz
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 10

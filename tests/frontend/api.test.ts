@@ -4,15 +4,17 @@
  * Uses vitest-fetch-mock to stub window.fetch. Each test asserts on the
  * correct URL, method, headers, body, and return value / thrown error.
  */
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // vitest-fetch-mock is initialised in setup.ts and exposed as globalThis.fetchMocker
 const fetchMocker = (globalThis as any).fetchMocker
 import {
+  MAX_CLIENT_ROWS,
+  beaconCancelJob,
   cancelJob,
+  fetchAllResultPages,
   deleteJob,
   fetchJobs,
-  fetchResults,
   fetchSummary,
   fetchTop,
   invalidateJobCache,
@@ -23,6 +25,55 @@ import {
   renameJob,
   updateJobTags,
 } from '../../frontend/src/utils/api'
+
+// ---------------------------------------------------------------------------
+// CSRF header
+// ---------------------------------------------------------------------------
+// Mutating requests must carry X-Requested-With: the backend rejects them
+// without it, which is what stops a third-party page driving the API with the
+// user's SameSite=None cookies attached.
+
+describe('CSRF header', () => {
+  it.each([
+    ['postFetch', () => postFetch({ owner: 'a', repo: 'b' })],
+    ['postImport', () => postImport({ alice: {} })],
+    ['deleteJob', () => deleteJob('job-1')],
+    ['renameJob', () => renameJob('job-1', 'new name')],
+    ['updateJobTags', () => updateJobTags('job-1', ['x'])],
+    ['cancelJob', () => cancelJob('job-1')],
+    ['postCompare', () => postCompare('a', 'b')],
+  ])('%s sends X-Requested-With', async (_name, call) => {
+    fetchMocker.mockResponseOnce(JSON.stringify({}))
+    await call()
+    expect(fetchMocker.requests()[0].headers.get('X-Requested-With')).toBe('repo-people')
+  })
+
+  it('does not send it on GETs, which would cost a preflight', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify([]))
+    await fetchJobs()
+    const req = fetchMocker.requests()[0]
+    expect(req.method).toBe('GET')
+    expect(req.headers.get('X-Requested-With')).toBeNull()
+  })
+
+  it('postFetch keeps its own headers alongside the CSRF one', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({ job_id: 'x' }))
+    await postFetch({ owner: 'a', repo: 'b' }, 'tok')
+    const req = fetchMocker.requests()[0]
+    expect(req.headers.get('Authorization')).toBe('Bearer tok')
+    expect(req.headers.get('Content-Type')).toBe('application/json')
+    expect(req.headers.get('X-Requested-With')).toBe('repo-people')
+  })
+
+  it('beaconCancelJob uses keepalive fetch so it can send the header', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({}))
+    beaconCancelJob('job-1')
+    const req = fetchMocker.requests()[0]
+    expect(req.method).toBe('POST')
+    expect(new URL(req.url).pathname).toBe('/fetch/job-1/cancel')
+    expect(req.headers.get('X-Requested-With')).toBe('repo-people')
+  })
+})
 
 // Re-enable fetch mocks and clear the session-storage cache before each test
 beforeEach(() => {
@@ -82,56 +133,6 @@ describe('postFetch', () => {
     expect(body.repo).toBe('hello')
     expect(body.limit).toBe(5)
     expect(body.token).toBeUndefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// fetchResults
-// ---------------------------------------------------------------------------
-
-describe('fetchResults', () => {
-  it('calls GET /results/{id}', async () => {
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { alice: { login: 'alice' } }, total: 1, page: 1, page_size: 200, pages: 1,
-    }))
-    await fetchResults('job-1')
-    expect(new URL(fetchMocker.requests()[0].url).pathname).toBe('/results/job-1')
-    expect(fetchMocker.requests()[0].method).toBe('GET')
-  })
-
-  it('returns flat user dict from paginated response', async () => {
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { alice: { login: 'alice', followers: 10 } }, total: 1, page: 1, page_size: 200, pages: 1,
-    }))
-    const data = await fetchResults('job-1')
-    expect((data as any).alice.followers).toBe(10)
-  })
-
-  it('merges multiple pages into a single dict', async () => {
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { alice: { login: 'alice' } }, total: 2, page: 1, page_size: 1, pages: 2,
-    }))
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { bob: { login: 'bob' } }, total: 2, page: 2, page_size: 1, pages: 2,
-    }))
-    const data = await fetchResults('job-1')
-    expect(Object.keys(data)).toContain('alice')
-    expect(Object.keys(data)).toContain('bob')
-  })
-
-  it('throws with detail on non-ok', async () => {
-    fetchMocker.mockResponseOnce(JSON.stringify({ detail: 'Job status: pending' }), { status: 409 })
-    await expect(fetchResults('job-1')).rejects.toThrow('Job status: pending')
-  })
-
-  it('returns cached result on second call without fetching', async () => {
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { alice: { login: 'alice' } }, total: 1, page: 1, page_size: 200, pages: 1,
-    }))
-    await fetchResults('job-cached')
-    const requestCountAfterFirst = fetchMocker.requests().length
-    await fetchResults('job-cached') // should hit cache
-    expect(fetchMocker.requests().length).toBe(requestCountAfterFirst) // no new request
   })
 })
 
@@ -385,12 +386,8 @@ describe('postImport', () => {
 
 describe('invalidateJobCache', () => {
   it('removes cached results and summary for the given job', async () => {
-    // Populate cache via real function calls
-    fetchMocker.mockResponseOnce(JSON.stringify({
-      users: { alice: { login: 'alice' } }, total: 1, page: 1, page_size: 200, pages: 1,
-    }))
+    // Populate cache via a real function call
     fetchMocker.mockResponseOnce(JSON.stringify({ total: 1 }))
-    await fetchResults('job-del')
     await fetchSummary('job-del')
 
     // Verify entries are present
@@ -411,5 +408,98 @@ describe('invalidateJobCache', () => {
 
     const keysAfter = Object.keys(sessionStorage).filter(k => k.startsWith('rp:job-keep:'))
     expect(keysAfter.length).toBeGreaterThan(0)
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// fetchAllResultPages
+// ---------------------------------------------------------------------------
+// Charts, the quick-stat badges and every client-side export aggregate the rows
+// the view holds. Holding only page one made them silently describe a fraction
+// of the result set, so this walk has to reach the last page.
+
+function pageOf(logins: string[], total: number) {
+  return JSON.stringify({
+    users: Object.fromEntries(logins.map(l => [l, { login: l }])),
+    total,
+    unfiltered_total: total,
+    page: 1,
+    pages: 1,
+  })
+}
+
+describe('fetchAllResultPages', () => {
+  it('walks every page and returns the union', async () => {
+    fetchMocker.mockResponseOnce(pageOf(['a', 'b'], 4))
+    fetchMocker.mockResponseOnce(pageOf(['c', 'd'], 4))
+    const rows = await fetchAllResultPages('job-1', {}, { total: 4, pageSize: 2 })
+    expect(rows.map(r => r.login)).toEqual(['a', 'b', 'c', 'd'])
+  })
+
+  it('deduplicates the first page against the overlapping page 1 refetch', async () => {
+    // The view renders 200 rows, then this walks from page 1 at a larger page
+    // size — so page 1 necessarily repeats rows already held.
+    fetchMocker.mockResponseOnce(pageOf(['a', 'b', 'c'], 3))
+    const rows = await fetchAllResultPages('job-1', {}, {
+      firstPage: [{ login: 'a' }],
+      total: 3,
+      pageSize: 3,
+    })
+    expect(rows.map(r => r.login)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('does not stop early when the last page is a partial one', async () => {
+    // total=3 with pageSize=2 means page 2 returns a single row; an
+    // offset-based loop overshoots here and drops it.
+    fetchMocker.mockResponseOnce(pageOf(['a', 'b'], 3))
+    fetchMocker.mockResponseOnce(pageOf(['c'], 3))
+    const rows = await fetchAllResultPages('job-1', {}, { total: 3, pageSize: 2 })
+    expect(rows).toHaveLength(3)
+  })
+
+  it('stops at MAX_CLIENT_ROWS rather than loading an unbounded set', async () => {
+    const pageSize = MAX_CLIENT_ROWS / 2
+    const big = (offset: number) =>
+      pageOf(Array.from({ length: pageSize }, (_, i) => `u${offset + i}`), MAX_CLIENT_ROWS * 10)
+    fetchMocker.mockResponseOnce(big(0))
+    fetchMocker.mockResponseOnce(big(pageSize))
+    const rows = await fetchAllResultPages('job-1', {}, {
+      total: MAX_CLIENT_ROWS * 10,
+      pageSize,
+    })
+    expect(rows).toHaveLength(MAX_CLIENT_ROWS)
+    expect(fetchMocker.requests()).toHaveLength(2)
+  })
+
+  it('abandons the walk when shouldContinue goes false', async () => {
+    // The view bumps a token on every new query; a walk for a superseded query
+    // must not keep fetching or emit rows into the newer one.
+    fetchMocker.mockResponseOnce(pageOf(['a'], 3))
+    let live = true
+    const onPage = vi.fn(() => { live = false })
+    const rows = await fetchAllResultPages('job-1', {}, {
+      total: 3, pageSize: 1, shouldContinue: () => live, onPage,
+    })
+    expect(rows.map(r => r.login)).toEqual(['a'])
+    expect(fetchMocker.requests()).toHaveLength(1)
+  })
+
+  it('reports progress after each page so the table fills in as it loads', async () => {
+    fetchMocker.mockResponseOnce(pageOf(['a'], 2))
+    fetchMocker.mockResponseOnce(pageOf(['b'], 2))
+    const sizes: number[] = []
+    await fetchAllResultPages('job-1', {}, {
+      total: 2, pageSize: 1, onPage: rows => sizes.push(rows.length),
+    })
+    expect(sizes).toEqual([1, 2])
+  })
+
+  it('forwards the active filters to each page request', async () => {
+    fetchMocker.mockResponseOnce(pageOf(['a'], 1))
+    await fetchAllResultPages('job-1', { q: 'alice', hide_bots: true }, { total: 1, pageSize: 1 })
+    const url = new URL(fetchMocker.requests()[0].url)
+    expect(url.searchParams.get('q')).toBe('alice')
+    expect(url.searchParams.get('hide_bots')).toBe('true')
   })
 })

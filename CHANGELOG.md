@@ -6,6 +6,67 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.0] — 2026-08-17
+
+Findings from a full-codebase security and correctness audit.
+
+> **Upgrading from 1.0.x.** Two operational notes: OAuth session tokens are now
+> encrypted at rest, so every existing session is invalidated and users must sign
+> in once after deploying — set `SESSION_TOKEN_KEY` first, or sessions will also
+> be dropped on every restart. And `cloudrun-service.yaml` now sets
+> `minScale: "1"`, which is required for scheduled re-fetch to run at all but
+> bills continuously.
+
+### Security
+
+- **OAuth login CSRF — the `state` was not bound to the browser** (`backend/main.py`, `backend/store.py`). `add_oauth_state()` wrote the state to a global table and `consume_oauth_state()` only checked that it existed, so the state proved *some* flow had started, not that **this** browser started it. An attacker could hit `/auth/login` themselves, capture their own `?code=…&state=…` callback URL without following it, and get a victim to load it — silently signing the victim into the attacker's GitHub account. Since jobs are keyed `gh:{login}`, everything the victim then fetched landed in the attacker's namespace and was readable by them. `/auth/login` now also sets the state in an httponly, short-lived `rp_oauth_state` cookie, and `/auth/callback` requires a `secrets.compare_digest` match **before** the DB lookup — so a replayed callback cannot consume (and thereby burn) a state belonging to someone else's in-flight login. The cookie is cleared on success.
+- **GitHub access tokens are encrypted at rest** (`backend/store.py`). `sessions.github_token` held a live OAuth token (`read:user user:email public_repo`) in plaintext for up to 30 days, so a database dump handed over every user's GitHub credentials. Tokens are now Fernet-encrypted (`_encrypt_token`/`_decrypt_token`) under `SESSION_TOKEN_KEY`; unset falls back to a per-process ephemeral key with a startup warning. `get_session` decrypts on read and **deletes** any row it cannot decrypt (legacy plaintext, or a rotated key), so a ciphertext blob can never be sent to GitHub as a Bearer token. **Existing users must sign in once after deploying.**
+- **CSRF on preflight-free mutating routes** (`backend/main.py`, `frontend/src/utils/api.ts`). The documented split deployment (Vercel frontend + Cloud Run backend) requires `COOKIE_SAMESITE=none`, so the browser attaches session cookies to cross-site requests; CORS only prevents an attacker *reading* the response, not the request being delivered. `POST /import` with `Content-Type: text/plain` was a "simple" request and let a third-party page create jobs in a victim's account and burn their rate budget; `POST /auth/logout` and `POST /fetch/{id}/cancel` were nuisance-grade. A `require_csrf_header` middleware now rejects `POST`/`PUT`/`PATCH`/`DELETE` without an `X-Requested-With` header (`403`), which forces a preflight that fails CORS for unlisted origins. `GET /auth/callback` is exempt — GitHub drives that redirect and it is protected by the state cookie instead. The middleware is registered *before* `CORSMiddleware` so CORS remains outermost and the `403` is readable rather than surfacing as an opaque CORS failure.
+- **Security headers on the frontend** (`vercel.json`). Added `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY` and a `Permissions-Policy`. Because the file uses legacy `routes` (which cannot be combined with a top-level `headers` block), they are applied via a `"continue": true` pass-through route. The CSP keeps `script-src 'self'` with no `unsafe-inline`; `connect-src` is `https:` and flagged in-file as the value to tighten to the exact backend origin.
+
+### Fixed
+
+- **Charts, quick-stat badges and client-side exports only ever described the first page** (`frontend/src/views/ResultsView.tsx`, `frontend/src/utils/api.ts`). `users` held only the pages that had been scrolled into view (200 at a time), yet every aggregate derived from it — `healthScore`, location/language/org/email-domain breakdowns, growth, role overlap — silently described that fraction. With the default `FETCH_LIMIT=500` this was the common case, not an edge case. Worse, the "total users" badge rendered `users.length` while the summary card directly above it showed the server's total, so the same screen contradicted itself. `loadJob` now renders page 1 immediately and then pulls the remaining pages in the background via the new `fetchAllResultPages()` helper (capped at `MAX_CLIENT_ROWS = 10000`), guarded by a `loadTokenRef` so a filter change mid-load discards stale pages. The badge reads the server total.
+- **Client-side exports silently dropped every unloaded row** (`frontend/src/views/ResultsView.tsx`). Same root cause: "Export JSON/CSV/Excel" and the per-role CSV serialised only the loaded pages, so exporting a 500-row job produced 200 rows with no warning. Export buttons are now disabled until coverage is complete, and a banner states the actual coverage while loading or when a result set exceeds the client cap. Coverage is *derived* from the row count rather than tracked in state, so a page walk that fails part-way is correctly reported as incomplete instead of a flag claiming success.
+- **Scheduled re-fetch never fired in production** (`cloudrun-service.yaml`). `_schedule_loop()` is an in-process asyncio loop, but the deployed service set `minScale: "0"` — the instance scaled to zero, the loop died with it, and schedules never ran while the UI still showed them enabled with a sliding `next_run_at`. Set to `minScale: "1"`, documented inline, **including that a warm instance bills continuously**; revert to `0` only if you drop scheduling or move it to Cloud Scheduler.
+- **`/schedules` was missing from the Vite dev proxy** (`frontend/vite.config.ts`). Dev requests hit the Vite server and 404'd, and `fetchSchedules()` swallows a failure with `return []` — so scheduling looked empty-but-working locally. Added `/schedules` and `/healthz`.
+- **SSE event queues grew without bound** (`backend/store.py`, `backend/worker.py`). Each job got an unbounded `asyncio.Queue`, and the worker emits one event per fetched user whether or not an SSE client is attached. A client that never opened the stream (or disconnected mid-fetch) left every event resident for the life of the process, and `_runtime` entries are only removed on `delete_job`. Queues are now bounded (`_EVENT_QUEUE_MAX = 500`, built by `_new_runtime()`) and `emit_event()` drops the oldest event when full — the terminal `done` event is written last, so it always survives eviction.
+- **`GET /jobs/{id}/history` parsed every run's full result blob** (`backend/store.py`). It selected `result_json` for *every* completed run of a repo purely to rebuild each run's set of logins, and `ResultsView` calls it automatically on every job selection — tens of MB of JSON parsing on a hot path for an uncapped local install. Added a `logins_json` column, written whenever `result` is persisted; `load_repo_history` reads it instead and lazily backfills pre-migration rows on first read.
+
+### Changed
+
+- **`beaconCancelJob` uses `fetch(keepalive)` instead of `navigator.sendBeacon`** (`frontend/src/utils/api.ts`). A beacon cannot set custom headers, so it could not send the CSRF header the backend now requires. `keepalive` gives the same outlive-the-page guarantee and still sends cookies.
+- **Vite's modulepreload polyfill is disabled** (`frontend/vite.config.ts`). It is injected as an inline `<script>`, which would have forced `'unsafe-inline'` into the CSP's `script-src`. Every browser this app targets supports modulepreload natively; the built `index.html` now has exactly one external script tag.
+- **`req()` adds `X-Requested-With` to non-GET requests only** (`frontend/src/utils/api.ts`), so `GET`s stay "simple" and don't pay for a preflight round trip.
+
+### Removed
+
+- **`fetchResults()` deleted** (`frontend/src/utils/api.ts`) — the page-merging helper was imported by `ResultsView` but never called; only tests exercised it. Its role is now filled for real by `fetchAllResultPages()`. `_persist_field`, `_all_job_ids_async` and `get_job_tags` were left in place: `conftest`/`test_store` use them, so they are test helpers rather than dead code.
+
+### Dependencies
+
+- **`cryptography>=43.0.0`** added to `backend/requirements.txt` and `backend/requirements.cloudrun.txt` for Fernet session-token encryption. It was already present transitively, but session encryption is not something to leave depending on another package's dependency graph.
+
+### Tests
+
+- **Backend — `tests/backend/test_security.py`** (new, 18 tests) — CSRF: mutating requests are rejected without the header across `POST`/`PATCH`/`DELETE`, requests carrying it reach the handler, `GET`s don't need it, and `/auth/callback` is exempt. OAuth: `/auth/login` sets a state cookie matching the redirect; a callback with no cookie is rejected **and leaves the state unconsumed**; a mismatched cookie is rejected; a matching cookie gets past both checks. Sessions: the stored token is not plaintext, `get_session` returns it decrypted, and an undecryptable row is dropped and reported as no session. Queues: the bound holds under overflow and the terminal `done` event survives eviction.
+- **Backend — `tests/backend/test_store.py`** — Added `TestLoginsDenormalisation` (6 tests): persisting a result writes a sorted login list; rewriting a result updates it; history reads runs without touching `result_json`; history is owner-scoped; a legacy `NULL` row is backfilled on read so the slow path is not taken twice; pending runs of the same repo are excluded.
+- **Backend — `tests/backend/conftest.py`** — Both test clients now send `X-Requested-With` by default (`CSRF_HEADERS`), matching real clients; tests asserting enforcement strip it deliberately. Seed helpers use `store._new_runtime()` rather than building their own unbounded `asyncio.Queue` — writing the queue-bound test is what surfaced that they were bypassing the cap.
+- **Frontend — `tests/frontend/api.test.ts`** — Added a `CSRF header` suite (mutating calls send it, `GET`s don't, `postFetch` keeps its own headers alongside it, `beaconCancelJob` sends it) and a `fetchAllResultPages` suite (walks every page and unions the results, deduplicates the first page against the overlapping page-1 refetch, **does not stop early on a partial last page**, stops at `MAX_CLIENT_ROWS`, abandons the walk when `shouldContinue` goes false, reports progress per page, and forwards active filters). Removed the six `fetchResults` tests along with the function.
+
+### Documentation
+
+- **`README.md`** — Added `SESSION_TOKEN_KEY` to the backend environment table (with the key-generation command) and a CSRF note alongside the existing job-scoping note.
+- **`docs/cloud-run-deployment-guide.md`** — Added `SESSION_TOKEN_KEY` to the Cloud Run variables table plus a "Session token encryption key" section covering generation, Secret Manager storage, and the consequences of leaving it unset or rotating it.
+- **`ARCHITECTURE.md`** — Updated the `jobs`/`sessions`/`oauth_states` schema descriptions, the runtime-overlay and request-lifecycle sections, and the environment/secrets notes. Two "known issues" are now struck through as resolved (plaintext tokens; no cleanup of expired rows — `_maintenance_loop` already covered the latter), and the dead-`fetchResults` entry reflects its deletion.
+- **`cloudrun-service.yaml`** — Documented why `minScale` must be `1`, and added a commented `SESSION_TOKEN_KEY` secret reference next to the existing `DATABASE_URL` one.
+
+### Known and not fixed
+
+- **Two browser tabs streaming the same job split its events between them.** `asyncio.Queue.get()` is destructive and there is one queue per job, so each tab receives roughly half the log lines. Fixing it properly means a per-job ring buffer with per-subscriber cursors — real work for a cosmetic symptom, deliberately deferred.
+
+---
+
 ## [Unreleased] — 2026-07-14
 
 ### Security

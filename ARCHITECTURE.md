@@ -60,11 +60,10 @@ manual chunks (`vite.config.ts:10-18`), so they don't load until an export runs.
 
 ### Installed but effectively dead
 
-- **`fetchResults` (fetch-all-pages)** in `frontend/src/utils/api.ts:100` is
-  imported by `ResultsView.tsx:2` but never called there; only the tests call
-  it (`frontend/src/tests/api.test.ts`). The app uses `fetchResultsPage`
-  instead. So the import in `ResultsView.tsx` is unused and the fetch-all path
-  is test-only.
+- ~~**`fetchResults` (fetch-all-pages)**~~ — deleted. It was imported by
+  `ResultsView.tsx` but never called, and only the tests exercised it. The
+  fetch-all path now exists for real as `fetchAllResultPages` (`api.ts`), which
+  `ResultsView` uses to load the complete result set behind the first page.
 - **`create_job` (sync)** in `backend/store.py:95` is called only by
   `tests/backend/test_store.py`. Every real endpoint uses `create_job_async`
   (`backend/main.py:194,222,778`). The sync variant and its fire-and-forget
@@ -121,6 +120,10 @@ hop, in order:
    - `_owner_key` (`main.py:89`) resolves the caller identity, minting an
      anonymous `rp_client` cookie if there's neither session nor cookie.
    - `_rate_check` (`main.py:120`) enforces the in-memory per-caller window.
+   - Before any of this, the `require_csrf_header` middleware rejects mutating
+     requests without an `X-Requested-With` header (§5). It is registered
+     *before* `CORSMiddleware` so CORS stays outermost and the 403 is readable
+     rather than surfacing as an opaque CORS failure.
    - `FETCH_LIMIT` clamps `req.limit` (`main.py:189`).
    - `create_job_async` (`store.py:111`) inserts a `pending` row **and awaits
      it** before the worker starts (comment "B4" — avoids a worker-before-insert
@@ -168,8 +171,12 @@ hop, in order:
      into `job["summary"]` (which persists via the `_JobProxy` write).
    - `api.ts` caches both in `sessionStorage` for 5 minutes (`api.ts:130,203`).
    - The view renders summary cards, recharts charts, `WorldMap`, and
-     `UserTable`. "Load more" pages in the rest via `loadMoreUsers`
-     (`ResultsView.tsx:178`).
+     `UserTable`. The remaining pages are then pulled in the background by
+     `fetchAllResultPages` (`api.ts`), capped at `MAX_CLIENT_ROWS`, so that the
+     charts, quick-stat badges and client-side exports aggregate the **whole**
+     result set — holding only page one made them silently describe the first
+     200 rows. A `loadTokenRef` guard discards a walk whose query has been
+     superseded; client-side exports stay disabled until coverage is complete.
 
 ---
 
@@ -182,9 +189,12 @@ Four tables:
 - `job_id` TEXT PK, `status` TEXT (`pending|running|done|error`),
   `message`, `total_fetched` INT, `label`, `result_json`, `summary_json`,
   `created_at`.
-- Added by ad-hoc migrations (`store.py:50-54`): `tags` TEXT (JSON array,
-  default `'[]'`), `owner_key` TEXT (scopes a job to its creator),
-  `params_json` TEXT (original fetch request, for refresh).
+- Added by ad-hoc migrations: `tags` TEXT (JSON array, default `'[]'`),
+  `owner_key` TEXT (scopes a job to its creator), `params_json` TEXT (original
+  fetch request, for refresh), `repo_owner`/`repo_name` TEXT (denormalised so
+  history can group runs of a repo), and `logins_json` TEXT (the run's member
+  list, denormalised from `result_json` so `/jobs/{id}/history` never parses a
+  full result blob; legacy rows are backfilled on first read).
 - `result_json` holds the whole `{login: userRecord}` map as a JSON string.
   **The per-user record itself has no schema on the backend** — it is whatever
   `repo_people.GitHubUserInfo.to_dict()` produces, stored verbatim. The only
@@ -192,20 +202,28 @@ Four tables:
   (`frontend/src/types/index.ts:1-48`), which is descriptive, not enforced.
   Treat that as the *implicit, unvalidated* schema.
 
-**`sessions`** (`store.py:59`) — OAuth: `session_id` PK, `github_token`,
-`github_login`, `github_name`, `github_avatar`, `created_at`, `expires_at`.
-The GitHub access token is stored in plaintext here.
+**`sessions`** — OAuth: `session_id` PK, `github_token`, `github_login`,
+`github_name`, `github_avatar`, `created_at`, `expires_at`. The GitHub access
+token is **encrypted at rest** with Fernet (`_encrypt_token`/`_decrypt_token`),
+keyed by `SESSION_TOKEN_KEY`; unset falls back to a per-process ephemeral key.
+`get_session` decrypts on read and deletes any row it cannot decrypt (rotated
+key, or a legacy plaintext row), so an unusable ciphertext can never be sent to
+GitHub as a Bearer token.
 
-**`oauth_states`** (`store.py:71`) — CSRF: `state` PK, `expires_at`.
-Single-use, consumed in `consume_oauth_state` (`store.py:467`).
+**`oauth_states`** — CSRF: `state` PK, `expires_at`. Single-use, consumed in
+`consume_oauth_state`. The state is **also mirrored into an httponly
+`rp_oauth_state` cookie** at `/auth/login` and compared in `/auth/callback`
+before the DB lookup — the DB row alone only proves *some* flow started, not
+that this browser started it, which allowed a login-CSRF where a victim was
+signed into an attacker's GitHub account.
 
 **`share_tokens`** (`store.py:77`) — `token` PK, `job_id`, `expires_at`.
 24h read links (`main.py:661`).
 
-Expiry for sessions/states/tokens is enforced by comparing ISO strings in SQL
-(`store.py:436,477,507`) — lexicographic comparison that works only because all
-timestamps are `datetime.utcnow().isoformat()` at the same precision. There is
-no scheduled cleanup; expired rows are deleted opportunistically when queried.
+Expiry for sessions/states/tokens is enforced by comparing ISO strings in SQL —
+lexicographic comparison that works only because all timestamps are naive UTC
+`isoformat()` at the same precision. Expired rows are deleted opportunistically
+when queried, and swept hourly by `_maintenance_loop` (`main.py`).
 
 ---
 
@@ -215,8 +233,13 @@ State lives in four places, and some of it is deliberately duplicated:
 
 - **SQLite (`*.db`)** — source of truth for jobs, results, sessions, tokens
   (`store.py`).
-- **In-memory `_runtime` dict (`store.py:28`)** — holds the per-job
-  `asyncio.Queue` and `cancelled` flag, which cannot be serialized. This is
+- **In-memory `_runtime` dict** — holds the per-job `asyncio.Queue` and
+  `cancelled` flag, which cannot be serialized. The queue is **bounded**
+  (`_EVENT_QUEUE_MAX`, built by `_new_runtime`) and `emit_event` drops the
+  oldest event when it is full: the worker emits one event per user whether or
+  not an SSE client is attached, so an unbounded queue retained every event for
+  the life of the process. The terminal `done` event is written last and so
+  always survives eviction. This is
   **duplicated state**: `status`, `cancelled`, etc. exist both in the DB row
   and in the runtime overlay, reconciled by `_row_to_job` (`store.py:188`) and
   the `_JobProxy` subclass (`store.py:209`), which mirrors writes into both.
@@ -270,9 +293,10 @@ Frontend env vars (read via `import.meta.env`, defined in
 **Secrets.** `backend/.env` on this machine contains a real-looking
 `GITHUB_CLIENT_SECRET`. It is **git-ignored** (`.gitignore` `.env` entry) and
 `git ls-files` confirms it is not tracked, so it is not committed — but it is
-sitting in plaintext in the working tree, and OAuth `github_token`s are stored
-plaintext in the `sessions` table (`store.py:425`). The `.db` files are
-git-ignored too (`.gitignore` `*.db`).
+sitting in plaintext in the working tree. OAuth `github_token`s in the
+`sessions` table are encrypted at rest (see §5); set `SESSION_TOKEN_KEY` from a
+secret store in any real deployment. The `.db` files are git-ignored too
+(`.gitignore` `*.db`).
 
 ---
 
@@ -384,21 +408,20 @@ Things that will bite the next maintainer:
    edit that writes `job["result"] = ...` via the proxy instead of
    `persist_job` reintroduces the out-of-order write the "B3" comment fixed.
 
-7. **`ResultsView.tsx:2` imports `fetchResults` but never uses it** (§2); and
-   **`store.create_job` (sync)** is production-dead, test-only (§2). Dead
-   imports/functions that read as if they're load-bearing.
+7. **`store.create_job` (sync)** is production-dead, test-only (§2) — a
+   function that reads as if it's load-bearing. (The unused `fetchResults`
+   client helper has since been deleted.)
 
 8. **`frontend/dist/` is committed** (built assets in the tree). It's stale the
    moment source changes and shouldn't be in version control.
 
-9. **No cleanup of expired rows.** `sessions`, `oauth_states`, and
-   `share_tokens` are only pruned opportunistically when queried
-   (`store.py:477,507`). A row nobody queries lives forever. Fine at this scale,
-   surprising later.
+9. ~~**No cleanup of expired rows.**~~ Resolved: `_maintenance_loop`
+   (`main.py`) sweeps `sessions`, `oauth_states` and `share_tokens` hourly via
+   `purge_expired`, on top of the opportunistic prune on query.
 
-10. **Plaintext GitHub tokens in the DB** (`store.py:425`) and a plaintext OAuth
-    secret in `backend/.env`. Not committed (§7), but anyone with the DB file or
-    the host has the users' GitHub tokens.
+10. ~~**Plaintext GitHub tokens in the DB.**~~ Resolved: tokens are Fernet-encrypted
+    at rest (§5). The OAuth client secret in `backend/.env` is still plaintext on
+    disk — not committed (§7), but anyone with the host can read it.
 
 ### Things I found confusing (the useful part)
 

@@ -3,21 +3,70 @@ import asyncio
 import io
 import csv
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import aiosqlite
+from cryptography.fernet import Fernet, InvalidToken
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SQLite-backed job store
+# Session token encryption
 # ---------------------------------------------------------------------------
-# The DB file lives next to this module (or in the path set by REPO_PEOPLE_DB).
-# Each job's heavy result blob is stored as compressed JSON in the DB.
-# The in-memory dict is kept for fast access to runtime-only fields
-# (asyncio.Queue, cancelled flag) that cannot be serialised.
+# sessions.github_token holds a live GitHub OAuth token for up to 30 days, so a
+# database dump used to hand over every user's credentials in plaintext. Tokens
+# are now encrypted at rest with Fernet (AES-128-CBC + HMAC).
+#
+# SESSION_TOKEN_KEY must be a urlsafe-base64 32-byte key — generate one with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# and store it in Secret Manager. Without it a per-process ephemeral key is used,
+# which is still safe but invalidates every session on restart.
 # ---------------------------------------------------------------------------
+
+_TOKEN_KEY = os.environ.get("SESSION_TOKEN_KEY", "").strip()
+if _TOKEN_KEY:
+    _fernet = Fernet(_TOKEN_KEY.encode())
+else:
+    _fernet = Fernet(Fernet.generate_key())
+    _logger.warning(
+        "SESSION_TOKEN_KEY is not set — using an ephemeral encryption key. "
+        "Every OAuth session will be invalidated when this process restarts. "
+        "Set SESSION_TOKEN_KEY to a persistent Fernet key in any real deployment."
+    )
+
+
+def _encrypt_token(token: str) -> str:
+    return _fernet.encrypt(token.encode()).decode()
+
+
+def _decrypt_token(blob: str) -> str | None:
+    """Decrypt a stored token. Returns None when the ciphertext is unreadable —
+    a rotated key, an ephemeral key after restart, or a legacy plaintext row.
+    Callers treat that as an invalid session, so the user simply logs in again."""
+    try:
+        return _fernet.decrypt(blob.encode()).decode()
+    except (InvalidToken, ValueError):
+        return None
+
+# ---------------------------------------------------------------------------
+# Job store — SQLite by default, Postgres when DATABASE_URL is set
+# ---------------------------------------------------------------------------
+# SQLite keeps state in-process, which means a Cloud Run instance that scales to
+# zero loses every job. Set DATABASE_URL to a Postgres connection string for
+# durable, multi-instance storage; everything else in this module is written to
+# be dialect-agnostic (see _sql()).
+#
+# The in-memory `_runtime` overlay still holds the per-job asyncio.Queue and
+# cancellation flag, which cannot be serialised. Those are inherently
+# per-instance: an SSE stream is served by the instance running the job.
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+IS_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
 _DB_PATH = os.environ.get(
     "REPO_PEOPLE_DB",
@@ -27,178 +76,332 @@ _DB_PATH = os.environ.get(
 # Runtime-only overlay: stores asyncio.Queue and cancelled flag keyed by job_id
 _runtime: dict[str, dict[str, Any]] = {}
 
+_pg_pool = None  # lazily created AsyncConnectionPool when IS_POSTGRES
+
+
+def _utcnow_iso() -> str:
+    """Naive UTC ISO timestamp. Naive (no offset suffix) so that string
+    comparison against other stored timestamps stays lexicographically correct."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def _iso_in(seconds: float) -> str:
+    return (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=seconds)).isoformat()
+
+
+def _sql(query: str) -> str:
+    """Translate the `?` placeholder style used throughout this module into the
+    dialect the active driver expects. All other SQL here is written to be
+    portable: no `datetime('now')` (timestamps come from Python), and no
+    `INSERT OR REPLACE` (every key inserted is a fresh UUID or random token)."""
+    if not IS_POSTGRES:
+        return query
+    return query.replace("?", "%s")
+
+
+class _Conn:
+    """Uniform async cursor API over aiosqlite and psycopg, so callers do not
+    branch on the dialect. Returns plain dicts from reads."""
+
+    def __init__(self, raw: Any):
+        self._raw = raw
+
+    async def exec(self, query: str, params: tuple | list = ()) -> int:
+        if IS_POSTGRES:
+            async with self._raw.cursor() as cur:
+                await cur.execute(_sql(query), tuple(params))
+                return cur.rowcount
+        cur = await self._raw.execute(_sql(query), tuple(params))
+        try:
+            return cur.rowcount
+        finally:
+            # Leaving cursors open holds a read lock on the table, which makes
+            # later DDL fail with "database table is locked".
+            await cur.close()
+
+    async def one(self, query: str, params: tuple | list = ()) -> dict | None:
+        if IS_POSTGRES:
+            from psycopg.rows import dict_row
+            async with self._raw.cursor(row_factory=dict_row) as cur:
+                await cur.execute(_sql(query), tuple(params))
+                return await cur.fetchone()
+        async with self._raw.execute(_sql(query), tuple(params)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row is not None else None
+
+    async def all(self, query: str, params: tuple | list = ()) -> list[dict]:
+        if IS_POSTGRES:
+            from psycopg.rows import dict_row
+            async with self._raw.cursor(row_factory=dict_row) as cur:
+                await cur.execute(_sql(query), tuple(params))
+                return list(await cur.fetchall())
+        async with self._raw.execute(_sql(query), tuple(params)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def commit(self) -> None:
+        await self._raw.commit()
+
+    def execute(self, query: str, params: tuple | list = ()):
+        """Escape hatch returning the driver's native cursor (SQLite only).
+        Prefer exec/one/all — those work on both backends."""
+        if IS_POSTGRES:
+            raise NotImplementedError("Use exec()/one()/all() — execute() is SQLite-only")
+        return self._raw.execute(_sql(query), tuple(params))
+
+
+_schema_ready = False
+
+
+async def _init_schema(c: _Conn) -> None:
+    """Create tables and apply additive migrations. Runs once per process."""
+    global _schema_ready
+    if _schema_ready:
+        return
+
+    await c.exec("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id      TEXT PRIMARY KEY,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            message     TEXT,
+            total_fetched INTEGER NOT NULL DEFAULT 0,
+            label       TEXT,
+            result_json TEXT,
+            summary_json TEXT,
+            created_at  TEXT
+        )
+    """)
+    await c.exec("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT PRIMARY KEY,
+            github_token TEXT NOT NULL,
+            github_login TEXT NOT NULL,
+            github_name  TEXT,
+            github_avatar TEXT,
+            created_at   TEXT,
+            expires_at   TEXT NOT NULL
+        )
+    """)
+    await c.exec("""
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state      TEXT PRIMARY KEY,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    await c.exec("""
+        CREATE TABLE IF NOT EXISTS share_tokens (
+            token      TEXT PRIMARY KEY,
+            job_id     TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    # Scheduled re-fetch: re-runs a job's saved params on a fixed interval.
+    await c.exec("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            schedule_id   TEXT PRIMARY KEY,
+            owner_key     TEXT NOT NULL,
+            source_job_id TEXT NOT NULL,
+            params_json   TEXT NOT NULL,
+            label         TEXT,
+            interval_hours INTEGER NOT NULL,
+            next_run_at   TEXT NOT NULL,
+            last_run_at   TEXT,
+            last_job_id   TEXT,
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT
+        )
+    """)
+
+    # Additive migrations for pre-existing databases.
+    for col, ddl in (
+        ("tags",        "ALTER TABLE jobs ADD COLUMN tags TEXT DEFAULT '[]'"),
+        ("owner_key",   "ALTER TABLE jobs ADD COLUMN owner_key TEXT"),
+        ("params_json", "ALTER TABLE jobs ADD COLUMN params_json TEXT"),
+        # Denormalised so history/churn can group runs of the same repo without
+        # parsing every params blob.
+        ("repo_owner",  "ALTER TABLE jobs ADD COLUMN repo_owner TEXT"),
+        ("repo_name",   "ALTER TABLE jobs ADD COLUMN repo_name TEXT"),
+        # Just the logins from result_json. Churn/history only ever needs the
+        # set of members, and parsing every run's full result blob to rebuild it
+        # made /jobs/{id}/history read tens of MB on a hot path.
+        ("logins_json", "ALTER TABLE jobs ADD COLUMN logins_json TEXT"),
+    ):
+        if IS_POSTGRES:
+            # Postgres aborts the surrounding transaction on a duplicate-column
+            # error, so use IF NOT EXISTS rather than catching.
+            await c.exec(ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS"))
+        else:
+            try:
+                await c.exec(ddl)
+            except Exception:
+                pass  # Column already exists
+
+    await c.exec("CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs (owner_key)")
+    await c.exec("CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs (owner_key, repo_owner, repo_name)")
+    await c.exec("CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions (expires_at)")
+    await c.exec("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules (enabled, next_run_at)")
+    await c.commit()
+    _schema_ready = True
+
 
 @asynccontextmanager
 async def _db():
-    """Async context manager that opens, initialises, and closes the SQLite DB."""
-    async with aiosqlite.connect(_DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id      TEXT PRIMARY KEY,
-                status      TEXT NOT NULL DEFAULT 'pending',
-                message     TEXT,
-                total_fetched INTEGER NOT NULL DEFAULT 0,
-                label       TEXT,
-                result_json TEXT,
-                summary_json TEXT,
-                created_at  TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        # Lightweight migrations for existing DBs — ignore if the column exists.
-        for ddl in (
-            "ALTER TABLE jobs ADD COLUMN tags TEXT DEFAULT '[]'",
-            "ALTER TABLE jobs ADD COLUMN owner_key TEXT",     # scopes a job to its creator
-            "ALTER TABLE jobs ADD COLUMN params_json TEXT",   # original fetch params, for refresh
-        ):
-            try:
-                await conn.execute(ddl)
-            except Exception:
-                pass  # Column already exists
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id   TEXT PRIMARY KEY,
-                github_token TEXT NOT NULL,
-                github_login TEXT NOT NULL,
-                github_name  TEXT,
-                github_avatar TEXT,
-                created_at   TEXT DEFAULT (datetime('now')),
-                expires_at   TEXT NOT NULL
-            )
-        """)
-        # Ephemeral stores persisted so they survive restarts / multiple instances.
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS oauth_states (
-                state      TEXT PRIMARY KEY,
-                expires_at TEXT NOT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS share_tokens (
-                token      TEXT PRIMARY KEY,
-                job_id     TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            )
-        """)
-        await conn.commit()
-        yield conn
+    """Async context manager yielding an initialised _Conn."""
+    if IS_POSTGRES:
+        global _pg_pool
+        if _pg_pool is None:
+            from psycopg_pool import AsyncConnectionPool
+            _pg_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False)
+            await _pg_pool.open()
+        async with _pg_pool.connection() as raw:
+            c = _Conn(raw)
+            await _init_schema(c)
+            yield c
+    else:
+        import aiosqlite
+        async with aiosqlite.connect(_DB_PATH) as raw:
+            raw.row_factory = aiosqlite.Row
+            # PRAGMA returns a row, so its cursor must be closed — an open
+            # cursor holds a read lock and makes later DDL on this connection
+            # fail with "database table is locked".
+            async with raw.execute("PRAGMA journal_mode=WAL"):
+                pass
+            c = _Conn(raw)
+            await _init_schema(c)
+            yield c
 
 
 def _log_task_error(task: asyncio.Task) -> None:
     """Done-callback that logs exceptions from fire-and-forget tasks."""
-    import logging
     if not task.cancelled() and task.exception() is not None:
-        logging.getLogger(__name__).error("Background store task failed: %s", task.exception())
+        _logger.error("Background store task failed: %s", task.exception())
 
+
+# ---------------------------------------------------------------------------
+# Runtime overlay (per-instance, not persisted)
+# ---------------------------------------------------------------------------
+
+# The worker emits one progress event per user whether or not anyone is
+# listening, and nothing drains the queue when the client never opens the SSE
+# stream (or disconnects mid-fetch). An unbounded queue therefore held every
+# event for the life of the process. Cap it and drop the oldest events instead.
+_EVENT_QUEUE_MAX = 500
+
+
+def _new_runtime() -> dict[str, Any]:
+    return {"cancelled": False, "events": asyncio.Queue(maxsize=_EVENT_QUEUE_MAX)}
+
+
+def emit_event(queue: asyncio.Queue, item: dict[str, Any]) -> None:
+    """Put an event on a job's queue without ever blocking the worker.
+
+    When the queue is full the oldest event is discarded. Progress events are
+    the bulk of the traffic and only the latest one matters for the UI; the
+    terminal 'done' event is the last written, so it always survives.
+    """
+    try:
+        queue.put_nowait(item)
+        return
+    except asyncio.QueueFull:
+        pass
+    try:
+        queue.get_nowait()
+    except asyncio.QueueEmpty:  # pragma: no cover — drained concurrently
+        pass
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:  # pragma: no cover — refilled concurrently
+        _logger.warning("Dropped SSE event; queue full")
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
 
 def create_job() -> str:
-    """Create a new pending job synchronously (DB write is deferred to the event loop)."""
+    """Create a job synchronously, deferring the DB insert to the event loop.
+
+    Prefer create_job_async() in async code: this variant can let a worker start
+    before the row exists. Retained for synchronous callers and tests.
+    """
     job_id = str(uuid.uuid4())
-    _runtime[job_id] = {
-        "cancelled": False,
-        "events": asyncio.Queue(),
-    }
-    # Schedule the DB insert without blocking — only if an event loop is running.
+    _runtime[job_id] = _new_runtime()
     try:
-        task = asyncio.get_event_loop().create_task(_insert_job(job_id))
+        task = asyncio.get_running_loop().create_task(_insert_job(job_id))
         task.add_done_callback(_log_task_error)
     except RuntimeError:
-        pass  # No running loop (e.g., sync unit tests) — use create_job_async in async contexts.
+        pass  # No running loop (sync unit tests)
     return job_id
 
 
 async def create_job_async(owner_key: str | None = None, params: dict | None = None) -> str:
     """Create a new pending job and await the DB insert before returning.
-    Use this in async endpoints to avoid the worker-starts-before-insert race.
     owner_key scopes the job to its creator; params is the original fetch request."""
     job_id = str(uuid.uuid4())
-    _runtime[job_id] = {
-        "cancelled": False,
-        "events": asyncio.Queue(),
-    }
+    _runtime[job_id] = _new_runtime()
     await _insert_job(job_id, owner_key, params)
     return job_id
 
 
 async def _insert_job(job_id: str, owner_key: str | None = None, params: dict | None = None) -> None:
-    async with _db() as conn:
-        await conn.execute(
-            "INSERT OR IGNORE INTO jobs (job_id, status, owner_key, params_json) VALUES (?, ?, ?, ?)",
-            (job_id, "pending", owner_key, json.dumps(params) if params else None),
+    params = params or None
+    async with _db() as c:
+        await c.exec(
+            "INSERT INTO jobs (job_id, status, owner_key, params_json, repo_owner, repo_name, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id, "pending", owner_key,
+                json.dumps(params) if params else None,
+                (params or {}).get("owner"),
+                (params or {}).get("repo"),
+                _utcnow_iso(),
+            ),
         )
-        await conn.commit()
+        await c.commit()
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
-    """Return a live job dict (merges DB state with runtime overlay).
-    This is a *synchronous* call that reads from the DB via a helper run in the
-    current event loop if available, otherwise falls back to a blocking read."""
+    """Return a live job dict backed by the runtime overlay.
+
+    Synchronous, for use by the worker. Reads of `cancelled`/`events` go
+    straight to the shared overlay so a cancel issued through a *different*
+    proxy instance is visible here.
+    """
     rt = _runtime.get(job_id)
-    # If we have no runtime entry the job either never existed or was loaded from DB
     if rt is None:
-        # Try to load from DB synchronously (startup reconciliation path)
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Can't block — return None; callers should use async path
-                return None
-            row = loop.run_until_complete(_load_job_row(job_id))
-        except RuntimeError:
-            return None
-        if row is None:
-            return None
-        rt = {"cancelled": False, "events": asyncio.Queue()}
-        _runtime[job_id] = rt
-        return _row_to_job(row, rt)
-
-    # Fast path: read cached data from DB via get_job_async (sync wrapper)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Caller is in async context — they should use get_job_async.
-            # Return a partial dict from runtime so the worker can update it.
-            return _make_partial(job_id, rt)
-    except RuntimeError:
-        pass
-    return _make_partial(job_id, rt)
-
-
-def _make_partial(job_id: str, rt: dict[str, Any]) -> dict[str, Any]:
-    """Build a minimal mutable job dict backed by runtime data.
-    Writes to this dict are immediately visible and are persisted async."""
+        return None
     return _JobProxy(job_id, rt)
 
 
 async def get_job_async(job_id: str) -> dict[str, Any] | None:
-    """Async version — always reads latest state from DB."""
+    """Async version — always reads latest state from the DB."""
     row = await _load_job_row(job_id)
     if row is None:
         return None
-    rt = _runtime.setdefault(job_id, {"cancelled": False, "events": asyncio.Queue()})
+    rt = _runtime.setdefault(job_id, _new_runtime())
     return _row_to_job(row, rt)
 
 
-async def _load_job_row(job_id: str):
-    async with _db() as conn:
-        async with conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)) as cur:
-            return await cur.fetchone()
+async def _load_job_row(job_id: str) -> dict | None:
+    async with _db() as c:
+        return await c.one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
 
 
-def _row_to_job(row, rt: dict[str, Any]) -> dict[str, Any]:
-    result = json.loads(row["result_json"]) if row["result_json"] else None
-    summary = json.loads(row["summary_json"]) if row["summary_json"] else None
-    keys = row.keys()
-    params = json.loads(row["params_json"]) if ("params_json" in keys and row["params_json"]) else None
+def _row_to_job(row: dict, rt: dict[str, Any]) -> dict[str, Any]:
+    result = json.loads(row["result_json"]) if row.get("result_json") else None
+    summary = json.loads(row["summary_json"]) if row.get("summary_json") else None
+    params = json.loads(row["params_json"]) if row.get("params_json") else None
     job: dict[str, Any] = {
         "status": row["status"],
-        "message": row["message"],
-        "total_fetched": row["total_fetched"],
-        "label": row["label"],
+        "message": row.get("message"),
+        "total_fetched": row.get("total_fetched") or 0,
+        "label": row.get("label"),
         "result": result,
         "summary": summary,
-        "owner_key": row["owner_key"] if "owner_key" in keys else None,
+        "owner_key": row.get("owner_key"),
         "params": params,
+        "repo_owner": row.get("repo_owner"),
+        "repo_name": row.get("repo_name"),
+        "created_at": row.get("created_at"),
         "cancelled": rt.get("cancelled", False),
         "events": rt["events"],
         "_job_id": row["job_id"],
@@ -206,8 +409,13 @@ def _row_to_job(row, rt: dict[str, Any]) -> dict[str, Any]:
     return _JobProxy(row["job_id"], rt, _cached=job)
 
 
+# Fields that live in the per-instance runtime overlay rather than the DB.
+_RUNTIME_FIELDS = ("cancelled", "events")
+
+
 class _JobProxy(dict):
-    """A dict subclass that intercepts writes and persists them to SQLite."""
+    """A dict subclass that routes runtime fields to the shared overlay and
+    persists DB fields to the store."""
 
     def __init__(self, job_id: str, rt: dict[str, Any], _cached: dict[str, Any] | None = None):
         super().__init__(_cached or {
@@ -217,114 +425,141 @@ class _JobProxy(dict):
             "label": None,
             "result": None,
             "summary": None,
-            "cancelled": False,
+            "cancelled": rt.get("cancelled", False),
             "events": rt["events"],
             "_job_id": job_id,
         })
         object.__setattr__(self, "_job_id", job_id)
         object.__setattr__(self, "_rt", rt)
 
-    def __setitem__(self, key: str, value: Any) -> None:
-        super().__setitem__(key, value)
-        # Sync runtime overlay for fast-path fields
-        if key in ("cancelled", "events"):
-            object.__getattribute__(self, "_rt")[key] = value
-        # Persist DB fields asynchronously
-        _DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary"}
-        if key in _DB_FIELDS:
-            job_id = object.__getattribute__(self, "_job_id")
-            task = asyncio.create_task(_persist_field(job_id, key, value))
-            task.add_done_callback(_log_task_error)
+    # Runtime fields must always be read live from the overlay. Reading them
+    # from this instance's own dict returns whatever was true when the proxy was
+    # built, which is why cancellation used to be invisible to a running worker.
+    def __getitem__(self, key: str) -> Any:
+        if key in _RUNTIME_FIELDS:
+            return object.__getattribute__(self, "_rt")[key]
+        return super().__getitem__(key)
 
     def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        if key in _RUNTIME_FIELDS:
+            return object.__getattribute__(self, "_rt").get(key, default)
         return super().get(key, default)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        super().__setitem__(key, value)
+        if key in _RUNTIME_FIELDS:
+            object.__getattribute__(self, "_rt")[key] = value
+            return
+        if key in _DB_FIELDS:
+            job_id = object.__getattribute__(self, "_job_id")
+            task = asyncio.create_task(persist_job(job_id, **{key: value}))
+            task.add_done_callback(_log_task_error)
+
+
+_DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary"}
+
+_COL_MAP = {
+    "status": "status", "message": "message", "total_fetched": "total_fetched",
+    "label": "label", "result": "result_json", "summary": "summary_json",
+}
+
+
+async def persist_job(job_id: str, **fields: Any) -> None:
+    """Atomically persist several job fields in one awaited write."""
+    sets, vals = [], []
+    for key, value in fields.items():
+        col = _COL_MAP.get(key)
+        if col is None:
+            continue
+        sets.append(f"{col} = ?")
+        vals.append(json.dumps(value) if isinstance(value, (dict, list)) else value)
+    # Keep the denormalised login list in step with the result it derives from,
+    # so history never has to parse a full result blob.
+    if isinstance(fields.get("result"), dict):
+        sets.append("logins_json = ?")
+        vals.append(json.dumps(sorted(fields["result"].keys())))
+    if not sets:
+        return
+    vals.append(job_id)
+    async with _db() as c:
+        await c.exec(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", vals)
+        await c.commit()
 
 
 async def _persist_field(job_id: str, key: str, value: Any) -> None:
-    col_map = {
-        "status": "status",
-        "message": "message",
-        "total_fetched": "total_fetched",
-        "label": "label",
-        "result": "result_json",
-        "summary": "summary_json",
-    }
-    col = col_map.get(key)
-    if col is None:
-        return
-    serialised = json.dumps(value) if isinstance(value, (dict, list)) else value
-    async with _db() as conn:
-        await conn.execute(f"UPDATE jobs SET {col} = ? WHERE job_id = ?", (serialised, job_id))
-        await conn.commit()
+    """Persist a single job field. Thin wrapper over persist_job()."""
+    await persist_job(job_id, **{key: value})
 
 
 async def _all_job_ids_async() -> list[str]:
-    async with _db() as conn:
-        async with conn.execute("SELECT job_id FROM jobs ORDER BY created_at") as cur:
-            rows = await cur.fetchall()
+    async with _db() as c:
+        rows = await c.all("SELECT job_id FROM jobs ORDER BY created_at")
     return [r["job_id"] for r in rows]
 
 
 async def load_jobs_list(owner_key: str | None = None) -> list[dict]:
-    """Return jobs as lightweight dicts using a single SELECT (avoids N+1).
+    """Return the caller's jobs as lightweight dicts using a single SELECT.
 
-    When owner_key is given, returns only that owner's jobs plus legacy
-    unowned (NULL) jobs. When None, returns only unowned jobs.
+    Jobs are strictly owner-scoped. An anonymous caller with no cookie sees
+    nothing rather than the pool of legacy unowned jobs.
     """
-    async with _db() as conn:
-        async with conn.execute(
-            "SELECT job_id, status, total_fetched, label, created_at, tags FROM jobs "
-            "WHERE owner_key IS NULL OR owner_key = ? ORDER BY created_at",
+    if not owner_key:
+        return []
+    async with _db() as c:
+        rows = await c.all(
+            "SELECT job_id, status, total_fetched, label, created_at, tags, repo_owner, repo_name "
+            "FROM jobs WHERE owner_key = ? ORDER BY created_at",
             (owner_key,),
-        ) as cur:
-            rows = await cur.fetchall()
+        )
     result = []
     for row in rows:
-        raw_tags = row["tags"] if "tags" in row.keys() else "[]"
         try:
-            tags = json.loads(raw_tags or "[]")
+            tags = json.loads(row.get("tags") or "[]")
         except Exception:
             tags = []
         result.append({
             "job_id": row["job_id"],
             "status": row["status"],
-            "total_fetched": row["total_fetched"],
-            "label": row["label"],
-            "created_at": row["created_at"],
+            "total_fetched": row.get("total_fetched") or 0,
+            "label": row.get("label"),
+            "created_at": row.get("created_at"),
             "tags": tags,
+            "repo_owner": row.get("repo_owner"),
+            "repo_name": row.get("repo_name"),
         })
     return result
 
 
 async def load_all_jobs_into_runtime() -> None:
-    """Called at startup to restore jobs from the DB into _runtime."""
-    async with _db() as conn:
-        async with conn.execute("SELECT job_id FROM jobs ORDER BY created_at") as cur:
-            rows = await cur.fetchall()
+    """Called at startup to restore job IDs from the DB into _runtime."""
+    async with _db() as c:
+        rows = await c.all("SELECT job_id FROM jobs ORDER BY created_at")
     for row in rows:
         jid = row["job_id"]
         if jid not in _runtime:
-            _runtime[jid] = {"cancelled": False, "events": asyncio.Queue()}
+            _runtime[jid] = _new_runtime()
 
 
 async def delete_job(job_id: str) -> bool:
-    """Remove a job from the DB and runtime. Returns True if it existed."""
+    """Remove a job, its share tokens and its schedules. True if it existed."""
     existed = job_id in _runtime or await _load_job_row(job_id) is not None
     _runtime.pop(job_id, None)
-    async with _db() as conn:
-        await conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
-        await conn.commit()
+    async with _db() as c:
+        await c.exec("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+        # Dangling share links to a deleted job are dead weight — drop them so a
+        # leaked token cannot outlive the data it pointed at.
+        await c.exec("DELETE FROM share_tokens WHERE job_id = ?", (job_id,))
+        await c.exec("DELETE FROM schedules WHERE source_job_id = ?", (job_id,))
+        await c.commit()
     return existed
 
 
 async def get_job_tags(job_id: str) -> list[str]:
-    """Return the tags list for a job."""
     row = await _load_job_row(job_id)
     if row is None:
         return []
-    raw = row["tags"] if "tags" in row.keys() else "[]"
     try:
-        return json.loads(raw or "[]")
+        return json.loads(row.get("tags") or "[]")
     except Exception:
         return []
 
@@ -335,52 +570,98 @@ async def set_job_tags(job_id: str, tags: list[str]) -> bool:
     if row is None:
         return False
     cleaned = sorted({t.strip().lower() for t in tags if t.strip()})
-    async with _db() as conn:
-        await conn.execute(
-            "UPDATE jobs SET tags = ? WHERE job_id = ?",
-            (json.dumps(cleaned), job_id),
-        )
-        await conn.commit()
+    async with _db() as c:
+        await c.exec("UPDATE jobs SET tags = ? WHERE job_id = ?", (json.dumps(cleaned), job_id))
+        await c.commit()
     return True
-
-
-async def persist_job(job_id: str, **fields: Any) -> None:
-    """Atomically persist several job fields in one awaited write.
-
-    Use for state transitions (result + status + total) where the fire-and-forget
-    _JobProxy writes could otherwise land out of order.
-    """
-    col_map = {
-        "status": "status", "message": "message", "total_fetched": "total_fetched",
-        "label": "label", "result": "result_json", "summary": "summary_json",
-    }
-    sets, vals = [], []
-    for key, value in fields.items():
-        col = col_map.get(key)
-        if col is None:
-            continue
-        sets.append(f"{col} = ?")
-        vals.append(json.dumps(value) if isinstance(value, (dict, list)) else value)
-    if not sets:
-        return
-    vals.append(job_id)
-    async with _db() as conn:
-        await conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", vals)
-        await conn.commit()
 
 
 async def clear_all_jobs() -> int:
     """Delete every job from the DB and clear the runtime overlay.
-
-    Returns the number of rows deleted.
-    Intended for development / testing use only.
-    """
+    Intended for development / testing use only."""
     _runtime.clear()
-    async with _db() as conn:
-        cur = await conn.execute("DELETE FROM jobs")
-        deleted = cur.rowcount
-        await conn.commit()
-    return deleted
+    async with _db() as c:
+        deleted = await c.exec("DELETE FROM jobs")
+        await c.exec("DELETE FROM share_tokens")
+        await c.exec("DELETE FROM schedules")
+        await c.commit()
+    return max(deleted, 0)
+
+
+async def load_repo_history(owner_key: str, repo_owner: str, repo_name: str) -> list[dict]:
+    """Return every completed run for one repo, oldest first, with full results.
+
+    Powers churn/retention: consecutive runs are diffed to find joiners and
+    leavers. Only the caller's own runs are considered.
+    """
+    async with _db() as c:
+        # logins_json first: rows written since it was introduced carry just the
+        # member list, so the full result blob never has to be read or parsed.
+        rows = await c.all(
+            "SELECT job_id, label, created_at, total_fetched, logins_json FROM jobs "
+            "WHERE owner_key = ? AND repo_owner = ? AND repo_name = ? AND status = 'done' "
+            "ORDER BY created_at",
+            (owner_key, repo_owner, repo_name),
+        )
+        legacy = [r["job_id"] for r in rows if not r.get("logins_json")]
+        backfilled: dict[str, list[str]] = {}
+        for job_id in legacy:
+            # Pre-migration row: parse its result once, then persist the derived
+            # list so this path is not taken again for that job.
+            blob = await c.one("SELECT result_json FROM jobs WHERE job_id = ?", (job_id,))
+            try:
+                result = json.loads(blob["result_json"]) if blob and blob.get("result_json") else {}
+            except Exception:
+                result = {}
+            logins = sorted(result.keys()) if isinstance(result, dict) else []
+            backfilled[job_id] = logins
+            await c.exec(
+                "UPDATE jobs SET logins_json = ? WHERE job_id = ?", (json.dumps(logins), job_id)
+            )
+        if legacy:
+            await c.commit()
+
+    out = []
+    for row in rows:
+        job_id = row["job_id"]
+        if job_id in backfilled:
+            logins = backfilled[job_id]
+        else:
+            try:
+                logins = json.loads(row["logins_json"])
+            except Exception:
+                logins = []
+        out.append({
+            "job_id": job_id,
+            "label": row.get("label"),
+            "created_at": row.get("created_at"),
+            "total_fetched": row.get("total_fetched") or 0,
+            "logins": set(logins),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+# Leading characters that make a spreadsheet treat a cell as a formula.
+_CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection.
+
+    Exported data is attacker-controllable (via /import, and via GitHub profile
+    fields like name/bio/company), and a cell beginning `=`, `+`, `-`, `@`, tab
+    or CR is executed as a formula when the CSV is opened in Excel or Sheets.
+    Prefixing with a single quote makes it render as literal text.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(_CSV_INJECTION_PREFIXES):
+        return "'" + value
+    return value
 
 
 def result_to_csv_bytes(result: dict[str, Any]) -> bytes:
@@ -399,7 +680,8 @@ def result_to_csv_bytes(result: dict[str, Any]) -> bytes:
         row = {}
         for k in all_keys:
             v = u.get(k, "")
-            row[k] = json.dumps(v) if isinstance(v, (list, dict)) else (v if v is not None else "")
+            v = json.dumps(v) if isinstance(v, (list, dict)) else (v if v is not None else "")
+            row[k] = csv_safe(v)
         writer.writerow(row)
     return buf.getvalue().encode()
 
@@ -416,98 +698,233 @@ async def create_session(
     avatar: str | None,
     ttl_days: int = 30,
 ) -> None:
-    """Persist a new OAuth session. Expires after *ttl_days* days."""
-    from datetime import datetime, timedelta
-    expires_at = (datetime.utcnow() + timedelta(days=ttl_days)).isoformat()
-    async with _db() as conn:
-        await conn.execute(
-            """INSERT OR REPLACE INTO sessions
-               (session_id, github_token, github_login, github_name, github_avatar, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (session_id, token, login, name, avatar, expires_at),
+    """Persist a new OAuth session. Expires after *ttl_days* days.
+
+    The GitHub token is encrypted before it touches the database."""
+    async with _db() as c:
+        await c.exec(
+            """INSERT INTO sessions
+               (session_id, github_token, github_login, github_name, github_avatar, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, _encrypt_token(token), login, name, avatar,
+             _utcnow_iso(), _iso_in(ttl_days * 24 * 3600)),
         )
-        await conn.commit()
+        # Expired sessions hold live GitHub access tokens, so sweep them on every
+        # write rather than letting them accumulate indefinitely.
+        await c.exec("DELETE FROM sessions WHERE expires_at < ?", (_utcnow_iso(),))
+        await c.commit()
 
 
 async def get_session(session_id: str) -> dict[str, Any] | None:
-    """Return a valid, non-expired session dict, or None."""
-    async with _db() as conn:
-        async with conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime('now')",
-            (session_id,),
-        ) as cur:
-            row = await cur.fetchone()
+    """Return a valid, non-expired session with its token decrypted, or None.
+
+    A row whose token cannot be decrypted is dropped and treated as no session:
+    it is unusable either way, and leaving it in place would keep handing the
+    caller a ciphertext blob to send to GitHub as a Bearer token."""
+    async with _db() as c:
+        row = await c.one(
+            "SELECT * FROM sessions WHERE session_id = ? AND expires_at > ?",
+            (session_id, _utcnow_iso()),
+        )
     if row is None:
         return None
-    return dict(row)
+    token = _decrypt_token(row["github_token"] or "")
+    if token is None:
+        await delete_session(session_id)
+        return None
+    row["github_token"] = token
+    return row
 
 
 async def delete_session(session_id: str) -> None:
-    """Delete a session (logout)."""
-    async with _db() as conn:
-        await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-        await conn.commit()
+    async with _db() as c:
+        await c.exec("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await c.commit()
+
+
+async def purge_expired() -> dict[str, int]:
+    """Delete expired sessions, OAuth states and share tokens. Returns counts."""
+    now = _utcnow_iso()
+    async with _db() as c:
+        sessions = await c.exec("DELETE FROM sessions WHERE expires_at < ?", (now,))
+        states = await c.exec("DELETE FROM oauth_states WHERE expires_at < ?", (now,))
+        shares = await c.exec("DELETE FROM share_tokens WHERE expires_at < ?", (now,))
+        await c.commit()
+    return {"sessions": max(sessions, 0), "oauth_states": max(states, 0), "share_tokens": max(shares, 0)}
 
 
 # ---------------------------------------------------------------------------
-# OAuth CSRF state (persisted so it survives restarts / multiple instances)
+# OAuth CSRF state
 # ---------------------------------------------------------------------------
 
 async def add_oauth_state(state: str, ttl_seconds: int = 600) -> None:
-    from datetime import datetime, timedelta
-    expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
-    async with _db() as conn:
-        await conn.execute(
-            "INSERT OR REPLACE INTO oauth_states (state, expires_at) VALUES (?, ?)",
-            (state, expires_at),
+    async with _db() as c:
+        await c.exec(
+            "INSERT INTO oauth_states (state, expires_at) VALUES (?, ?)",
+            (state, _iso_in(ttl_seconds)),
         )
-        await conn.commit()
+        await c.commit()
 
 
 async def consume_oauth_state(state: str) -> bool:
     """Return True if the state exists and is unexpired, deleting it (single-use)."""
-    from datetime import datetime
-    now_iso = datetime.utcnow().isoformat()
-    async with _db() as conn:
-        async with conn.execute(
-            "SELECT expires_at FROM oauth_states WHERE state = ?", (state,)
-        ) as cur:
-            row = await cur.fetchone()
-        await conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-        await conn.execute("DELETE FROM oauth_states WHERE expires_at < ?", (now_iso,))
-        await conn.commit()
+    now_iso = _utcnow_iso()
+    async with _db() as c:
+        row = await c.one("SELECT expires_at FROM oauth_states WHERE state = ?", (state,))
+        await c.exec("DELETE FROM oauth_states WHERE state = ?", (state,))
+        await c.exec("DELETE FROM oauth_states WHERE expires_at < ?", (now_iso,))
+        await c.commit()
     return bool(row) and row["expires_at"] > now_iso
 
 
 # ---------------------------------------------------------------------------
-# Shareable read tokens (persisted)
+# Shareable read tokens
 # ---------------------------------------------------------------------------
 
 async def add_share_token(token: str, job_id: str, ttl_seconds: int = 24 * 3600) -> str:
-    from datetime import datetime, timedelta
-    expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
-    async with _db() as conn:
-        await conn.execute(
-            "INSERT OR REPLACE INTO share_tokens (token, job_id, expires_at) VALUES (?, ?, ?)",
+    expires_at = _iso_in(ttl_seconds)
+    async with _db() as c:
+        await c.exec(
+            "INSERT INTO share_tokens (token, job_id, expires_at) VALUES (?, ?, ?)",
             (token, job_id, expires_at),
         )
-        await conn.commit()
+        await c.commit()
     return expires_at
 
 
 async def get_share_token(token: str) -> dict[str, Any] | None:
-    """Return {job_id, expires_at} for a valid unexpired token, else None (deleting if expired)."""
-    from datetime import datetime
-    now_iso = datetime.utcnow().isoformat()
-    async with _db() as conn:
-        async with conn.execute(
-            "SELECT job_id, expires_at FROM share_tokens WHERE token = ?", (token,)
-        ) as cur:
-            row = await cur.fetchone()
-        await conn.execute("DELETE FROM share_tokens WHERE expires_at < ?", (now_iso,))
-        await conn.commit()
-    if row is None:
-        return None
-    if row["expires_at"] <= now_iso:
+    """Return {job_id, expires_at} for a valid unexpired token, else None."""
+    now_iso = _utcnow_iso()
+    async with _db() as c:
+        row = await c.one("SELECT job_id, expires_at FROM share_tokens WHERE token = ?", (token,))
+        await c.exec("DELETE FROM share_tokens WHERE expires_at < ?", (now_iso,))
+        await c.commit()
+    if row is None or row["expires_at"] <= now_iso:
         return None
     return {"job_id": row["job_id"], "expires_at": row["expires_at"]}
+
+
+# ---------------------------------------------------------------------------
+# Scheduled re-fetch
+# ---------------------------------------------------------------------------
+
+async def create_schedule(
+    owner_key: str, source_job_id: str, params: dict, label: str | None, interval_hours: int
+) -> dict:
+    schedule_id = str(uuid.uuid4())
+    next_run = _iso_in(interval_hours * 3600)
+    async with _db() as c:
+        await c.exec(
+            "INSERT INTO schedules (schedule_id, owner_key, source_job_id, params_json, label, "
+            "interval_hours, next_run_at, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (schedule_id, owner_key, source_job_id, json.dumps(params), label,
+             interval_hours, next_run, _utcnow_iso()),
+        )
+        await c.commit()
+    return {
+        "schedule_id": schedule_id, "source_job_id": source_job_id, "label": label,
+        "interval_hours": interval_hours, "next_run_at": next_run, "enabled": True,
+        "last_run_at": None, "last_job_id": None,
+    }
+
+
+def _schedule_row_to_dict(row: dict) -> dict:
+    return {
+        "schedule_id": row["schedule_id"],
+        "source_job_id": row["source_job_id"],
+        "label": row.get("label"),
+        "interval_hours": row["interval_hours"],
+        "next_run_at": row["next_run_at"],
+        "last_run_at": row.get("last_run_at"),
+        "last_job_id": row.get("last_job_id"),
+        "enabled": bool(row["enabled"]),
+    }
+
+
+async def list_schedules(owner_key: str) -> list[dict]:
+    async with _db() as c:
+        rows = await c.all(
+            "SELECT * FROM schedules WHERE owner_key = ? ORDER BY created_at", (owner_key,)
+        )
+    return [_schedule_row_to_dict(r) for r in rows]
+
+
+async def get_schedule(schedule_id: str, owner_key: str) -> dict | None:
+    async with _db() as c:
+        row = await c.one(
+            "SELECT * FROM schedules WHERE schedule_id = ? AND owner_key = ?",
+            (schedule_id, owner_key),
+        )
+    return _schedule_row_to_dict(row) if row else None
+
+
+async def set_schedule_enabled(schedule_id: str, owner_key: str, enabled: bool) -> bool:
+    async with _db() as c:
+        n = await c.exec(
+            "UPDATE schedules SET enabled = ? WHERE schedule_id = ? AND owner_key = ?",
+            (1 if enabled else 0, schedule_id, owner_key),
+        )
+        await c.commit()
+    return n > 0
+
+
+async def delete_schedule(schedule_id: str, owner_key: str) -> bool:
+    async with _db() as c:
+        n = await c.exec(
+            "DELETE FROM schedules WHERE schedule_id = ? AND owner_key = ?",
+            (schedule_id, owner_key),
+        )
+        await c.commit()
+    return n > 0
+
+
+async def claim_due_schedules(limit: int = 5) -> list[dict]:
+    """Return due schedules, immediately advancing next_run_at so a concurrent
+    instance cannot pick up the same one.
+
+    ponytail: read-then-write rather than SELECT ... FOR UPDATE, because SQLite
+    has no row locking. Worst case under multi-instance Postgres is a duplicate
+    re-fetch, which is wasteful but harmless. Switch to FOR UPDATE SKIP LOCKED
+    if that becomes expensive.
+    """
+    now = _utcnow_iso()
+    async with _db() as c:
+        rows = await c.all(
+            "SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? "
+            "ORDER BY next_run_at LIMIT ?",
+            (now, limit),
+        )
+        claimed = []
+        for row in rows:
+            advanced = _iso_in(row["interval_hours"] * 3600)
+            n = await c.exec(
+                "UPDATE schedules SET next_run_at = ?, last_run_at = ? "
+                "WHERE schedule_id = ? AND next_run_at = ?",
+                (advanced, now, row["schedule_id"], row["next_run_at"]),
+            )
+            if n > 0:
+                claimed.append({
+                    "schedule_id": row["schedule_id"],
+                    "owner_key": row["owner_key"],
+                    "source_job_id": row["source_job_id"],
+                    "label": row.get("label"),
+                    "params": json.loads(row["params_json"]),
+                })
+        await c.commit()
+    return claimed
+
+
+async def record_schedule_run(schedule_id: str, job_id: str) -> None:
+    async with _db() as c:
+        await c.exec(
+            "UPDATE schedules SET last_job_id = ? WHERE schedule_id = ?", (job_id, schedule_id)
+        )
+        await c.commit()
+
+
+async def close_pool() -> None:
+    """Release the Postgres pool on shutdown."""
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None

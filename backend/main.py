@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -11,20 +13,25 @@ from urllib.parse import urlencode
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Cookie, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from models import FetchRequest, CompareRequest, MultiCompareRequest, RenameJobRequest, TagsRequest
+from models import (
+    FetchRequest, CompareRequest, MultiCompareRequest, RenameJobRequest, TagsRequest,
+    CreateScheduleRequest, UpdateScheduleRequest,
+)
 from store import (
     create_job_async, get_job, result_to_csv_bytes,
     load_all_jobs_into_runtime, get_job_async, delete_job, load_jobs_list,
-    set_job_tags, clear_all_jobs, persist_job,
+    set_job_tags, clear_all_jobs, persist_job, purge_expired, load_repo_history,
     create_session, get_session, delete_session,
     add_oauth_state, consume_oauth_state, add_share_token, get_share_token,
+    create_schedule, list_schedules, get_schedule, set_schedule_enabled,
+    delete_schedule, claim_due_schedules, record_schedule_run, close_pool,
 )
 from worker import run_fetch_job
 
@@ -48,6 +55,7 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 SESSION_COOKIE = "rp_session"
 ANON_COOKIE = "rp_client"
+OAUTH_STATE_COOKIE = "rp_oauth_state"
 
 # Cookie flags. Secure is auto-enabled when the backend is served over HTTPS.
 # COOKIE_SAMESITE=none is required when the frontend and backend are on
@@ -73,11 +81,40 @@ _RATE_LIMIT = int(os.environ.get("FETCH_RATE_LIMIT", "20"))   # requests per win
 _RATE_WINDOW = 60                                             # seconds
 _rate_hits: dict[str, list[float]] = defaultdict(list)
 
-app = FastAPI(title="repo-people Explorer API", version="1.0.0")
+# Production hardening: interactive docs and the OpenAPI schema are only served
+# when explicitly enabled, so a public deployment does not advertise its whole
+# API surface. Health checks use /healthz instead.
+_EXPOSE_DOCS = os.environ.get("EXPOSE_DOCS", "").lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="repo-people Explorer API",
+    version="1.1.0",
+    docs_url="/docs" if _EXPOSE_DOCS else None,
+    redoc_url="/redoc" if _EXPOSE_DOCS else None,
+    openapi_url="/openapi.json" if _EXPOSE_DOCS else None,
+)
+
+_background: list[asyncio.Task] = []
+
 
 @app.on_event("startup")
 async def startup():
     await load_all_jobs_into_runtime()
+    _background.append(asyncio.create_task(_maintenance_loop()))
+    _background.append(asyncio.create_task(_schedule_loop()))
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    for task in _background:
+        task.cancel()
+    await close_pool()
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness/startup probe target. Deliberately reveals nothing."""
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +147,14 @@ async def _owner_key(response: Response, rp_session: str | None, rp_client: str 
 
 
 def _can_access(job: dict, key: str | None) -> bool:
-    """A job is accessible if it has no owner (legacy) or the caller owns it."""
+    """A job is accessible only to its owner.
+
+    Ownerless jobs used to be readable by everyone, which exposed every
+    pre-migration job to anonymous visitors. They are now private: run the
+    backfill in docs/ to assign owners, or delete them.
+    """
     owner = job.get("owner_key")
-    return owner is None or owner == key
+    return owner is not None and key is not None and owner == key
 
 
 async def _get_owned_job(job_id: str, rp_session: str | None, rp_client: str | None):
@@ -127,17 +169,83 @@ async def _get_owned_job(job_id: str, rp_session: str | None, rp_client: str | N
     return job
 
 
-def _rate_check(key: str) -> None:
+def _client_ip(request: Request) -> str:
+    """Best-effort caller IP. Trusts the left-most X-Forwarded-For entry, which
+    is correct behind Cloud Run / Vercel where the platform rewrites the header."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_check(*keys: str) -> None:
+    """Enforce the window against every supplied key.
+
+    Anonymous callers are identified by a cookie they control, so keying on that
+    alone let anyone reset their own budget by discarding the cookie. Callers
+    pass both the owner key and the client IP; exceeding either one trips.
+    """
     now = time.time()
-    hits = [t for t in _rate_hits[key] if t > now - _RATE_WINDOW]
-    if len(hits) >= _RATE_LIMIT:
-        raise HTTPException(429, f"Rate limit exceeded — max {_RATE_LIMIT} requests per minute.")
-    hits.append(now)
-    _rate_hits[key] = hits
+    for key in keys:
+        if not key:
+            continue
+        hits = [t for t in _rate_hits[key] if t > now - _RATE_WINDOW]
+        if len(hits) >= _RATE_LIMIT:
+            raise HTTPException(429, f"Rate limit exceeded — max {_RATE_LIMIT} requests per minute.")
+        hits.append(now)
+        _rate_hits[key] = hits
+
+
+def _prune_rate_hits() -> None:
+    """Drop windows with no recent hits. Without this the dict grows one entry
+    per visitor forever, since entries are only pruned when re-hit."""
+    cutoff = time.time() - _RATE_WINDOW
+    for key in [k for k, v in _rate_hits.items() if not v or v[-1] < cutoff]:
+        _rate_hits.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# CSRF protection
+# ---------------------------------------------------------------------------
+# Auth is cookie-based, and the split deployment (Vercel frontend + Cloud Run
+# backend) needs COOKIE_SAMESITE=none, so the browser attaches those cookies to
+# cross-site requests. CORS only stops an attacker *reading* the response — a
+# request with no custom headers is "simple", skips the preflight, and is
+# delivered regardless. Requiring a custom header on every mutating route forces
+# a preflight, which CORS then rejects for unlisted origins.
+#
+# Callers must send `X-Requested-With` (see req() in frontend/src/utils/api.ts).
+_CSRF_HEADER = "x-requested-with"
+_CSRF_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# GitHub redirects the browser here; it cannot send our header, and the flow has
+# its own CSRF defence in the state cookie.
+_CSRF_EXEMPT_PATHS = frozenset({"/auth/callback"})
+
+
+@app.middleware("http")
+async def require_csrf_header(request: Request, call_next):
+    if (
+        request.method in _CSRF_METHODS
+        and request.url.path not in _CSRF_EXEMPT_PATHS
+        and not request.headers.get(_CSRF_HEADER)
+    ):
+        return JSONResponse(
+            {"detail": "Missing X-Requested-With header."}, status_code=403
+        )
+    return await call_next(request)
+
 
 # S2: CORS origins configurable via env var (comma-separated list).
 _raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# allow_credentials + a wildcard origin would let any site drive an authenticated
+# request. Starlette silently drops the credential header in that combination;
+# fail loudly instead so it cannot be misconfigured unnoticed.
+if "*" in _allowed_origins:
+    raise RuntimeError(
+        "CORS_ORIGINS cannot be '*' — this API sends credentialed cookies. "
+        "List the exact frontend origins instead."
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -177,12 +285,15 @@ def _start_fetch(background_tasks: BackgroundTasks, job_id: str, req: FetchReque
         include_social_accounts=req.include_social_accounts,
         workers=req.workers,
         save_each_user=req.save_each_user,
+        # Hard server-side cap on profile lookups (0 = unlimited, local installs).
+        max_total=FETCH_LIMIT if FETCH_LIMIT > 0 else None,
     )
 
 
 @app.post("/fetch")
 async def fetch_users(
     req: FetchRequest,
+    request: Request,
     background_tasks: BackgroundTasks,
     response: Response,
     authorization: str | None = Header(default=None),
@@ -191,14 +302,12 @@ async def fetch_users(
 ):
     # S1: Extract token from Authorization: Bearer header instead of request body.
     token = await _resolve_token(authorization, rp_session)
-    # Scope this job to its creator and rate-limit per caller.
+    # Scope this job to its creator and rate-limit per caller *and* per IP, so a
+    # cookie reset does not buy a fresh budget.
     owner_key = await _owner_key(response, rp_session, rp_client)
-    _rate_check(owner_key)
-    # Cap the per-job fetch limit to keep hosting costs bounded.
-    # FETCH_LIMIT=0 disables the cap (local installs only).
-    if FETCH_LIMIT > 0:
-        if req.limit is None or req.limit > FETCH_LIMIT:
-            req.limit = FETCH_LIMIT
+    _rate_check(owner_key, f"ip:{_client_ip(request)}")
+    # The hosted cap is enforced in the worker via max_total (see _start_fetch);
+    # req.limit stays as the user set it and is applied per role.
     # B4: Await DB insert before starting worker to avoid race condition.
     # Store params (no secrets) so the job can be refreshed later.
     job_id = await create_job_async(owner_key=owner_key, params=req.model_dump())
@@ -213,6 +322,7 @@ async def fetch_users(
 @app.post("/jobs/{job_id}/refresh")
 async def refresh_job(
     job_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     response: Response,
     authorization: str | None = Header(default=None),
@@ -228,7 +338,7 @@ async def refresh_job(
     req = FetchRequest(**params)
     token = await _resolve_token(authorization, rp_session)
     owner_key = await _owner_key(response, rp_session, rp_client)
-    _rate_check(owner_key)
+    _rate_check(owner_key, f"ip:{_client_ip(request)}")
     new_id = await create_job_async(owner_key=owner_key, params=params)
     _start_fetch(background_tasks, new_id, req, token)
     return {"job_id": new_id, "refreshed_from": job_id}
@@ -354,7 +464,10 @@ async def rename_job(
     job = await _get_owned_job(job_id, rp_session, rp_client)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    job["label"] = body.label
+    # Awaited rather than assigned through the job proxy: a proxy write is
+    # fire-and-forget, so this used to return 200 before the write was attempted
+    # and swallowed any failure into a log line.
+    await persist_job(job_id, label=body.label)
     return {"job_id": job_id, "label": body.label}
 
 
@@ -362,9 +475,111 @@ async def rename_job(
 # GET /results/{job_id}
 # ---------------------------------------------------------------------------
 
+_BOT_LOGIN_RE = re.compile(r"^[a-z][-a-z]*\d{6,}$", re.IGNORECASE)
+
+
+def _bot_score(u: dict) -> int:
+    """Heuristic spam/bot score 0–100, mirroring the client-side version so that
+    server-filtered results match what the table would have shown."""
+    if u.get("is_bot"):
+        return 100
+    score = 0
+    if not u.get("followers"):
+        score += 25
+    if not u.get("public_repos"):
+        score += 20
+    age = u.get("account_age_days")
+    if age is not None and age < 180:
+        score += 20
+    if not u.get("name") and not u.get("bio") and not u.get("location"):
+        score += 15
+    login = u.get("login") or ""
+    if login and _BOT_LOGIN_RE.match(login):
+        score += 20
+    return min(score, 100)
+
+
+def _filter_sort_users(users: list[dict], f: "ResultFilters") -> list[dict]:
+    """Apply filters and sorting across the *whole* result set.
+
+    Previously the table filtered only the pages it had already loaded, so on any
+    job larger than one page the counts and filter results were silently wrong.
+    """
+    rows = users
+
+    if f.q:
+        q = f.q.lower()
+        fields = ("login", "name", "company", "location", "bio")
+        rows = [u for u in rows if any(q in str(u.get(k) or "").lower() for k in fields)]
+    if f.location:
+        q = f.location.lower()
+        rows = [u for u in rows if q in str(u.get("location") or "").lower()]
+    if f.company:
+        q = f.company.lower()
+        rows = [u for u in rows if q in str(u.get("company") or "").lower()]
+    if f.role:
+        rows = [u for u in rows if f.role in (u.get("roles") or [])]
+    if f.min_followers is not None:
+        rows = [u for u in rows if (u.get("followers") or 0) >= f.min_followers]
+    if f.max_followers is not None:
+        rows = [u for u in rows if (u.get("followers") or 0) <= f.max_followers]
+    if f.joined_after:
+        rows = [u for u in rows if not u.get("created_at") or str(u["created_at"])[:10] >= f.joined_after]
+    if f.joined_before:
+        rows = [u for u in rows if not u.get("created_at") or str(u["created_at"])[:10] <= f.joined_before]
+    if f.hide_bots:
+        rows = [u for u in rows if _bot_score(u) < 60]
+
+    if f.sort_by:
+        def _key(u: dict):
+            v = u.get(f.sort_by)
+            if v is None:
+                # Sort missing values last in both directions.
+                return (1, 0.0, "")
+            if isinstance(v, bool):
+                return (0, float(v), "")
+            if isinstance(v, (int, float)):
+                return (0, float(v), "")
+            return (0, 0.0, str(v).lower())
+        rows = sorted(rows, key=_key, reverse=(f.sort_dir == "desc"))
+
+    return rows
+
+
+class ResultFilters:
+    """Query-parameter bundle for the filtered results endpoints."""
+
+    def __init__(
+        self,
+        q: str | None = Query(None, max_length=200),
+        location: str | None = Query(None, max_length=200),
+        company: str | None = Query(None, max_length=200),
+        role: str | None = Query(None, max_length=50),
+        min_followers: int | None = Query(None, ge=0),
+        max_followers: int | None = Query(None, ge=0),
+        joined_after: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        joined_before: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        hide_bots: bool = Query(False),
+        sort_by: str | None = Query(None, max_length=50),
+        sort_dir: str = Query("asc", pattern="^(asc|desc)$"),
+    ):
+        self.q = q
+        self.location = location
+        self.company = company
+        self.role = role
+        self.min_followers = min_followers
+        self.max_followers = max_followers
+        self.joined_after = joined_after
+        self.joined_before = joined_before
+        self.hide_bots = hide_bots
+        self.sort_by = sort_by
+        self.sort_dir = sort_dir
+
+
 @app.get("/results/{job_id}")
 async def get_results(
     job_id: str,
+    filters: ResultFilters = Depends(),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=1000),
     rp_session: str | None = Cookie(default=None),
@@ -378,14 +593,16 @@ async def get_results(
         raise HTTPException(status_code=409, detail=f"Job status: {job['status']}")
 
     result: dict[str, Any] = job["result"] or {}
-    all_users = list(result.values())
+    all_users = [u for u in result.values() if isinstance(u, dict) and "login" in u]
+    unfiltered_total = len(all_users)
+    all_users = _filter_sort_users(all_users, filters)
     total = len(all_users)
     start = (page - 1) * page_size
-    end = start + page_size
-    page_users = {u["login"]: u for u in all_users[start:end] if isinstance(u, dict) and "login" in u}
+    page_users = {u["login"]: u for u in all_users[start:start + page_size]}
     return {
         "users": page_users,
         "total": total,
+        "unfiltered_total": unfiltered_total,
         "page": page,
         "page_size": page_size,
         "pages": max(1, (total + page_size - 1) // page_size),
@@ -465,7 +682,7 @@ async def get_summary(
         "role_distribution": dict(role_counter),
     }
     # Cache computed summary back to DB so subsequent calls are instant.
-    job["summary"] = summary
+    await persist_job(job_id, summary=summary)
     return summary
 
 
@@ -501,6 +718,209 @@ async def get_top(
 
     top = sorted(users, key=_key, reverse=True)[:n]
     return top
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{job_id}/history  — churn / retention across runs of the same repo
+# ---------------------------------------------------------------------------
+
+@app.get("/jobs/{job_id}/history")
+async def get_job_history(
+    job_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    """Diff every completed run of this job's repo, oldest first.
+
+    Each run reports who joined and who left relative to the previous run, plus
+    retention (share of the previous run's members still present). One run
+    returns a baseline with no deltas.
+    """
+    job = await _get_owned_job(job_id, rp_session, rp_client)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    repo_owner, repo_name = job.get("repo_owner"), job.get("repo_name")
+    if not repo_owner or not repo_name:
+        raise HTTPException(
+            status_code=409,
+            detail="This job has no repository recorded (imported jobs cannot be tracked over time).",
+        )
+
+    key = await _reader_key(rp_session, rp_client)
+    runs = await load_repo_history(key, repo_owner, repo_name)
+    if not runs:
+        return {"repo": f"{repo_owner}/{repo_name}", "runs": [], "total_runs": 0}
+
+    points = []
+    prev: set[str] | None = None
+    for run in runs:
+        logins = run["logins"]
+        if prev is None:
+            joined, left, retention = [], [], None
+        else:
+            joined = sorted(logins - prev)
+            left = sorted(prev - logins)
+            retention = round(len(logins & prev) / max(len(prev), 1) * 100, 1)
+        points.append({
+            "job_id": run["job_id"],
+            "label": run["label"],
+            "created_at": run["created_at"],
+            "total": len(logins),
+            "joined": joined,
+            "left": left,
+            "joined_count": len(joined),
+            "left_count": len(left),
+            "retention_pct": retention,
+        })
+        prev = logins
+
+    first, last = runs[0]["logins"], runs[-1]["logins"]
+    return {
+        "repo": f"{repo_owner}/{repo_name}",
+        "runs": points,
+        "total_runs": len(points),
+        "net_change": len(last) - len(first),
+        # Members present in every single run — the stable core of the community.
+        "core_members": len(set.intersection(*[r["logins"] for r in runs])) if runs else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scheduled re-fetch
+# ---------------------------------------------------------------------------
+
+@app.get("/schedules")
+async def get_schedules(
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    key = await _reader_key(rp_session, rp_client)
+    if not key:
+        return []
+    return await list_schedules(key)
+
+
+@app.post("/schedules")
+async def add_schedule(
+    body: CreateScheduleRequest,
+    response: Response,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    job = await _get_owned_job(body.job_id, rp_session, rp_client)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    params = job.get("params")
+    if not params:
+        raise HTTPException(
+            status_code=409,
+            detail="This job has no saved parameters and cannot be scheduled.",
+        )
+    owner_key = await _owner_key(response, rp_session, rp_client)
+    existing = await list_schedules(owner_key)
+    # Each schedule is a recurring cost; cap how many one caller can create.
+    if len(existing) >= 10:
+        raise HTTPException(status_code=409, detail="Maximum of 10 schedules per account.")
+    return await create_schedule(
+        owner_key=owner_key,
+        source_job_id=body.job_id,
+        params=params,
+        label=job.get("label"),
+        interval_hours=body.interval_hours,
+    )
+
+
+@app.patch("/schedules/{schedule_id}")
+async def update_schedule(
+    schedule_id: str,
+    body: UpdateScheduleRequest,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    key = await _reader_key(rp_session, rp_client)
+    if not key or not await set_schedule_enabled(schedule_id, key, body.enabled):
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return await get_schedule(schedule_id, key)
+
+
+@app.delete("/schedules/{schedule_id}")
+async def remove_schedule(
+    schedule_id: str,
+    rp_session: str | None = Cookie(default=None),
+    rp_client: str | None = Cookie(default=None),
+):
+    key = await _reader_key(rp_session, rp_client)
+    if not key or not await delete_schedule(schedule_id, key):
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Background loops
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_TICK_SECONDS = int(os.environ.get("SCHEDULE_TICK_SECONDS", "300"))
+_MAINTENANCE_TICK_SECONDS = 3600
+
+
+async def _maintenance_loop() -> None:
+    """Periodically drop expired sessions/states/tokens and prune rate windows."""
+    while True:
+        try:
+            await asyncio.sleep(_MAINTENANCE_TICK_SECONDS)
+            _prune_rate_hits()
+            purged = await purge_expired()
+            if any(purged.values()):
+                logging.getLogger(__name__).info("Purged expired records: %s", purged)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("Maintenance loop iteration failed")
+
+
+async def _schedule_loop() -> None:
+    """Run due schedules.
+
+    ponytail: an in-process loop, not a real job queue. It only runs while an
+    instance is alive, so keep minScale >= 1 (or move to Cloud Scheduler hitting
+    an authenticated endpoint) if schedules must fire on an idle service.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_SCHEDULE_TICK_SECONDS)
+            for sched in await claim_due_schedules():
+                try:
+                    req = FetchRequest(**sched["params"])
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "Schedule %s has unusable params; skipping", sched["schedule_id"]
+                    )
+                    continue
+                # Scheduled runs are unauthenticated against GitHub: the OAuth
+                # token belongs to a session that may be long gone, and storing
+                # one per schedule would mean holding a credential indefinitely.
+                job_id = await create_job_async(owner_key=sched["owner_key"], params=sched["params"])
+                await record_schedule_run(sched["schedule_id"], job_id)
+                task = asyncio.create_task(run_fetch_job(
+                    job_id=job_id,
+                    owner=req.owner,
+                    repo=req.repo,
+                    token="",
+                    roles=req.roles,
+                    limit=req.limit,
+                    exclude_bots=req.exclude_bots,
+                    include_social_accounts=req.include_social_accounts,
+                    workers=req.workers,
+                    save_each_user=req.save_each_user,
+                    max_total=FETCH_LIMIT if FETCH_LIMIT > 0 else None,
+                ))
+                _background.append(task)
+                task.add_done_callback(lambda t: _background.remove(t) if t in _background else None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("Schedule loop iteration failed")
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +1187,7 @@ async def import_results(
     completed job so it can be visualised in the Results view.
     """
     owner_key = await _owner_key(response, rp_session, rp_client)
-    _rate_check(owner_key)
+    _rate_check(owner_key, f"ip:{_client_ip(request)}")
 
     raw = await _read_capped_body(request, MAX_IMPORT_BYTES)
     try:
@@ -822,16 +1242,29 @@ async def auth_login(request: Request):
     if not GITHUB_CLIENT_ID:
         raise HTTPException(503, "GitHub OAuth is not configured on this server.")
     state = secrets.token_urlsafe(32)
-    # Persist state (10-min TTL) for CSRF validation on callback.
+    # Persist state (10-min TTL) for CSRF validation on callback, and mirror it
+    # into a cookie so the callback can prove it is the *same browser* that
+    # started the flow. Without the cookie the state was only proof that some
+    # flow had started somewhere, which let an attacker hand a victim their own
+    # callback URL and silently sign the victim into the attacker's account.
     await add_oauth_state(state, ttl_seconds=600)
     backend_base_url = _backend_base_url(request)
     params = urlencode({
         "client_id": GITHUB_CLIENT_ID,
         "redirect_uri": f"{backend_base_url}/auth/callback",
-        "scope": "read:user user:email repo",
+        # Least privilege. The previous `repo` scope granted read *and write*
+        # access to every private repository the user could reach; this app only
+        # reads public profile and public-repo metadata. `public_repo` matches
+        # what the UI tells users to put on their own PATs.
+        "scope": "read:user user:email public_repo",
         "state": state,
     })
-    return RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
+    response = RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
+    response.set_cookie(
+        OAUTH_STATE_COOKIE, state, httponly=True, samesite=_cookie_samesite,
+        secure=_cookie_secure, max_age=600, path="/",
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +1272,16 @@ async def auth_login(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/auth/callback")
-async def auth_callback(code: str, state: str):
+async def auth_callback(
+    code: str,
+    state: str,
+    rp_oauth_state: str | None = Cookie(default=None),
+):
+    # The state must match the cookie set when *this browser* started the flow.
+    # Checked before the DB lookup so a replayed callback cannot consume (and
+    # thereby burn) a state belonging to someone else's in-flight login.
+    if not rp_oauth_state or not secrets.compare_digest(rp_oauth_state, state):
+        raise HTTPException(400, "Invalid or expired OAuth state.")
     # Validate state to prevent CSRF (single-use, DB-backed).
     if not await consume_oauth_state(state):
         raise HTTPException(400, "Invalid or expired OAuth state.")
@@ -899,6 +1341,8 @@ async def auth_callback(code: str, state: str):
         max_age=30 * 24 * 3600,
         path="/",
     )
+    # The state cookie is single-use — it has done its job.
+    response.delete_cookie(OAUTH_STATE_COOKIE, path="/")
     return response
 
 

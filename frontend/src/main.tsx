@@ -9,7 +9,7 @@ import './index.css'
 if (window.location.pathname === '/clear_cache') {
   // Dev-only reset. The backend endpoint is a guarded POST (enabled via
   // ALLOW_DEV_CLEAR); it 403s in production, which we ignore here.
-  fetch('/clear_cache', { method: 'POST' })
+  fetch('/clear_cache', { method: 'POST', headers: { 'X-Requested-With': 'repo-people' } })
     .catch(() => {/* backend may already be empty or disabled — continue regardless */})
     .finally(() => {
       sessionStorage.clear()

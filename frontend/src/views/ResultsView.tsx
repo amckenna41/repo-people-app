@@ -1,15 +1,23 @@
-import { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
-import { fetchResults, fetchResultsPage, fetchSummary, fetchTop, renameJob, createShareToken, refreshJob } from '../utils/api'
+import { useState, useEffect, useMemo, useRef, useCallback, lazy, Suspense } from 'react'
+import {
+  fetchResultsPage, fetchAllResultPages, MAX_CLIENT_ROWS,
+  fetchSummary, fetchTop, renameJob, createShareToken, refreshJob,
+  fetchJobHistory, fetchSchedules, createSchedule, setScheduleEnabled, deleteSchedule,
+  type ResultFilters, type JobHistory, type Schedule,
+} from '../utils/api'
 import type { JobInfo, UserRecord, SummaryData } from '../types'
 import { ROLE_COLORS } from '../types'
 import UserTable from '../components/UserTable'
+import type { SortingState } from '@tanstack/react-table'
+import { type FilterState, EMPTY_FILTERS } from '../utils/segments'
+import { toCsv, xlsxCell, downloadText } from '../utils/csv'
 const UserDrawer = lazy(() => import('../components/UserDrawer'))
 const WorldMap = lazy(() => import('../components/WorldMap'))
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend, AreaChart, Area,
+  PieChart, Pie, Cell, Legend, AreaChart, Area, LineChart, Line,
 } from 'recharts'
-import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock, Layers, TrendingUp, Link, RefreshCw } from 'lucide-react'
+import { Download, Loader2, Users, Bot, MapPin, Building2, Star, Activity, Globe, Code2, GitBranch, Mail, Shield, FileText, Share2, FileDown, ChevronDown, Info, Pencil, Check, X as XIcon, Trash2, Clock, Layers, TrendingUp, Link, RefreshCw, CalendarClock, UserPlus, UserMinus, Play, Pause } from 'lucide-react'
 
 interface Props {
   jobs: JobInfo[]
@@ -22,6 +30,16 @@ interface Props {
   onJobTagsUpdate?: (job_id: string, tags: string[]) => void
   onJobRefresh?: (newJobId: string, label: string) => void
 }
+
+// The table renders the first page immediately, then the rest streams in behind
+// it. Everything derived from `users` — every chart, the quick-stat badges and
+// all client-side exports — used to describe only the pages the user had
+// happened to scroll through, silently under-reporting on any job over one page.
+const FIRST_PAGE_SIZE = 200
+// ponytail: a flat cap (MAX_CLIENT_ROWS, from api.ts), not windowed aggregation.
+// Move the aggregates server-side if anyone actually explores six-figure result
+// sets in this UI.
+const PAGE_SIZE = 1000
 
 function relativeTime(iso?: string): string {
   if (!iso) return ''
@@ -56,9 +74,20 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const [selectedUser, setSelectedUser] = useState<UserRecord | null>(null)
   const [loading, setLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
-  const [currentPage, setCurrentPage] = useState(1)
-  const [totalPages, setTotalPages] = useState(1)
   const [totalUsers, setTotalUsers] = useState(0)
+  const [unfilteredTotal, setUnfilteredTotal] = useState(0)
+  // Bumped on every new query; a background page loop that finds its token
+  // stale drops its results instead of mixing them into a newer query.
+  const loadTokenRef = useRef(0)
+  // Filtering, search and sorting live here (not in UserTable) because they are
+  // applied server-side across the whole result set.
+  const [filters, setFilters] = useState<FilterState>({ ...EMPTY_FILTERS })
+  const [search, setSearch] = useState('')
+  const [sorting, setSorting] = useState<SortingState>([])
+  const [history, setHistory] = useState<JobHistory | null>(null)
+  const [schedules, setSchedules] = useState<Schedule[]>([])
+  const [scheduleInterval, setScheduleInterval] = useState(168)
+  const [schedulingBusy, setSchedulingBusy] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [shareLoading, setShareLoading] = useState(false)
   const [shareCopied, setShareCopied] = useState(false)
@@ -133,66 +162,141 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     ? doneJobs
     : doneJobs.filter(j => tagFilter.some(t => (j.tags ?? []).includes(t)))
 
+  /** Map the UI filter state onto the server's query parameters. */
+  const serverFilters = useMemo<ResultFilters>(() => ({
+    q: search || undefined,
+    location: filters.location || undefined,
+    company: filters.company || undefined,
+    min_followers: filters.minFollowers || undefined,
+    max_followers: filters.maxFollowers || undefined,
+    joined_after: filters.joinedAfter || undefined,
+    joined_before: filters.joinedBefore || undefined,
+    hide_bots: filters.hideBots || undefined,
+    sort_by: sorting[0]?.id,
+    sort_dir: sorting[0] ? (sorting[0].desc ? 'desc' : 'asc') : undefined,
+  }), [search, filters, sorting])
+
+  const activeJobIsDone = jobs.find(j => j.job_id === activeJobId)?.status === 'done'
+
+  // The result set is bigger than we are willing to hold in the browser.
+  const truncated = totalUsers > MAX_CLIENT_ROWS
+  // Every row we are ever going to have for this query is in `users`. Derived
+  // from the row count rather than tracked in state, so a page load that fails
+  // part-way is correctly reported as incomplete instead of claiming success.
+  const coverageComplete =
+    totalUsers === 0 || users.length >= Math.min(totalUsers, MAX_CLIENT_ROWS)
+
+  // Reload page 1 whenever the job or the server-side query changes. Debounced
+  // so typing in the search box does not fire a request per keystroke.
   useEffect(() => {
-    if (!activeJobId) return
-    const job = jobs.find(j => j.job_id === activeJobId)
-    if (job?.status !== 'done') return
-    loadJob(activeJobId)
-  }, [activeJobId, jobs])
+    if (!activeJobId || !activeJobIsDone) return
+    const handle = setTimeout(() => { loadJob(activeJobId, serverFilters) }, 250)
+    return () => clearTimeout(handle)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeJobId, activeJobIsDone, serverFilters])
+
+  // Reset the query when switching jobs — filters from the previous repo rarely
+  // make sense for the next one.
+  useEffect(() => {
+    setFilters({ ...EMPTY_FILTERS })
+    setSearch('')
+    setSorting([])
+  }, [activeJobId])
 
   useEffect(() => {
-    if (!activeJobId) return
-    const job = jobs.find(j => j.job_id === activeJobId)
-    if (job?.status !== 'done') return
+    if (!activeJobId || !activeJobIsDone) return
     loadTop(activeJobId, topBy)
-  }, [topBy, activeJobId, jobs])
+  }, [topBy, activeJobId, activeJobIsDone])
 
-  async function loadJob(jobId: string) {
+  // Churn history + schedules for the active job.
+  useEffect(() => {
+    if (!activeJobId || !activeJobIsDone) { setHistory(null); return }
+    fetchJobHistory(activeJobId).then(setHistory).catch(() => setHistory(null))
+  }, [activeJobId, activeJobIsDone])
+
+  useEffect(() => {
+    fetchSchedules().then(setSchedules).catch(() => {})
+  }, [activeJobId])
+
+  async function loadJob(jobId: string, query: ResultFilters) {
+    const token = ++loadTokenRef.current
     setLoading(true)
     setError(null)
-    setTopUsers([])
-    setCurrentPage(1)
-    setTotalPages(1)
-    setTotalUsers(0)
     try {
       // Load first page immediately for fast render; summary fetched in parallel.
       const [pageData, sum] = await Promise.all([
-        fetchResultsPage(jobId, 1, 200),
+        fetchResultsPage(jobId, 1, FIRST_PAGE_SIZE, query),
         fetchSummary(jobId),
       ])
+      if (loadTokenRef.current !== token) return
       const loadedUsers = Object.values(pageData.users) as UserRecord[]
       setUsers(loadedUsers)
-      setCurrentPage(1)
-      setTotalPages(pageData.pages)
       setTotalUsers(pageData.total)
+      setUnfilteredTotal(pageData.unfiltered_total ?? pageData.total)
       setSummary(sum)
       onUsersLoaded?.(jobId, loadedUsers)
-      await loadTop(jobId, topBy)
+      if (loadedUsers.length < pageData.total) {
+        void loadRemaining(jobId, query, token, loadedUsers, pageData.total)
+      }
     } catch (e: unknown) {
+      if (loadTokenRef.current !== token) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (loadTokenRef.current === token) setLoading(false)
     }
   }
 
-  async function loadMoreUsers() {
-    if (!activeJobId || loadingMore || currentPage >= totalPages) return
+  /** Pull the remaining pages of the current query in the background, so every
+   *  aggregate below reflects the whole result set rather than page one. */
+  async function loadRemaining(
+    jobId: string,
+    query: ResultFilters,
+    token: number,
+    firstPage: UserRecord[],
+    total: number,
+  ) {
     setLoadingMore(true)
     try {
-      const nextPage = currentPage + 1
-      const pageData = await fetchResultsPage(activeJobId, nextPage, 200)
-      const newUsers = Object.values(pageData.users) as UserRecord[]
-      setUsers(prev => {
-        const combined = [...prev, ...newUsers]
-        onUsersLoaded?.(activeJobId!, combined)
-        return combined
+      const all = await fetchAllResultPages(jobId, query, {
+        firstPage,
+        total,
+        pageSize: PAGE_SIZE,
+        shouldContinue: () => loadTokenRef.current === token,
+        onPage: rows => setUsers([...(rows as UserRecord[])]),
       })
-      setCurrentPage(nextPage)
+      if (loadTokenRef.current !== token) return
+      onUsersLoaded?.(jobId, all as UserRecord[])
     } catch (_) {
-      // non-fatal
+      // Non-fatal: the table keeps what it has. `coverageComplete` is derived
+      // from the row count, so a partial load stays labelled as partial and the
+      // client-side exports stay disabled without needing a flag set here.
     } finally {
-      setLoadingMore(false)
+      if (loadTokenRef.current === token) setLoadingMore(false)
     }
+  }
+
+  async function handleCreateSchedule() {
+    if (!activeJobId) return
+    setSchedulingBusy(true)
+    try {
+      const created = await createSchedule(activeJobId, scheduleInterval)
+      setSchedules(prev => [...prev, created])
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Could not create schedule.')
+    } finally {
+      setSchedulingBusy(false)
+    }
+  }
+
+  async function handleToggleSchedule(schedule: Schedule) {
+    setSchedules(prev => prev.map(s =>
+      s.schedule_id === schedule.schedule_id ? { ...s, enabled: !s.enabled } : s))
+    await setScheduleEnabled(schedule.schedule_id, !schedule.enabled).catch(() => {})
+  }
+
+  async function handleDeleteSchedule(scheduleId: string) {
+    setSchedules(prev => prev.filter(s => s.schedule_id !== scheduleId))
+    await deleteSchedule(scheduleId).catch(() => {})
   }
 
   async function loadTop(jobId: string, by: string) {
@@ -257,22 +361,13 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   function downloadRoleCsv(role: string) {
     const roleUsers = users.filter(u => u.roles?.includes(role))
     if (!roleUsers.length) return
-    const keys = Array.from(new Set(roleUsers.flatMap(u => Object.keys(u)))) as (keyof UserRecord)[]
-    const escape = (v: unknown) => {
-      const s = v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)
-      return `"${s.replace(/"/g, '""')}"`
-    }
-    const header = keys.map(k => escape(k)).join(',')
-    const rows = roleUsers.map(u => keys.map(k => escape(u[k])).join(','))
-    const csv = [header, ...rows].join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
+    const keys = Array.from(new Set(roleUsers.flatMap(u => Object.keys(u))))
     const label = doneJobs.find(j => j.job_id === activeJobId)?.label ?? activeJobId ?? 'repo'
-    a.href = url
-    a.download = `${label.replace(/\//g, '_')}_${role}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+    downloadText(
+      `${label.replace(/\//g, '_')}_${role}.csv`,
+      toCsv(keys, roleUsers as unknown as Record<string, unknown>[]),
+      'text/csv',
+    )
   }
 
   // All unique field keys present in the current user set (login is always exported as the key / first column)
@@ -299,17 +394,10 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       import('xlsx').then((XLSX) => {
       // Excel: login is first column; arrays expanded into comma-separated strings; objects JSON-stringified
       const allCols = ['login', ...fields]
-      const serialize = (v: unknown): string | number | boolean | null => {
-        if (v === null || v === undefined) return null
-        if (typeof v === 'boolean' || typeof v === 'number') return v
-        if (Array.isArray(v)) return v.map(item => (typeof item === 'object' ? JSON.stringify(item) : String(item))).join(', ')
-        if (typeof v === 'object') return JSON.stringify(v)
-        return String(v)
-      }
       const wsData = [
         allCols, // header row
         ...users.map(u =>
-          allCols.map(f => serialize((u as unknown as Record<string, unknown>)[f]))
+          allCols.map(f => xlsxCell((u as unknown as Record<string, unknown>)[f]))
         ),
       ]
       const ws = XLSX.utils.aoa_to_sheet(wsData)
@@ -334,31 +422,14 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
         for (const f of fields) obj[f] = (u as unknown as Record<string, unknown>)[f] ?? null
         data[u.login] = obj
       }
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${safeLabel}_users.json`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadText(`${safeLabel}_users.json`, JSON.stringify(data, null, 2), 'application/json')
     } else {
       // CSV: login is always first column
-      const escape = (v: unknown) => {
-        const s = v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)
-        return `"${s.replace(/"/g, '""')}"`
-      }
-      const allCols = ['login', ...fields]
-      const header = allCols.map(f => escape(f)).join(',')
-      const rows = users.map(u =>
-        allCols.map(f => escape((u as unknown as Record<string, unknown>)[f])).join(',')
+      downloadText(
+        `${safeLabel}_users.csv`,
+        toCsv(['login', ...fields], users as unknown as Record<string, unknown>[]),
+        'text/csv',
       )
-      const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${safeLabel}_users.csv`
-      a.click()
-      URL.revokeObjectURL(url)
     }
 
     setExportPickerFormat(null)
@@ -421,13 +492,25 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       summary.top_companies.slice(0, 10).forEach(c => lines.push(`| ${c.company} | ${c.count} |`))
       lines.push('')
     }
-    const blob = new Blob([lines.join('\n')], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `repo-people_${label.replace(/\//g, '_')}_report.md`
-    a.click()
-    URL.revokeObjectURL(url)
+    if (history && history.total_runs > 1) {
+      lines.push('## Membership Over Time')
+      lines.push('')
+      lines.push('| Run | Date | Members | Joined | Left | Retention |')
+      lines.push('|-----|------|---------|--------|------|-----------|')
+      history.runs.forEach((r, i) => {
+        lines.push(
+          `| ${i + 1} | ${(r.created_at ?? '').slice(0, 10)} | ${r.total} | ` +
+          `+${r.joined_count} | -${r.left_count} | ` +
+          `${r.retention_pct === null ? '–' : `${r.retention_pct}%`} |`
+        )
+      })
+      lines.push('')
+    }
+    downloadText(
+      `repo-people_${label.replace(/\//g, '_')}_report.md`,
+      lines.join('\n'),
+      'text/markdown',
+    )
   }
 
   const roleDistData = summary
@@ -848,24 +931,20 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
         {/* Export buttons */}
         {activeJobId && (
           <div className="flex gap-2 ml-auto flex-wrap items-center">
-            <button
-              onClick={() => openExportPicker('json')}
-              className="btn-secondary flex items-center gap-1.5 text-sm"
-            >
-              <Download size={14} /> JSON
-            </button>
-            <button
-              onClick={() => openExportPicker('csv')}
-              className="btn-secondary flex items-center gap-1.5 text-sm"
-            >
-              <Download size={14} /> CSV
-            </button>
-            <button
-              onClick={() => openExportPicker('xlsx')}
-              className="btn-secondary flex items-center gap-1.5 text-sm"
-            >
-              <Download size={14} /> Excel
-            </button>
+            {/* Client-side exports serialise whatever is in `users`, so they
+                stay disabled until the full result set has streamed in —
+                otherwise the file silently contains only the loaded pages. */}
+            {(['json', 'csv', 'xlsx'] as const).map(format => (
+              <button
+                key={format}
+                onClick={() => openExportPicker(format)}
+                disabled={!coverageComplete}
+                title={!coverageComplete ? 'Waiting for the full result set to load…' : undefined}
+                className="btn-secondary flex items-center gap-1.5 text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Download size={14} /> {format === 'xlsx' ? 'Excel' : format.toUpperCase()}
+              </button>
+            ))}
             {/* Per-role CSV dropdown */}
             {users.length > 0 && (
               <div ref={roleExportRef} className="relative">
@@ -976,7 +1055,10 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             <div className="flex flex-wrap gap-2 items-center">
               <span className="text-xs text-gray-500 flex items-center gap-1 mr-1"><Shield size={11} /> Quick stats</span>
               {([
-                { label: 'total users', value: String(users.length), bg: '#7c3aed' },
+                // The server's count for the current filters — `users.length` is
+                // whatever has streamed in so far, which contradicted the
+                // summary card above it while pages were still loading.
+                { label: 'total users', value: totalUsers.toLocaleString(), bg: '#7c3aed' },
                 { label: 'active', value: `${healthScore.activeCount} (${healthScore.activeRatio}%)`, bg: '#059669' },
                 { label: 'health score', value: `${healthScore.score}/100`, bg: healthScore.score >= 70 ? '#059669' : healthScore.score >= 40 ? '#d97706' : '#dc2626' },
                 { label: 'avg account age', value: `${healthScore.avgAge}yr`, bg: '#0284c7' },
@@ -988,6 +1070,28 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                   <div className="px-2 py-1 text-white font-bold" style={{ background: b.bg }}>{b.value}</div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Everything below aggregates `users`, so say plainly when that is
+              not yet (or cannot be) the whole result set. */}
+          {(!coverageComplete || truncated) && (
+            <div
+              className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs"
+              style={{
+                background: truncated ? 'rgba(217,119,6,0.1)' : 'rgba(124,58,237,0.08)',
+                border: `1px solid ${truncated ? 'rgba(217,119,6,0.25)' : 'rgba(124,58,237,0.2)'}`,
+                color: truncated ? '#fcd34d' : '#c4b5fd',
+              }}
+            >
+              {!coverageComplete
+                ? <><Loader2 size={12} className="animate-spin shrink-0" />
+                    Loading the full result set — charts below cover{' '}
+                    {users.length.toLocaleString()} of {totalUsers.toLocaleString()} users so far.</>
+                : <><Info size={12} className="shrink-0" />
+                    This result set is larger than {MAX_CLIENT_ROWS.toLocaleString()} users. Charts and
+                    exports cover the first {users.length.toLocaleString()} of{' '}
+                    {totalUsers.toLocaleString()} matching users.</>}
             </div>
           )}
 
@@ -1339,6 +1443,152 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </div>
           )}
 
+          {/* Membership over time — joiners, leavers and retention across runs */}
+          {history && history.total_runs > 1 && (
+            <div className="card">
+              <h3 className="text-sm font-semibold gradient-heading mb-3 flex items-center gap-1.5">
+                <TrendingUp size={14} /> Membership Over Time
+                <ChartInfo text="Compares every completed fetch of this repository: who joined, who left, and what share of the previous run's members are still present." />
+              </h3>
+              <div className="flex flex-wrap gap-2 items-center mb-3">
+                {([
+                  { label: 'runs', value: String(history.total_runs), bg: '#7c3aed' },
+                  { label: 'net change', value: `${(history.net_change ?? 0) >= 0 ? '+' : ''}${history.net_change ?? 0}`, bg: (history.net_change ?? 0) >= 0 ? '#059669' : '#dc2626' },
+                  { label: 'core members', value: String(history.core_members ?? 0), bg: '#0284c7' },
+                ] as { label: string; value: string; bg: string }[]).map(b => (
+                  <div key={b.label} className="flex items-stretch rounded-sm overflow-hidden text-xs font-mono select-none">
+                    <div className="px-2 py-1 bg-gray-700 text-gray-300">{b.label}</div>
+                    <div className="px-2 py-1 text-white font-bold" style={{ background: b.bg }}>{b.value}</div>
+                  </div>
+                ))}
+              </div>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart
+                  data={history.runs.map((r, i) => ({
+                    run: `#${i + 1}`,
+                    total: r.total,
+                    joined: r.joined_count,
+                    left: -r.left_count,
+                    retention: r.retention_pct,
+                  }))}
+                  margin={{ left: 0, right: 16, top: 4, bottom: 2 }}
+                >
+                  <XAxis dataKey="run" tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                  <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                  <Tooltip contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
+                  <Line type="monotone" dataKey="total" name="Members" stroke="#a78bfa" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="joined" name="Joined" stroke="#10b981" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="left" name="Left" stroke="#ef4444" strokeWidth={2} dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+              {/* Most recent delta, named */}
+              {(() => {
+                const latest = history.runs[history.runs.length - 1]
+                if (!latest || (!latest.joined.length && !latest.left.length)) return null
+                return (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                    {([
+                      { icon: <UserPlus size={11} />, title: 'Joined since last run', logins: latest.joined, color: '#10b981' },
+                      { icon: <UserMinus size={11} />, title: 'Left since last run', logins: latest.left, color: '#ef4444' },
+                    ] as { icon: React.ReactNode; title: string; logins: string[]; color: string }[]).map(group => (
+                      <div key={group.title}>
+                        <div className="text-xs mb-1.5 flex items-center gap-1" style={{ color: group.color }}>
+                          {group.icon} {group.title} ({group.logins.length})
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {group.logins.slice(0, 24).map(login => (
+                            <span
+                              key={login}
+                              className="badge text-xs font-mono"
+                              style={{ background: `${group.color}18`, color: group.color, border: `1px solid ${group.color}44` }}
+                            >
+                              {login}
+                            </span>
+                          ))}
+                          {group.logins.length > 24 && (
+                            <span className="text-xs text-gray-600 self-center">+{group.logins.length - 24} more</span>
+                          )}
+                          {group.logins.length === 0 && <span className="text-xs text-gray-600">none</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
+            </div>
+          )}
+
+          {/* Scheduled re-fetch */}
+          <div className="card">
+            <h3 className="text-sm font-semibold gradient-heading mb-3 flex items-center gap-1.5">
+              <CalendarClock size={14} /> Scheduled Re-fetch
+              <ChartInfo text="Re-runs this fetch automatically on a fixed interval. Each run becomes a new job, so Membership Over Time builds up a history without you doing anything." />
+            </h3>
+            {history === null && (
+              <p className="text-xs text-gray-500 mb-3">
+                Imported jobs have no saved fetch parameters, so they cannot be scheduled.
+              </p>
+            )}
+            {history !== null && (
+              <div className="flex items-center gap-2 flex-wrap mb-3">
+                <label className="text-xs text-gray-400">Run every</label>
+                <select
+                  className="input text-sm py-1 px-2 w-36"
+                  value={scheduleInterval}
+                  onChange={e => setScheduleInterval(Number(e.target.value))}
+                >
+                  <option value={24}>day</option>
+                  <option value={168}>week</option>
+                  <option value={336}>2 weeks</option>
+                  <option value={720}>30 days</option>
+                </select>
+                <button
+                  onClick={handleCreateSchedule}
+                  disabled={schedulingBusy}
+                  className="btn-secondary flex items-center gap-1.5 text-sm disabled:opacity-40"
+                >
+                  {schedulingBusy ? <Loader2 size={13} className="animate-spin" /> : <CalendarClock size={13} />}
+                  Schedule
+                </button>
+              </div>
+            )}
+            {schedules.length === 0 ? (
+              <p className="text-xs text-gray-600">No schedules yet.</p>
+            ) : (
+              <div className="space-y-1.5">
+                {schedules.map(s => (
+                  <div
+                    key={s.schedule_id}
+                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm"
+                    style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}
+                  >
+                    <span className="font-mono text-xs text-gray-200 truncate flex-1">
+                      {s.label ?? s.source_job_id}
+                    </span>
+                    <span className="text-xs text-gray-500 shrink-0">
+                      every {s.interval_hours}h · next {(s.next_run_at ?? '').slice(0, 16).replace('T', ' ')}
+                    </span>
+                    <button
+                      onClick={() => handleToggleSchedule(s)}
+                      title={s.enabled ? 'Pause' : 'Resume'}
+                      className="p-1 rounded-sm text-gray-500 hover:text-white transition-colors"
+                    >
+                      {s.enabled ? <Pause size={13} /> : <Play size={13} />}
+                    </button>
+                    <button
+                      onClick={() => handleDeleteSchedule(s.schedule_id)}
+                      title="Delete schedule"
+                      className="p-1 rounded-sm text-gray-600 hover:text-red-400 transition-colors"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Top N leaderboard */}
           <div className="card">
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -1399,31 +1649,22 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </Suspense>
           )}
 
-          {/* Data table */}
+          {/* Data table — filters, search and sort are applied server-side */}
           <div className="card">
-            <h3 className="text-sm font-semibold gradient-heading mb-3">
-              All Users
-              {totalUsers > users.length && (
-                <span className="ml-2 text-xs font-normal text-gray-500">
-                  (showing {users.length.toLocaleString()} of {totalUsers.toLocaleString()})
-                </span>
-              )}
-            </h3>
-            <UserTable users={users} onRowClick={setSelectedUser} />
-            {currentPage < totalPages && (
-              <div className="mt-3 text-center">
-                <button
-                  onClick={loadMoreUsers}
-                  disabled={loadingMore}
-                  className="btn-secondary flex items-center gap-2 mx-auto text-sm"
-                >
-                  {loadingMore
-                    ? <><Loader2 size={14} className="animate-spin" /> Loading…</>
-                    : <><ChevronDown size={14} /> Load more ({(totalUsers - users.length).toLocaleString()} remaining)</>
-                  }
-                </button>
-              </div>
-            )}
+            <h3 className="text-sm font-semibold gradient-heading mb-3">All Users</h3>
+            <UserTable
+              users={users}
+              onRowClick={setSelectedUser}
+              filters={filters}
+              onFiltersChange={setFilters}
+              search={search}
+              onSearchChange={setSearch}
+              sorting={sorting}
+              onSortingChange={setSorting}
+              totalUsers={totalUsers}
+              unfilteredTotal={unfilteredTotal}
+              loadingMore={loadingMore}
+            />
           </div>
         </div>
       )}

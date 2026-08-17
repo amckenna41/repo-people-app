@@ -2,11 +2,53 @@
 // In production builds, VITE_API_BASE_URL points at the Cloud Run service URL.
 const BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
+export const API_BASE = BASE
+
+// Sent on every mutating request. The backend rejects state-changing calls
+// without it (see require_csrf_header in backend/main.py): a request carrying a
+// custom header cannot be made cross-site without a preflight, and the preflight
+// fails CORS for any origin that isn't allow-listed. Cookies are SameSite=None
+// in the split deployment, so this is what stops a third-party page acting as
+// the user.
+export const CSRF_HEADER = { 'X-Requested-With': 'repo-people' } as const
+
 // All API calls must send cookies so the backend can scope jobs to this
 // browser/session (the rp_client / rp_session cookies). Cross-origin cookies
 // additionally require the backend to set SameSite=None; Secure.
 function req(url: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(url, { credentials: 'include', ...init })
+  const method = (init.method ?? 'GET').toUpperCase()
+  // GETs stay "simple" so they don't pay for a preflight round trip.
+  const headers = method === 'GET'
+    ? init.headers
+    : { ...CSRF_HEADER, ...init.headers }
+  return fetch(url, { credentials: 'include', ...init, headers })
+}
+
+/** Open the SSE progress stream for a job.
+ *
+ * Must go through BASE and send credentials: in production the frontend is on
+ * Vercel and the backend on Cloud Run, so a relative URL hits the frontend
+ * origin (404), and without cookies the backend's ownership check rejects it. */
+export function openJobStream(jobId: string): EventSource {
+  return new EventSource(`${BASE}/fetch/${jobId}/stream`, { withCredentials: true })
+}
+
+/** Fire-and-forget cancel that survives page unload.
+ *
+ *  Uses fetch(keepalive) rather than sendBeacon: a beacon cannot set custom
+ *  headers, so it could not send the CSRF header the backend now requires.
+ *  keepalive gives the same outlive-the-page guarantee and does send cookies. */
+export function beaconCancelJob(jobId: string): void {
+  try {
+    void fetch(`${BASE}/fetch/${jobId}/cancel`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: CSRF_HEADER,
+      keepalive: true,
+    }).catch(() => { /* page is going away — nothing to report */ })
+  } catch {
+    // Blocked or unsupported — the job will finish on its own.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,38 +139,30 @@ export async function postFetch(body: object, token?: string): Promise<{ job_id:
   return res.json()
 }
 
-export async function fetchResults(jobId: string): Promise<Record<string, unknown>> {
-  // C1: Return from session-storage cache when available (TTL = 5 min).
-  const cacheKey = `rp:${jobId}:results`
-  const cached = cacheGet<Record<string, unknown>>(cacheKey)
-  if (cached) return cached
+/** Filters applied server-side, across the whole result set rather than only
+ *  the pages already loaded into the table. */
+export interface ResultFilters {
+  q?: string
+  location?: string
+  company?: string
+  role?: string
+  min_followers?: string
+  max_followers?: string
+  joined_after?: string
+  joined_before?: string
+  hide_bots?: boolean
+  sort_by?: string
+  sort_dir?: 'asc' | 'desc'
+}
 
-  // P3: Backend now returns paginated response. Transparently fetch all pages.
-  const url = `${BASE}/results/${jobId}`
-  const res = await req(url)
-  if (!res.ok) {
-    const body = await res.json().catch(() => undefined)
-    logHttpError(url, res.status, res.statusText, body)
-    throw new Error(body?.detail ?? `HTTP ${res.status}`)
+/** Drop empty values so the URL only carries filters that are actually set. */
+export function filtersToParams(filters: ResultFilters = {}): URLSearchParams {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === '' || value === false) continue
+    params.set(key, String(value))
   }
-  const data = await res.json()
-  // Merge all pages into a flat dict keyed by login.
-  let result: Record<string, unknown>
-  if (data && typeof data === 'object' && 'users' in data) {
-    const allUsers: Record<string, unknown> = { ...data.users }
-    const totalPages: number = data.pages ?? 1
-    for (let page = 2; page <= totalPages; page++) {
-      const pageRes = await req(`${url}?page=${page}`)
-      if (!pageRes.ok) break
-      const pageData = await pageRes.json()
-      Object.assign(allUsers, pageData.users ?? {})
-    }
-    result = allUsers
-  } else {
-    result = data
-  }
-  cacheSet(cacheKey, result)
-  return result
+  return params
 }
 
 /** Fetch a single page of results — used for incremental "load more" UX. */
@@ -136,8 +170,18 @@ export async function fetchResultsPage(
   jobId: string,
   page: number,
   pageSize: number = 200,
-): Promise<{ users: Record<string, unknown>; total: number; page: number; pages: number }> {
-  const url = `${BASE}/results/${jobId}?page=${page}&page_size=${pageSize}`
+  filters: ResultFilters = {},
+): Promise<{
+  users: Record<string, unknown>
+  total: number
+  unfiltered_total: number
+  page: number
+  pages: number
+}> {
+  const params = filtersToParams(filters)
+  params.set('page', String(page))
+  params.set('page_size', String(pageSize))
+  const url = `${BASE}/results/${jobId}?${params}`
   const res = await req(url)
   if (!res.ok) {
     const body = await res.json().catch(() => undefined)
@@ -145,6 +189,137 @@ export async function fetchResultsPage(
     throw new Error(body?.detail ?? `HTTP ${res.status}`)
   }
   return res.json()
+}
+
+/** Rows the browser will hold for one query. The hosted FETCH_LIMIT is 500, so
+ *  this only binds on local installs running uncapped fetches. */
+export const MAX_CLIENT_ROWS = 10000
+
+/** Walk every page of a query, deduplicating by login.
+ *
+ *  Charts, quick-stat badges and client-side exports all aggregate the rows the
+ *  view is holding, so holding only page one made them silently describe a
+ *  fraction of the result set. `onPage` is called with the running total after
+ *  each page so the table fills in progressively; returning false from
+ *  `shouldContinue` abandons the walk (the caller's query has moved on) without
+ *  emitting anything further.
+ */
+export async function fetchAllResultPages(
+  jobId: string,
+  filters: ResultFilters,
+  opts: {
+    firstPage?: UserLike[]
+    total: number
+    pageSize?: number
+    shouldContinue?: () => boolean
+    onPage?: (rows: UserLike[]) => void
+  },
+): Promise<UserLike[]> {
+  const pageSize = opts.pageSize ?? 1000
+  const shouldContinue = opts.shouldContinue ?? (() => true)
+  const collected = [...(opts.firstPage ?? [])]
+  const seen = new Set(collected.map(u => u.login))
+  const cap = Math.min(opts.total, MAX_CLIENT_ROWS)
+  // Walk from page 1 at the full page size. That re-covers the rows already
+  // rendered, which costs one overlapping page and buys not having to reconcile
+  // two different page sizes against each other.
+  const lastPage = Math.ceil(cap / pageSize)
+
+  for (let page = 1; page <= lastPage; page++) {
+    if (!shouldContinue()) return collected
+    const data = await fetchResultsPage(jobId, page, pageSize, filters)
+    if (!shouldContinue()) return collected
+    const rows = Object.values(data.users) as UserLike[]
+    if (!rows.length) break
+    for (const row of rows) {
+      if (seen.has(row.login)) continue
+      seen.add(row.login)
+      collected.push(row)
+    }
+    opts.onPage?.(collected)
+  }
+  return collected
+}
+
+/** Minimal shape fetchAllResultPages needs — callers cast to their own record type. */
+interface UserLike { login: string }
+
+// ---------------------------------------------------------------------------
+// Churn / retention history
+// ---------------------------------------------------------------------------
+
+export interface HistoryRun {
+  job_id: string
+  label: string | null
+  created_at: string
+  total: number
+  joined: string[]
+  left: string[]
+  joined_count: number
+  left_count: number
+  retention_pct: number | null
+}
+
+export interface JobHistory {
+  repo: string
+  runs: HistoryRun[]
+  total_runs: number
+  net_change?: number
+  core_members?: number
+}
+
+/** Diff every completed run of this job's repo. Returns null when the job has
+ *  no repo recorded (imported jobs) or the backend is unavailable. */
+export async function fetchJobHistory(jobId: string): Promise<JobHistory | null> {
+  const res = await req(`${BASE}/jobs/${jobId}/history`)
+  if (!res.ok) return null
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled re-fetch
+// ---------------------------------------------------------------------------
+
+export interface Schedule {
+  schedule_id: string
+  source_job_id: string
+  label: string | null
+  interval_hours: number
+  next_run_at: string
+  last_run_at: string | null
+  last_job_id: string | null
+  enabled: boolean
+}
+
+export async function fetchSchedules(): Promise<Schedule[]> {
+  const res = await req(`${BASE}/schedules`)
+  if (!res.ok) return []
+  return res.json()
+}
+
+export async function createSchedule(jobId: string, intervalHours: number): Promise<Schedule> {
+  const res = await req(`${BASE}/schedules`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId, interval_hours: intervalHours }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail ?? `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function setScheduleEnabled(scheduleId: string, enabled: boolean): Promise<void> {
+  await req(`${BASE}/schedules/${scheduleId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export async function deleteSchedule(scheduleId: string): Promise<void> {
+  await req(`${BASE}/schedules/${scheduleId}`, { method: 'DELETE' })
 }
 
 /** Create a short-lived (24h) shareable read token for a job. */

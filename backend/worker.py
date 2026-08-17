@@ -16,7 +16,7 @@ from repo_people.users import GitHubUserInfo
 from repo_people import export as rp_export
 from github import Github, Auth, GithubException
 
-from store import get_job, persist_job
+from store import emit_event, get_job, persist_job
 
 
 def _classify_role_error(exc: Exception, role: str) -> str:
@@ -49,8 +49,15 @@ async def run_fetch_job(
     include_social_accounts: bool,
     workers: int,
     save_each_user: bool = False,
+    max_total: int | None = None,
 ) -> None:
-    """Background coroutine that drives RepoPeople and emits SSE events."""
+    """Background coroutine that drives RepoPeople and emits SSE events.
+
+    limit     — user-facing cap on usernames taken *from each role*.
+    max_total — server-side hard cap on unique profiles fetched, regardless of
+                `limit`. This is the cost control for the hosted service; the
+                profile lookups are what actually burn API quota and CPU.
+    """
     job = get_job(job_id)
     if job is None:
         return
@@ -59,7 +66,9 @@ async def run_fetch_job(
     partial_path = os.path.join(tempfile.gettempdir(), f"repo-people-{job_id}-partial.json")
 
     async def emit(event_type: str, data: dict) -> None:
-        await queue.put({"event": event_type, "data": data})
+        # Never blocks: the queue is bounded and drops its oldest events when
+        # nobody is draining it (no SSE client attached, or one that went away).
+        emit_event(queue, {"event": event_type, "data": data})
 
     job["status"] = "running"
     loop = asyncio.get_event_loop()
@@ -119,11 +128,27 @@ async def run_fetch_job(
                 await emit("warning", {"message": f"⚠️ Unexpected error during role fetch — {item}"})
             else:
                 role, data = item
-                username_map[role] = data
+                # Apply the per-role cap. Without this the `limit` field was
+                # accepted and silently ignored, so neither the user's choice
+                # nor the hosted FETCH_LIMIT had any effect.
+                username_map[role] = data[:limit] if limit and limit > 0 else data
 
-        unique_logins: set[str] = set()
+        unique_logins_set: set[str] = set()
         for logins in username_map.values():
-            unique_logins.update(logins)
+            unique_logins_set.update(logins)
+
+        # Hard server-side cap on profile lookups. Sorted so a truncated run is
+        # reproducible rather than dependent on set iteration order.
+        unique_logins: list[str] = sorted(unique_logins_set)
+        if max_total and max_total > 0 and len(unique_logins) > max_total:
+            await emit("warning", {
+                "message": f"⚠️ Capped at {max_total} users (found {len(unique_logins)}) — "
+                           f"run the app locally to remove this limit."
+            })
+            unique_logins = unique_logins[:max_total]
+            # Keep role membership consistent with what was actually fetched.
+            kept = set(unique_logins)
+            username_map = {r: [u for u in logins if u in kept] for r, logins in username_map.items()}
 
         total = len(unique_logins)
         roles_elapsed = time.monotonic() - t0

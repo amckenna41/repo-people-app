@@ -1,21 +1,41 @@
-import { useState, useMemo, useRef, useEffect } from 'react'
+import { useMemo, useRef, useEffect, useState } from 'react'
 import {
   useReactTable,
   getCoreRowModel,
-  getSortedRowModel,
-  getFilteredRowModel,
   flexRender,
   createColumnHelper,
   type SortingState,
 } from '@tanstack/react-table'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ExternalLink, ChevronUp, ChevronDown, ChevronsUpDown, Eye, X, CheckSquare, Square, Filter, AlertTriangle } from 'lucide-react'
+import {
+  ExternalLink, ChevronUp, ChevronDown, ChevronsUpDown, Eye, X, CheckSquare,
+  Square, Filter, AlertTriangle, Bookmark, Loader2, Trash2,
+} from 'lucide-react'
 import type { UserRecord } from '../types'
 import RoleBadges from './RoleBadges'
+import {
+  type FilterState, type Segment, EMPTY_FILTERS,
+  loadSegments, saveSegment, deleteSegment, activeFilterCount,
+} from '../utils/segments'
 
 interface Props {
+  /** Rows for the pages loaded so far. Already filtered and sorted server-side. */
   users: UserRecord[]
   onRowClick: (user: UserRecord) => void
+  /** Filtering, search and sort are controlled by the parent so they can be sent
+   *  to the server. Applying them here would only ever see the loaded pages. */
+  filters: FilterState
+  onFiltersChange: (filters: FilterState) => void
+  search: string
+  onSearchChange: (search: string) => void
+  sorting: SortingState
+  onSortingChange: (sorting: SortingState) => void
+  /** Total matching the current filters, server-side. */
+  totalUsers: number
+  /** Total ignoring filters — used for the "x of y" summary. */
+  unfilteredTotal: number
+  /** True while the parent is still pulling the remaining pages. */
+  loadingMore: boolean
 }
 
 const col = createColumnHelper<UserRecord>()
@@ -26,7 +46,8 @@ const ROW_HEIGHT = 44 // px — approximate height of a single table row
 // Bot-likelihood heuristic
 // ---------------------------------------------------------------------------
 // Returns a score 0–100. Score ≥ 60 = "likely bot / spam account".
-// The score is purely client-side and is only used to power the hide-bots toggle.
+// Mirrored server-side in main.py::_bot_score so the hide-bots filter agrees
+// with the badge shown here.
 
 function computeBotScore(u: UserRecord): number {
   if (u.is_bot) return 100
@@ -38,20 +59,6 @@ function computeBotScore(u: UserRecord): number {
   // Looks like a generated login: lower-case word(s) followed by 6+ digits
   if (u.login && /^[a-z][-a-z]*\d{6,}$/i.test(u.login)) score += 20
   return Math.min(score, 100)
-}
-
-// ---------------------------------------------------------------------------
-// Advanced filter state
-// ---------------------------------------------------------------------------
-
-interface FilterState {
-  location: string
-  company: string
-  minFollowers: string
-  maxFollowers: string
-  joinedAfter: string   // YYYY-MM-DD
-  joinedBefore: string  // YYYY-MM-DD
-  hideBots: boolean
 }
 
 const COL_VIS_KEY = 'repo-people-col-visibility'
@@ -79,40 +86,21 @@ function loadColVisibility(): Record<string, boolean> {
   }
 }
 
-export default function UserTable({ users, onRowClick }: Props) {
-  const [sorting, setSorting] = useState<SortingState>([])
-  const [globalFilter, setGlobalFilter] = useState('')
-  const [selectedLogin, setSelectedLogin] = useState<string | null>(null)
-  const [dropdownOpen, setDropdownOpen] = useState(false)
-  const [dropdownSearch, setDropdownSearch] = useState('')
-  const comboRef = useRef<HTMLDivElement>(null)
+const inputStyle = {
+  background: 'rgba(255,255,255,0.06)',
+  border: '1px solid rgba(255,255,255,0.10)',
+  color: '#e5e7eb',
+}
 
-  // Advanced filter panel
+export default function UserTable({
+  users, onRowClick, filters, onFiltersChange, search, onSearchChange,
+  sorting, onSortingChange, totalUsers, unfilteredTotal, loadingMore,
+}: Props) {
   const [showFilterPanel, setShowFilterPanel] = useState(false)
-  const [filters, setFilters] = useState<FilterState>({
-    location: '',
-    company: '',
-    minFollowers: '',
-    maxFollowers: '',
-    joinedAfter: '',
-    joinedBefore: '',
-    hideBots: false,
-  })
+  const [segments, setSegments] = useState<Segment[]>(loadSegments)
+  const [segmentName, setSegmentName] = useState('')
 
-  function resetFilters() {
-    setFilters({ location: '', company: '', minFollowers: '', maxFollowers: '', joinedAfter: '', joinedBefore: '', hideBots: false })
-  }
-
-  // Count how many advanced filters are active (for badge on Filters button)
-  const activeFilterCount = useMemo(() => [
-    filters.location,
-    filters.company,
-    filters.minFollowers,
-    filters.maxFollowers,
-    filters.joinedAfter,
-    filters.joinedBefore,
-    filters.hideBots ? 'x' : '',
-  ].filter(Boolean).length, [filters])
+  const activeCount = useMemo(() => activeFilterCount(filters), [filters])
 
   const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>(loadColVisibility)
   const [showVisibilityMenu, setShowVisibilityMenu] = useState(false)
@@ -120,17 +108,27 @@ export default function UserTable({ users, onRowClick }: Props) {
   const visMenuRef = useRef<HTMLDivElement>(null)
   const tableBodyRef = useRef<HTMLDivElement>(null)
 
+  function patchFilters(patch: Partial<FilterState>) {
+    onFiltersChange({ ...filters, ...patch })
+  }
+
+  function resetFilters() {
+    onFiltersChange({ ...EMPTY_FILTERS })
+  }
+
+  function clearAllFilters() {
+    onSearchChange('')
+    resetFilters()
+  }
+
   // Persist column visibility to localStorage whenever it changes
   useEffect(() => {
     try { localStorage.setItem(COL_VIS_KEY, JSON.stringify(columnVisibility)) } catch { /* storage full */ }
   }, [columnVisibility])
 
-  // Close dropdowns on outside click
+  // Close the column menu on outside click
   useEffect(() => {
     function onPointerDown(e: PointerEvent) {
-      if (comboRef.current && !comboRef.current.contains(e.target as Node)) {
-        setDropdownOpen(false)
-      }
       if (visMenuRef.current && !visMenuRef.current.contains(e.target as Node)) {
         setShowVisibilityMenu(false)
       }
@@ -139,88 +137,10 @@ export default function UserTable({ users, onRowClick }: Props) {
     return () => document.removeEventListener('pointerdown', onPointerDown)
   }, [])
 
-  // Sorted list of all logins for the dropdown
-  const sortedLogins = useMemo(() =>
-    [...users]
-      .sort((a, b) => (a.login ?? '').localeCompare(b.login ?? ''))
-      .map(u => ({ login: u.login, name: u.name }))
-  , [users])
-
-  // Filtered dropdown entries (by what user typed)
-  const dropdownEntries = useMemo(() => {
-    const q = dropdownSearch.toLowerCase()
-    if (!q) return sortedLogins
-    return sortedLogins.filter(u =>
-      u.login.toLowerCase().includes(q) || (u.name ?? '').toLowerCase().includes(q)
-    )
-  }, [sortedLogins, dropdownSearch])
-
-  // Reset scroll position when filters or sorting change
+  // Jump back to the top whenever the server returns a different result set.
   useEffect(() => {
     if (tableBodyRef.current) tableBodyRef.current.scrollTop = 0
-  }, [globalFilter, selectedLogin, sorting])
-
-  // Table data: apply login select + advanced filters
-  const tableData = useMemo(() => {
-    let rows = selectedLogin ? users.filter(u => u.login === selectedLogin) : users
-
-    if (filters.location) {
-      const q = filters.location.toLowerCase()
-      rows = rows.filter(u => (u.location ?? '').toLowerCase().includes(q))
-    }
-    if (filters.company) {
-      const q = filters.company.toLowerCase()
-      rows = rows.filter(u => (u.company ?? '').toLowerCase().includes(q))
-    }
-    if (filters.minFollowers !== '') {
-      const min = Number(filters.minFollowers)
-      rows = rows.filter(u => (u.followers ?? 0) >= min)
-    }
-    if (filters.maxFollowers !== '') {
-      const max = Number(filters.maxFollowers)
-      rows = rows.filter(u => (u.followers ?? 0) <= max)
-    }
-    if (filters.joinedAfter) {
-      const after = new Date(filters.joinedAfter).getTime()
-      rows = rows.filter(u => u.created_at ? new Date(u.created_at).getTime() >= after : true)
-    }
-    if (filters.joinedBefore) {
-      const before = new Date(filters.joinedBefore).getTime()
-      rows = rows.filter(u => u.created_at ? new Date(u.created_at).getTime() <= before : true)
-    }
-    if (filters.hideBots) {
-      rows = rows.filter(u => computeBotScore(u) < 60)
-    }
-
-    return rows
-  }, [users, selectedLogin, filters])
-
-  function clearAllFilters() {
-    setSelectedLogin(null)
-    setDropdownSearch('')
-    setGlobalFilter('')
-    setDropdownOpen(false)
-    resetFilters()
-  }
-
-  function selectUser(login: string) {
-    setSelectedLogin(login)
-    setDropdownSearch('')
-    setDropdownOpen(false)
-    setGlobalFilter('')
-  }
-
-  function showAllColumns() {
-    const allVisible: Record<string, boolean> = {}
-    table.getAllLeafColumns().forEach(c => { allVisible[c.id] = true })
-    setColumnVisibility(allVisible)
-  }
-
-  function hideAllColumns() {
-    const allHidden: Record<string, boolean> = {}
-    table.getAllLeafColumns().forEach(c => { allHidden[c.id] = c.id === 'avatar_url' })
-    setColumnVisibility(allHidden)
-  }
+  }, [search, filters, sorting])
 
   const columns = useMemo(() => [
     col.accessor('avatar_url', {
@@ -304,11 +224,13 @@ export default function UserTable({ users, onRowClick }: Props) {
     col.accessor('total_public_stars_sampled', { header: 'Stars', cell: i => i.getValue() ?? '–' }),
     col.accessor('total_public_forks_sampled', { header: 'Forks', cell: i => i.getValue() ?? '–' }),
     // Computed column — bot heuristic score (0–100). Hidden by default.
+    // Sorted client-side only, since the server has no such stored field.
     {
       id: 'bot_score',
       header: 'Bot Score',
+      enableSorting: false,
       accessorFn: (u: UserRecord) => computeBotScore(u),
-      cell: (info: any) => {
+      cell: (info: { getValue: () => unknown }) => {
         const score = info.getValue() as number
         const color = score >= 60 ? '#fbbf24' : score >= 30 ? '#94a3b8' : '#34d399'
         return <span style={{ color, fontVariantNumeric: 'tabular-nums' }}>{score}</span>
@@ -317,16 +239,30 @@ export default function UserTable({ users, onRowClick }: Props) {
   ], [])
 
   const table = useReactTable({
-    data: tableData,
+    data: users,
     columns,
-    state: { sorting, globalFilter, columnVisibility },
-    onSortingChange: setSorting,
-    onGlobalFilterChange: setGlobalFilter,
+    state: { sorting, columnVisibility },
+    // Sorting is applied by the server across the whole result set; the client
+    // model would only reorder the pages already loaded.
+    manualSorting: true,
+    onSortingChange: updater => {
+      onSortingChange(typeof updater === 'function' ? updater(sorting) : updater)
+    },
     onColumnVisibilityChange: setColumnVisibility,
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
   })
+
+  function showAllColumns() {
+    const allVisible: Record<string, boolean> = {}
+    table.getAllLeafColumns().forEach(c => { allVisible[c.id] = true })
+    setColumnVisibility(allVisible)
+  }
+
+  function hideAllColumns() {
+    const allHidden: Record<string, boolean> = {}
+    table.getAllLeafColumns().forEach(c => { allHidden[c.id] = c.id === 'avatar_url' })
+    setColumnVisibility(allHidden)
+  }
 
   const allRows = table.getRowModel().rows
   const virtualizer = useVirtualizer({
@@ -343,35 +279,37 @@ export default function UserTable({ users, onRowClick }: Props) {
       {/* Toolbar */}
       <div className="flex items-center gap-3 flex-wrap">
 
-        {/* User combobox */}
-        <div ref={comboRef} className="relative max-w-xs w-full" style={{ minWidth: 200 }}>
-          <div
-            className="input flex items-center gap-1.5 pr-2 cursor-text"
-            style={{ padding: '0 8px' }}
-            onClick={() => { setDropdownOpen(true); }}
-          >
+        {/* Search — matches login, name, company, location and bio server-side */}
+        <div className="relative max-w-xs w-full" style={{ minWidth: 200 }}>
+          <div className="input flex items-center gap-1.5 pr-2" style={{ padding: '0 8px' }}>
             <input
               className="flex-1 bg-transparent outline-hidden text-sm py-2 min-w-0"
+<<<<<<< HEAD
               placeholder={selectedLogin ? '' : 'Filter users…'}
               value={dropdownSearch}
               onChange={e => { setDropdownSearch(e.target.value); setDropdownOpen(true); setSelectedLogin(null) }}
               onFocus={() => setDropdownOpen(true)}
+=======
+              placeholder="Search all users…"
+              value={search}
+              onChange={e => onSearchChange(e.target.value)}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
             />
-            {selectedLogin && (
-              <span className="text-xs font-medium truncate max-w-[120px]" style={{ color: '#a78bfa' }}>
-                {selectedLogin}
-              </span>
-            )}
-            {(selectedLogin || dropdownSearch) && (
+            {search && (
               <button
                 type="button"
                 className="text-gray-500 hover:text-gray-200 shrink-0 transition-colors"
+<<<<<<< HEAD
                 onPointerDown={e => { e.preventDefault(); clearAllFilters() }}
+=======
+                onPointerDown={e => { e.preventDefault(); onSearchChange('') }}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
               >
                 <X size={13} />
               </button>
             )}
           </div>
+<<<<<<< HEAD
 
           {dropdownOpen && (
             <div
@@ -407,10 +345,12 @@ export default function UserTable({ users, onRowClick }: Props) {
               )}
             </div>
           )}
+=======
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
         </div>
 
         {/* Clear filters */}
-        {(selectedLogin || globalFilter) && (
+        {(search || activeCount > 0) && (
           <button
             type="button"
             onClick={clearAllFilters}
@@ -429,12 +369,12 @@ export default function UserTable({ users, onRowClick }: Props) {
         >
           <Filter size={13} />
           Filters
-          {activeFilterCount > 0 && (
+          {activeCount > 0 && (
             <span
               className="absolute -top-1.5 -right-1.5 text-[10px] font-bold w-4 h-4 rounded-full flex items-center justify-center"
               style={{ background: '#7c3aed', color: '#fff' }}
             >
-              {activeFilterCount}
+              {activeCount}
             </span>
           )}
         </button>
@@ -460,11 +400,15 @@ export default function UserTable({ users, onRowClick }: Props) {
                 value={visibilitySearch}
                 onChange={e => setVisibilitySearch(e.target.value)}
                 className="w-full bg-transparent outline-hidden text-xs px-2 py-1.5 rounded-md"
+<<<<<<< HEAD
                 style={{
                   background: 'rgba(255,255,255,0.06)',
                   border: '1px solid rgba(255,255,255,0.10)',
                   color: '#e5e7eb',
                 }}
+=======
+                style={inputStyle}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
               />
               {/* Select / Deselect all columns buttons */}
               <div className="flex gap-1.5">
@@ -491,16 +435,16 @@ export default function UserTable({ users, onRowClick }: Props) {
               </div>
               <div className="grid grid-cols-2 gap-1">
                 {table.getAllLeafColumns()
-                  .filter(col => col.id !== 'avatar_url' && col.id.toLowerCase().includes(visibilitySearch.toLowerCase()))
-                  .map(col => (
-                  <label key={col.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                  .filter(c => c.id !== 'avatar_url' && c.id.toLowerCase().includes(visibilitySearch.toLowerCase()))
+                  .map(c => (
+                  <label key={c.id} className="flex items-center gap-2 text-sm cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={col.getIsVisible()}
-                      onChange={col.getToggleVisibilityHandler()}
+                      checked={c.getIsVisible()}
+                      onChange={c.getToggleVisibilityHandler()}
                       className="accent-brand-500"
                     />
-                    {col.id}
+                    {c.id}
                   </label>
                 ))}
               </div>
@@ -509,7 +453,8 @@ export default function UserTable({ users, onRowClick }: Props) {
         </div>
 
         <span className="text-sm text-gray-500 ml-auto">
-          {allRows.length} users
+          {totalUsers.toLocaleString()}
+          {totalUsers !== unfilteredTotal && ` of ${unfilteredTotal.toLocaleString()}`} users
         </span>
       </div>
 
@@ -525,10 +470,14 @@ export default function UserTable({ users, onRowClick }: Props) {
               <input
                 type="text"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+=======
+                style={inputStyle}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 placeholder="e.g. London"
                 value={filters.location}
-                onChange={e => setFilters(f => ({ ...f, location: e.target.value }))}
+                onChange={e => patchFilters({ location: e.target.value })}
               />
             </div>
             <div>
@@ -536,10 +485,14 @@ export default function UserTable({ users, onRowClick }: Props) {
               <input
                 type="text"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+=======
+                style={inputStyle}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 placeholder="e.g. Google"
                 value={filters.company}
-                onChange={e => setFilters(f => ({ ...f, company: e.target.value }))}
+                onChange={e => patchFilters({ company: e.target.value })}
               />
             </div>
             <div className="flex gap-2">
@@ -549,10 +502,14 @@ export default function UserTable({ users, onRowClick }: Props) {
                   type="number"
                   min={0}
                   className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                   style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+=======
+                  style={inputStyle}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                   placeholder="0"
                   value={filters.minFollowers}
-                  onChange={e => setFilters(f => ({ ...f, minFollowers: e.target.value }))}
+                  onChange={e => patchFilters({ minFollowers: e.target.value })}
                 />
               </div>
               <div className="flex-1">
@@ -561,10 +518,14 @@ export default function UserTable({ users, onRowClick }: Props) {
                   type="number"
                   min={0}
                   className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                   style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
+=======
+                  style={inputStyle}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                   placeholder="∞"
                   value={filters.maxFollowers}
-                  onChange={e => setFilters(f => ({ ...f, maxFollowers: e.target.value }))}
+                  onChange={e => patchFilters({ maxFollowers: e.target.value })}
                 />
               </div>
             </div>
@@ -573,9 +534,13 @@ export default function UserTable({ users, onRowClick }: Props) {
               <input
                 type="date"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
+=======
+                style={{ ...inputStyle, colorScheme: 'dark' }}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 value={filters.joinedAfter}
-                onChange={e => setFilters(f => ({ ...f, joinedAfter: e.target.value }))}
+                onChange={e => patchFilters({ joinedAfter: e.target.value })}
               />
             </div>
             <div>
@@ -583,9 +548,13 @@ export default function UserTable({ users, onRowClick }: Props) {
               <input
                 type="date"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
+<<<<<<< HEAD
                 style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
+=======
+                style={{ ...inputStyle, colorScheme: 'dark' }}
+>>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 value={filters.joinedBefore}
-                onChange={e => setFilters(f => ({ ...f, joinedBefore: e.target.value }))}
+                onChange={e => patchFilters({ joinedBefore: e.target.value })}
               />
             </div>
             <div className="flex flex-col justify-end">
@@ -594,7 +563,7 @@ export default function UserTable({ users, onRowClick }: Props) {
                   type="checkbox"
                   className="accent-amber-400"
                   checked={filters.hideBots}
-                  onChange={e => setFilters(f => ({ ...f, hideBots: e.target.checked }))}
+                  onChange={e => patchFilters({ hideBots: e.target.checked })}
                 />
                 <span className="text-gray-300 flex items-center gap-1">
                   <AlertTriangle size={12} className="text-amber-400" />
@@ -604,19 +573,83 @@ export default function UserTable({ users, onRowClick }: Props) {
               <p className="text-[10px] text-gray-600 mt-0.5 ml-5">Hides accounts scoring ≥ 60 on the spam heuristic</p>
             </div>
           </div>
-          {activeFilterCount > 0 && (
-            <button
-              type="button"
-              onClick={resetFilters}
-              className="text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center gap-1"
-            >
-              <X size={11} /> Reset all filters
-            </button>
-          )}
+
+          {/* Saved segments */}
+          <div className="pt-3 space-y-2" style={{ borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-gray-500 flex items-center gap-1">
+                <Bookmark size={11} /> Saved segments
+              </span>
+              {segments.length === 0 && (
+                <span className="text-xs text-gray-600">none yet — set some filters and save them</span>
+              )}
+              {segments.map(seg => (
+                <span
+                  key={seg.name}
+                  className="flex items-center gap-1 text-xs rounded-full pl-2.5 pr-1 py-0.5"
+                  style={{ background: 'rgba(139,92,246,0.14)', border: '1px solid rgba(139,92,246,0.35)' }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => onFiltersChange({ ...seg.filters })}
+                    className="text-purple-300 hover:text-white transition-colors"
+                    title={`Apply "${seg.name}"`}
+                  >
+                    {seg.name}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSegments(prev => deleteSegment(seg.name, prev))}
+                    className="text-gray-500 hover:text-red-400 transition-colors p-0.5"
+                    title={`Delete "${seg.name}"`}
+                  >
+                    <Trash2 size={10} />
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="text-sm rounded-md px-2 py-1.5 outline-hidden w-48"
+                style={inputStyle}
+                placeholder="Name this filter set…"
+                value={segmentName}
+                onChange={e => setSegmentName(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key !== 'Enter' || !segmentName.trim()) return
+                  setSegments(prev => saveSegment(segmentName, filters, prev))
+                  setSegmentName('')
+                }}
+              />
+              <button
+                type="button"
+                disabled={!segmentName.trim() || activeCount === 0}
+                onClick={() => {
+                  setSegments(prev => saveSegment(segmentName, filters, prev))
+                  setSegmentName('')
+                }}
+                className="btn-secondary text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                title={activeCount === 0 ? 'Set at least one filter first' : 'Save these filters'}
+              >
+                Save segment
+              </button>
+              {activeCount > 0 && (
+                <button
+                  type="button"
+                  onClick={resetFilters}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center gap-1 ml-auto"
+                >
+                  <X size={11} /> Reset all filters
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
-      {/* Virtualised table — only visible rows are rendered in the DOM */}      <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(255,255,255,0.06)' }}>
+      {/* Virtualised table — only visible rows are rendered in the DOM */}
+      <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(255,255,255,0.06)' }}>
         {/* Fixed header */}
         <table className="w-full text-sm">
           <thead style={{ background: 'rgba(255,255,255,0.03)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
@@ -693,10 +726,11 @@ export default function UserTable({ users, onRowClick }: Props) {
       </div>
 
       {allRows.length > 0 && (
-        <div className="text-xs text-gray-600 text-right pt-1">
-          {allRows.length < users.length
-            ? `Showing ${allRows.length} of ${users.length} users — scroll to navigate`
-            : `Showing all ${allRows.length} users — scroll to navigate`}
+        <div className="text-xs text-gray-600 text-right pt-1 flex items-center justify-end gap-2">
+          {loadingMore && <Loader2 size={11} className="animate-spin text-brand-500" />}
+          {loadingMore
+            ? `Loaded ${allRows.length.toLocaleString()} of ${totalUsers.toLocaleString()} matching users…`
+            : `Showing all ${allRows.length.toLocaleString()} matching users`}
         </div>
       )}
     </div>

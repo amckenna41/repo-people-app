@@ -7,6 +7,10 @@ export default defineConfig({
     // recharts minifies to ~526 kB — raise the threshold to avoid a false-positive warning.
     // xlsx/jspdf/html2canvas are already lazy-loaded via dynamic import().
     chunkSizeWarningLimit: 600,
+    // The polyfill is injected as an inline <script>, which would force
+    // 'unsafe-inline' in the script-src of the CSP set in vercel.json. Every
+    // browser this app supports handles modulepreload natively.
+    modulePreload: { polyfill: false },
     rollupOptions: {
       output: {
         // Vite 8 / Rolldown only accepts the function form of manualChunks.
@@ -33,6 +37,10 @@ export default defineConfig({
       '/clear_cache': 'http://localhost:8000',
       '/auth': 'http://localhost:8000',
       '/share': 'http://localhost:8000',
+      // Without these two the dev server answers the request itself with a 404,
+      // and fetchSchedules() swallows it — scheduling looked empty-but-working.
+      '/schedules': 'http://localhost:8000',
+      '/healthz': 'http://localhost:8000',
     },
   },
 })

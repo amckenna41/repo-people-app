@@ -103,11 +103,28 @@ SAMPLE_USERS: dict[str, Any] = {
 }
 
 
-async def _seed_done_job(result: dict[str, Any] | None = None) -> str:
+# Jobs are strictly owner-scoped, so seeded fixtures must carry an owner and the
+# test client must present the matching cookie. TEST_CLIENT_COOKIE is the raw
+# rp_client value; TEST_OWNER_KEY is what the backend derives from it.
+TEST_CLIENT_COOKIE = "test-client-cookie"
+TEST_OWNER_KEY = f"anon:{TEST_CLIENT_COOKIE}"
+
+# Mutating routes require a custom header so they cannot be sent as a
+# preflight-free cross-site request (see require_csrf_header in main.py). Real
+# clients send it on every non-GET; the test clients do the same. Tests that
+# assert the header is *enforced* omit it deliberately.
+CSRF_HEADERS = {"X-Requested-With": "repo-people"}
+
+
+async def _seed_done_job(
+    result: dict[str, Any] | None = None,
+    owner_key: str | None = TEST_OWNER_KEY,
+    params: dict[str, Any] | None = None,
+) -> str:
     """Insert a completed job into the DB and return its job_id."""
     job_id = str(uuid.uuid4())
-    _runtime[job_id] = {"cancelled": False, "events": asyncio.Queue()}
-    await store._insert_job(job_id)
+    _runtime[job_id] = store._new_runtime()
+    await store._insert_job(job_id, owner_key, params)
 
     # Directly patch via _persist_field
     await store._persist_field(job_id, "status", "done")
@@ -117,11 +134,11 @@ async def _seed_done_job(result: dict[str, Any] | None = None) -> str:
     return job_id
 
 
-async def _seed_pending_job() -> str:
+async def _seed_pending_job(owner_key: str | None = TEST_OWNER_KEY) -> str:
     """Insert a pending job and return its job_id."""
     job_id = str(uuid.uuid4())
-    _runtime[job_id] = {"cancelled": False, "events": asyncio.Queue()}
-    await store._insert_job(job_id)
+    _runtime[job_id] = store._new_runtime()
+    await store._insert_job(job_id, owner_key)
     return job_id
 
 
@@ -137,18 +154,41 @@ def event_loop():
     loop.close()
 
 
+async def _drain_background_tasks(timeout: float = 2.0) -> None:
+    """Wait for fire-and-forget store writes (e.g. from create_job()) to finish.
+
+    Dropping tables while one of those still holds an open connection fails with
+    'database table is locked', which surfaces as a confusing error in whichever
+    test happens to run next.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        pending = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        if not pending:
+            return
+        await asyncio.wait(pending, timeout=0.1)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def reset_store():
     """Clear runtime + DB before each test for full isolation."""
+    await _drain_background_tasks()
     _runtime.clear()
-    # Drop and recreate the jobs table so each test starts clean
+    # Drop every table so each test starts clean
     async with store._db() as conn:
-        await conn.execute("DROP TABLE IF EXISTS jobs")
+        for table in ("jobs", "sessions", "oauth_states", "share_tokens", "schedules"):
+            await conn.exec(f"DROP TABLE IF EXISTS {table}")
         await conn.commit()
-    # Re-initialise — _db() creates the table on entry
+    # Schema creation is memoised per process — clear the flag so the next
+    # _db() actually recreates the tables we just dropped.
+    store._schema_ready = False
     async with store._db() as conn:
         pass
     yield
+    await _drain_background_tasks()
     _runtime.clear()
 
 
@@ -194,5 +234,24 @@ async def async_client():
     importlib.reload(main_module)
     app = main_module.app
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=CSRF_HEADERS
+    ) as client:
+        # Present the anonymous-owner cookie that seeded fixtures are scoped to.
+        client.cookies.set("rp_client", TEST_CLIENT_COOKIE)
         yield client
+
+
+@pytest_asyncio.fixture
+async def anonymous_client():
+    """A client with no ownership cookie — used to assert that jobs belonging to
+    someone else are not readable."""
+    import importlib
+    import main as main_module
+    importlib.reload(main_module)
+    async with AsyncClient(
+        transport=ASGITransport(app=main_module.app), base_url="http://test",
+        headers=CSRF_HEADERS,
+    ) as client:
+        yield client
+

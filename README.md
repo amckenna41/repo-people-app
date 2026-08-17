@@ -128,6 +128,8 @@ docker compose up --build
 
 > **Job scoping.** Jobs are private to the caller — identified by the GitHub login for OAuth users, or an anonymous `rp_client` cookie otherwise. `GET /jobs` returns only your jobs, and every job-specific endpoint returns `404` for jobs you don't own (legacy jobs created before scoping have no owner and remain public). `/fetch` and `/import` are rate-limited per caller. Send credentials (cookies) with every request; for a cross-origin frontend/backend split set `COOKIE_SAMESITE=none`.
 
+> **CSRF.** Every mutating request (`POST`/`PUT`/`PATCH`/`DELETE`) must send an `X-Requested-With` header; without it the backend returns `403`. Cookies are `SameSite=None` in a split deployment, so they ride along on cross-site requests — requiring a custom header forces a CORS preflight, which fails for any origin not in `CORS_ORIGINS`. `GET /auth/callback` is exempt, since GitHub redirects the browser there; that flow is protected by a state cookie instead.
+
 ## Stack
 
 | Layer | Technology |
@@ -248,6 +250,7 @@ npm run build   # output in frontend/dist/ — deploy to Vercel / Firebase Hosti
 | `ALLOW_DEV_CLEAR` | _(unset)_ | Set to `1` to enable the guarded `POST /clear_cache` dev endpoint |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | _(unset)_ | Enable GitHub OAuth sign-in |
 | `FRONTEND_URL` / `BACKEND_URL` | localhost dev URLs | OAuth redirect targets; `BACKEND_URL` over HTTPS auto-enables `Secure` cookies |
+| `SESSION_TOKEN_KEY` | _(ephemeral)_ | Fernet key encrypting stored OAuth tokens. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Unset means a per-process key, which signs every user out on restart |
 | `REPO_PEOPLE_DB` | `backend/repo_people_jobs.db` | SQLite job-store path |
 
 ## Views

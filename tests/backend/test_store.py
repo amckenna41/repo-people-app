@@ -10,6 +10,7 @@ Tests cover:
   - load_all_jobs_into_runtime
   - result_to_csv_bytes
   - _all_job_ids_async ordering
+  - logins_json denormalisation and load_repo_history
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
-from conftest import SAMPLE_USERS, _seed_done_job, _seed_pending_job
+from conftest import TEST_OWNER_KEY, SAMPLE_USERS, _seed_done_job, _seed_pending_job
 import store
 from store import (
     _all_job_ids_async,
@@ -34,6 +35,8 @@ from store import (
     get_job_async,
     get_job_tags,
     load_all_jobs_into_runtime,
+    load_repo_history,
+    persist_job,
     result_to_csv_bytes,
     set_job_tags,
 )
@@ -397,3 +400,79 @@ class TestResultToCsvBytes:
         text = result_to_csv_bytes(result).decode()
         # Should not raise; bob's email cell just empty
         assert text != ""
+
+
+# ===========================================================================
+# logins_json / load_repo_history
+# ===========================================================================
+# History diffs every run of a repo, but only ever needs each run's member list.
+# It used to rebuild that by parsing every run's full result blob, so selecting a
+# job read tens of MB on a hot path. The list is now denormalised on write.
+
+class TestLoginsDenormalisation:
+    @pytest.mark.asyncio
+    async def test_persisting_a_result_writes_the_login_list(self):
+        job_id = await _seed_done_job()
+        await persist_job(job_id, result={"bob": {"login": "bob"}, "alice": {"login": "alice"}})
+
+        row = await _load_job_row(job_id)
+        # Sorted, so a run's stored list is stable regardless of dict order.
+        assert json.loads(row["logins_json"]) == ["alice", "bob"]
+
+    @pytest.mark.asyncio
+    async def test_login_list_tracks_a_rewritten_result(self):
+        job_id = await _seed_done_job()
+        await persist_job(job_id, result={"alice": {"login": "alice"}})
+        await persist_job(job_id, result={"carol": {"login": "carol"}})
+
+        row = await _load_job_row(job_id)
+        assert json.loads(row["logins_json"]) == ["carol"]
+
+    @pytest.mark.asyncio
+    async def test_history_reads_runs_without_touching_result_json(self):
+        params = {"owner": "acme", "repo": "widgets"}
+        first = await _seed_done_job({"alice": {"login": "alice"}}, params=params)
+        second = await _seed_done_job(
+            {"alice": {"login": "alice"}, "bob": {"login": "bob"}}, params=params
+        )
+
+        runs = await load_repo_history(TEST_OWNER_KEY, "acme", "widgets")
+        assert [r["job_id"] for r in runs] == [first, second]
+        assert runs[0]["logins"] == {"alice"}
+        assert runs[1]["logins"] == {"alice", "bob"}
+
+    @pytest.mark.asyncio
+    async def test_history_is_scoped_to_the_caller(self):
+        params = {"owner": "acme", "repo": "widgets"}
+        await _seed_done_job({"alice": {"login": "alice"}}, params=params)
+
+        assert await load_repo_history("anon:someone-else", "acme", "widgets") == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_row_without_logins_json_is_backfilled_on_read(self):
+        """Rows written before the column existed still have to work — and must
+        not pay the full-blob parse on every subsequent read."""
+        params = {"owner": "acme", "repo": "widgets"}
+        job_id = await _seed_done_job({"alice": {"login": "alice"}}, params=params)
+        async with store._db() as c:
+            await c.exec("UPDATE jobs SET logins_json = NULL WHERE job_id = ?", (job_id,))
+            await c.commit()
+
+        runs = await load_repo_history(TEST_OWNER_KEY, "acme", "widgets")
+        assert runs[0]["logins"] == {"alice"}
+
+        # The read repaired the row, so the legacy path is not taken again.
+        row = await _load_job_row(job_id)
+        assert json.loads(row["logins_json"]) == ["alice"]
+
+    @pytest.mark.asyncio
+    async def test_pending_runs_of_the_same_repo_are_excluded(self):
+        """An in-flight run has no membership yet; including it would show the
+        whole community as having left."""
+        params = {"owner": "acme", "repo": "widgets"}
+        done = await _seed_done_job({"alice": {"login": "alice"}}, params=params)
+        # A pending run of the *same* repo, so only the status filter excludes it.
+        await _insert_job(str(uuid.uuid4()), TEST_OWNER_KEY, params)
+
+        runs = await load_repo_history(TEST_OWNER_KEY, "acme", "widgets")
+        assert [r["job_id"] for r in runs] == [done]

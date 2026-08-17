@@ -14,12 +14,28 @@
     }
   ],
   "routes": [
+    {
+      "//": "Security headers for every response. This config uses legacy `routes`, which cannot be combined with a top-level `headers` block — hence the `continue: true` pass-through entry. connect-src is the one to tighten: replace https: with your exact backend origin (the VITE_API_BASE_URL value) once it is stable.",
+      "src": "/(.*)",
+      "headers": {
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://avatars.githubusercontent.com https://github.com; font-src 'self' data:; connect-src 'self' https:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "X-Frame-Options": "DENY",
+        "Permissions-Policy": "geolocation=(), microphone=(), camera=(), payment=()"
+      },
+      "continue": true
+    },
     { "src": "/fetch(.*)",   "dest": "/backend/main.py" },
     { "src": "/results(.*)", "dest": "/backend/main.py" },
     { "src": "/compare(.*)", "dest": "/backend/main.py" },
     { "src": "/jobs(.*)",    "dest": "/backend/main.py" },
     { "src": "/import(.*)",  "dest": "/backend/main.py" },
     { "src": "/auth(.*)",    "dest": "/backend/main.py" },
+    { "src": "/share(.*)",   "dest": "/backend/main.py" },
+    { "src": "/schedules(.*)", "dest": "/backend/main.py" },
+    { "src": "/healthz",     "dest": "/backend/main.py" },
+    { "src": "/clear_cache", "dest": "/backend/main.py" },
     { "handle": "filesystem" },
     { "src": "/(.*)", "dest": "/frontend/index.html" }
   ]
