@@ -284,69 +284,20 @@ export default function UserTable({
           <div className="input flex items-center gap-1.5 pr-2" style={{ padding: '0 8px' }}>
             <input
               className="flex-1 bg-transparent outline-hidden text-sm py-2 min-w-0"
-<<<<<<< HEAD
-              placeholder={selectedLogin ? '' : 'Filter users…'}
-              value={dropdownSearch}
-              onChange={e => { setDropdownSearch(e.target.value); setDropdownOpen(true); setSelectedLogin(null) }}
-              onFocus={() => setDropdownOpen(true)}
-=======
               placeholder="Search all users…"
               value={search}
               onChange={e => onSearchChange(e.target.value)}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
             />
             {search && (
               <button
                 type="button"
                 className="text-gray-500 hover:text-gray-200 shrink-0 transition-colors"
-<<<<<<< HEAD
-                onPointerDown={e => { e.preventDefault(); clearAllFilters() }}
-=======
                 onPointerDown={e => { e.preventDefault(); onSearchChange('') }}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
               >
                 <X size={13} />
               </button>
             )}
           </div>
-<<<<<<< HEAD
-
-          {dropdownOpen && (
-            <div
-              className="absolute left-0 right-0 top-full mt-1 rounded-lg z-30 overflow-y-auto"
-              style={{
-                maxHeight: 240,
-                background: 'rgba(14,10,36,0.97)',
-                border: '1px solid rgba(139,92,246,0.3)',
-                boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-                backdropFilter: 'blur(12px)',
-              }}
-            >
-              {dropdownEntries.length === 0 ? (
-                <div className="text-xs text-gray-500 px-3 py-2">No users found</div>
-              ) : (
-                dropdownEntries.map(u => (
-                  <button
-                    key={u.login}
-                    type="button"
-                    className="w-full text-left px-3 py-2 text-sm flex items-center gap-2 transition-colors"
-                    style={selectedLogin === u.login ? {
-                      background: 'rgba(139,92,246,0.18)',
-                      color: '#a78bfa',
-                    } : {}}
-                    onMouseEnter={e => { if (selectedLogin !== u.login) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.05)' }}
-                    onMouseLeave={e => { if (selectedLogin !== u.login) (e.currentTarget as HTMLElement).style.background = '' }}
-                    onPointerDown={e => { e.preventDefault(); selectUser(u.login) }}
-                  >
-                    <span className="font-mono text-xs text-gray-400 shrink-0">{u.login}</span>
-                    {u.name && <span className="text-gray-500 text-xs truncate">{u.name}</span>}
-                  </button>
-                ))
-              )}
-            </div>
-          )}
-=======
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
         </div>
 
         {/* Clear filters */}
@@ -400,15 +351,7 @@ export default function UserTable({
                 value={visibilitySearch}
                 onChange={e => setVisibilitySearch(e.target.value)}
                 className="w-full bg-transparent outline-hidden text-xs px-2 py-1.5 rounded-md"
-<<<<<<< HEAD
-                style={{
-                  background: 'rgba(255,255,255,0.06)',
-                  border: '1px solid rgba(255,255,255,0.10)',
-                  color: '#e5e7eb',
-                }}
-=======
                 style={inputStyle}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
               />
               {/* Select / Deselect all columns buttons */}
               <div className="flex gap-1.5">
@@ -470,11 +413,7 @@ export default function UserTable({
               <input
                 type="text"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
-=======
                 style={inputStyle}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 placeholder="e.g. London"
                 value={filters.location}
                 onChange={e => patchFilters({ location: e.target.value })}
@@ -485,11 +424,7 @@ export default function UserTable({
               <input
                 type="text"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
-=======
                 style={inputStyle}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 placeholder="e.g. Google"
                 value={filters.company}
                 onChange={e => patchFilters({ company: e.target.value })}
@@ -502,11 +437,7 @@ export default function UserTable({
                   type="number"
                   min={0}
                   className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
-=======
                   style={inputStyle}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                   placeholder="0"
                   value={filters.minFollowers}
                   onChange={e => patchFilters({ minFollowers: e.target.value })}
@@ -518,11 +449,7 @@ export default function UserTable({
                   type="number"
                   min={0}
                   className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb' }}
-=======
                   style={inputStyle}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                   placeholder="∞"
                   value={filters.maxFollowers}
                   onChange={e => patchFilters({ maxFollowers: e.target.value })}
@@ -534,11 +461,7 @@ export default function UserTable({
               <input
                 type="date"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
-=======
                 style={{ ...inputStyle, colorScheme: 'dark' }}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 value={filters.joinedAfter}
                 onChange={e => patchFilters({ joinedAfter: e.target.value })}
               />
@@ -548,11 +471,7 @@ export default function UserTable({
               <input
                 type="date"
                 className="w-full text-sm rounded-md px-2 py-1.5 outline-hidden"
-<<<<<<< HEAD
-                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)', color: '#e5e7eb', colorScheme: 'dark' }}
-=======
                 style={{ ...inputStyle, colorScheme: 'dark' }}
->>>>>>> 32d33d9 (v1.1.0; repo-people web app)
                 value={filters.joinedBefore}
                 onChange={e => patchFilters({ joinedBefore: e.target.value })}
               />

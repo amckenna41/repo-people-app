@@ -57,7 +57,7 @@ Understanding who contributes to, uses, and maintains an open-source project is 
 | Requirement | Minimum version |
 |---|---|
 | Python | 3.11 |
-| Node.js | 18 |
+| Node.js | 20.19 (or 22.12+) — required by Vite 8 |
 | npm | 9 |
 | GitHub personal access token | — |
 
@@ -75,6 +75,11 @@ A GitHub personal access token is required to fetch data from the GitHub API. To
 **The token is entered directly in the app UI when starting a collection job. It is transmitted as an `Authorization: Bearer` HTTP header and is never stored server-side or included in the request body.**
 
 ## Quick start (local, no Docker)
+
+Two processes in two terminals: the FastAPI backend on port 8000 and the Vite
+dev server on 5173, which proxies API calls to the backend. There is no
+`package.json` at the repo root — run `npm` from `frontend/`, and `uvicorn` from
+`backend/` (`main.py` imports `models`/`store` as top-level modules).
 
 ### 1. Backend
 
