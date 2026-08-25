@@ -565,13 +565,13 @@ Create a separate `tsconfig.test.json` for IDE/test support:
 
 | Variable | Value |
 |---|---|
-| `VITE_API_BASE_URL` | Your Cloud Run backend URL (e.g. `https://repo-people-app-xxxxx-ew.a.run.app`) |
+| `API_BASE_URL` | Your Cloud Run backend URL (e.g. `https://repo-people-app-xxxxx-ew.a.run.app`) |
 
 Set this in Vercel Project Settings → Environment Variables, then redeploy.
 
 Why this matters:
-- The frontend calls OAuth endpoints using `${VITE_API_BASE_URL}/auth/*`.
-- If `VITE_API_BASE_URL` is empty in production, OAuth calls go to the Vercel frontend domain and can return `404 NOT_FOUND`.
+- The frontend calls OAuth endpoints using `${API_BASE_URL}/auth/*`.
+- If `API_BASE_URL` is empty in production, OAuth calls go to the Vercel frontend domain and can return `404 NOT_FOUND`.
 
 Optional alternative:
-- You can proxy `/auth/*` through Vercel via `vercel.json`, but then all API routes must be consistently proxied. The default recommended setup is direct frontend → Cloud Run using `VITE_API_BASE_URL`.
+- You can proxy `/auth/*` through Vercel via `vercel.json`, but then all API routes must be consistently proxied. The default recommended setup is direct frontend → Cloud Run using `API_BASE_URL`.

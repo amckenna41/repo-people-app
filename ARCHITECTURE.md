@@ -287,7 +287,7 @@ Frontend env vars (read via `import.meta.env`, defined in
 
 | Var | Read at | Breaks without it |
 |---|---|---|
-| `VITE_API_BASE_URL` | `api.ts:3`, `App.tsx:331` | Empty → all API calls are relative (dev proxy). Must point at the backend in a cross-origin deploy |
+| `API_BASE_URL` | `api.ts:3`, `App.tsx:331` | Empty → all API calls are relative (dev proxy). Must point at the backend in a cross-origin deploy |
 | `VITE_FETCH_LIMIT` | `FetchView.tsx:74` | UI-side cap; **must be kept in sync manually** with backend `FETCH_LIMIT` (two independent sources of the same number) |
 
 **Secrets.** `backend/.env` on this machine contains a real-looking
@@ -395,7 +395,7 @@ Things that will bite the next maintainer:
    - `navigator.sendBeacon(`/fetch/.../cancel`)` (`FetchView.tsx:115`) is
      origin-relative too.
    All of these assume same-origin (i.e. the dev proxy in `vite.config.ts` or a
-   reverse proxy). In a cross-origin `VITE_API_BASE_URL` deploy they point at
+  reverse proxy). In a cross-origin `API_BASE_URL` deploy they point at
    the frontend origin and fail. This is the kind of split that "works on my
    machine" and dies in production.
 

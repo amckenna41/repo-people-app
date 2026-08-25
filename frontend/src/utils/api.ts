@@ -1,6 +1,6 @@
 // In development, BASE is empty and Vite proxies API calls to localhost:8000.
-// In production builds, VITE_API_BASE_URL points at the Cloud Run service URL.
-const BASE = import.meta.env.VITE_API_BASE_URL ?? ''
+// In production builds, API_BASE_URL (or the legacy VITE_API_BASE_URL) points at the Cloud Run service URL.
+const BASE = import.meta.env.API_BASE_URL ?? import.meta.env.VITE_API_BASE_URL ?? ''
 
 export const API_BASE = BASE
 

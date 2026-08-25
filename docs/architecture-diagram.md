@@ -34,7 +34,7 @@ flowchart TB
     end
 
     %% Frontend → Backend communication
-    UI -->|"HTTPS REST + SSE\n(VITE_API_BASE_URL)"| API
+    UI -->|"HTTPS REST + SSE\n(API_BASE_URL)"| API
 
     %% Auth flow
     UI -->|"Popup /auth/login"| GHOAuth

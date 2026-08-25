@@ -282,7 +282,7 @@ def build():
     # ── Environment variables ────────────────────────────────────────────────
     pdf.section_title("Environment Variables", GREY)
     env_rows = [
-        ["VITE_API_BASE_URL", "Frontend (Vercel)", "Cloud Run backend URL; required for prod builds"],
+        ["API_BASE_URL", "Frontend (Vercel)", "Cloud Run backend URL; required for prod builds"],
         ["BACKEND_URL", "Backend (Cloud Run)", "Self-referencing URL used in OAuth redirect_uri"],
         ["FRONTEND_URL", "Backend (Cloud Run)", "Vercel app URL; used in post-OAuth redirect"],
         ["CORS_ORIGINS", "Backend (Cloud Run)", "Comma-separated allowed origins for CORS"],
