@@ -245,6 +245,102 @@ export async function fetchAllResultPages(
 interface UserLike { login: string }
 
 // ---------------------------------------------------------------------------
+// GitHub token validation
+// ---------------------------------------------------------------------------
+
+/** Scopes the app asks for on a classic PAT (mirrors the help text in FetchView). */
+export const REQUIRED_SCOPES = ['read:user', 'public_repo'] as const
+
+export interface TokenValidation {
+  valid: boolean
+  login?: string
+  /** Classic-PAT scopes. Empty for fine-grained tokens, which don't use them. */
+  scopes?: string[]
+  /** Required scopes absent from a classic PAT. Never populated for fine-grained. */
+  missingScopes?: string[]
+  /** True when GitHub reports no classic scopes — a fine-grained PAT or App token. */
+  fineGrained?: boolean
+  rateLimit?: { remaining: number; limit: number }
+  error?: string
+}
+
+/** Check a PAT against GitHub directly from the browser.
+ *
+ *  Goes straight to api.github.com rather than through our backend: GitHub sends
+ *  `access-control-allow-origin: *` and exposes `X-OAuth-Scopes` and the
+ *  rate-limit headers via `access-control-expose-headers`, so the browser can
+ *  read everything needed. That avoids adding an endpoint whose only job would
+ *  be to relay a credential we would then have to rate-limit and log around.
+ *
+ *  Deliberately a bare fetch — no `credentials`, no CSRF header. Those belong to
+ *  our own API; sending our session cookie to github.com would be wrong.
+ */
+export async function validateGitHubToken(token: string): Promise<TokenValidation> {
+  const trimmed = token.trim()
+  if (!trimmed) return { valid: false, error: 'Enter a token first.' }
+
+  let res: Response
+  try {
+    res = await fetch('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${trimmed}`,
+        Accept: 'application/vnd.github+json',
+      },
+    })
+  } catch {
+    return { valid: false, error: 'Could not reach GitHub. Check your connection.' }
+  }
+
+  // GitHub omits these entirely on some errors (a real 401 carries none), and
+  // Number(null) is 0 — so read them as "absent" rather than "zero", otherwise a
+  // header-less 403 gets reported as a rate limit that was never hit.
+  const num = (name: string): number | null => {
+    const raw = res.headers.get(name)
+    if (raw === null) return null
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : null
+  }
+  const limit = num('x-ratelimit-limit')
+  const remaining = num('x-ratelimit-remaining')
+  const rateLimit =
+    limit !== null && remaining !== null && limit > 0 ? { limit, remaining } : undefined
+
+  if (res.status === 401) {
+    return { valid: false, error: 'Token is invalid or has expired.', rateLimit }
+  }
+  if (res.status === 403) {
+    return {
+      valid: false,
+      rateLimit,
+      error: remaining === 0
+        ? 'Rate limit exceeded for this token — wait for the reset.'
+        : 'GitHub refused this token (it may be blocked or SSO-restricted).',
+    }
+  }
+  if (!res.ok) {
+    return { valid: false, error: `GitHub returned HTTP ${res.status}.`, rateLimit }
+  }
+
+  const user = await res.json().catch(() => ({} as { login?: string }))
+
+  // Fine-grained PATs and GitHub App tokens report no classic scopes. An empty
+  // header therefore means "cannot tell", not "no permissions" — warning about
+  // missing scopes there would be wrong, and the token may work perfectly.
+  const raw = res.headers.get('x-oauth-scopes')
+  const scopes = (raw ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  const fineGrained = scopes.length === 0
+
+  return {
+    valid: true,
+    login: user.login,
+    scopes,
+    fineGrained,
+    missingScopes: fineGrained ? [] : REQUIRED_SCOPES.filter(s => !scopes.includes(s)),
+    rateLimit,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Churn / retention history
 // ---------------------------------------------------------------------------
 

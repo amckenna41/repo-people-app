@@ -1,5 +1,5 @@
 fastapi>=0.141.1
-uvicorn[standard]>=0.52.1
+uvicorn[standard]>=0.52.4
 python-dotenv>=1.2.2
 sse-starlette>=3.4.8
 aiosqlite>=0.22.1

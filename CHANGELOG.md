@@ -90,6 +90,11 @@ Findings from a full-codebase security and correctness audit.
 
 ## [Unreleased] — 2026-07-14
 
+### Documentation
+
+- **README.md** — Centered the `repo-people-app` availability line on the main README to improve visual layout and consistency with the project banner.
+
+
 ### Security
 
 - **Jobs are now scoped to their creator (IDOR fix).** Previously every endpoint was unauthenticated and `GET /jobs` listed *all* jobs to *all* visitors, so anyone could read, export, compare, rename, or delete anyone else's harvested data. A new `owner_key` column (`backend/store.py`) scopes each job to its creator — the GitHub login for OAuth users, or an anonymous httponly `rp_client` cookie otherwise. `GET /jobs` filters to the caller (`load_jobs_list(owner_key)`); `/results`, `/summary`, `/top`, `/export/*`, `/compare`, `/compare/multi`, `/share`, `DELETE`, `PATCH`, `/cancel`, and `/stream` all resolve jobs through `_get_owned_job()` and return `404` for jobs the caller doesn't own (existence is not leaked). Legacy jobs with a `NULL` owner remain public for back-compat.

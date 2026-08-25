@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const fetchMocker = (globalThis as any).fetchMocker
 import {
   MAX_CLIENT_ROWS,
+  validateGitHubToken,
   beaconCancelJob,
   cancelJob,
   fetchAllResultPages,
@@ -501,5 +502,132 @@ describe('fetchAllResultPages', () => {
     const url = new URL(fetchMocker.requests()[0].url)
     expect(url.searchParams.get('q')).toBe('alice')
     expect(url.searchParams.get('hide_bots')).toBe('true')
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// validateGitHubToken
+// ---------------------------------------------------------------------------
+// Talks straight to api.github.com (which sends CORS `*` and exposes the scope
+// and rate-limit headers), so no backend endpoint is involved.
+
+function ghResponse(
+  body: unknown,
+  init: { status?: number; scopes?: string | null; remaining?: string; limit?: string } = {},
+) {
+  const headers: Record<string, string> = {}
+  if (init.scopes !== null) headers['x-oauth-scopes'] = init.scopes ?? 'read:user, public_repo'
+  headers['x-ratelimit-limit'] = init.limit ?? '5000'
+  headers['x-ratelimit-remaining'] = init.remaining ?? '4999'
+  return [JSON.stringify(body), { status: init.status ?? 200, headers }] as [string, object]
+}
+
+describe('validateGitHubToken', () => {
+  it('does not call the network for an empty token', async () => {
+    const res = await validateGitHubToken('   ')
+    expect(res.valid).toBe(false)
+    expect(fetchMocker.requests()).toHaveLength(0)
+  })
+
+  it('calls GitHub with a Bearer header and no cookies', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }))
+    await validateGitHubToken('ghp_abc')
+    const req = fetchMocker.requests()[0]
+    expect(req.url).toBe('https://api.github.com/user')
+    expect(req.headers.get('Authorization')).toBe('Bearer ghp_abc')
+    // Our own API's cookie/CSRF machinery must not leak to github.com.
+    expect(req.credentials).not.toBe('include')
+    expect(req.headers.get('X-Requested-With')).toBeNull()
+  })
+
+  it('reports a valid classic token with login, scopes and rate limit', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }))
+    const res = await validateGitHubToken('ghp_abc')
+    expect(res.valid).toBe(true)
+    expect(res.login).toBe('octocat')
+    expect(res.scopes).toEqual(['read:user', 'public_repo'])
+    expect(res.missingScopes).toEqual([])
+    expect(res.rateLimit).toEqual({ limit: 5000, remaining: 4999 })
+  })
+
+  it('flags a required scope the token is missing', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }, { scopes: 'read:user' }))
+    const res = await validateGitHubToken('ghp_abc')
+    expect(res.valid).toBe(true)
+    expect(res.missingScopes).toEqual(['public_repo'])
+  })
+
+  it('treats a token with no classic scopes as fine-grained, not as missing scopes', async () => {
+    // Fine-grained PATs and App tokens report an empty scope header. Warning
+    // "missing public_repo" there would be wrong — the token may work fine.
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }, { scopes: '' }))
+    const res = await validateGitHubToken('github_pat_abc')
+    expect(res.valid).toBe(true)
+    expect(res.fineGrained).toBe(true)
+    expect(res.missingScopes).toEqual([])
+  })
+
+  it('treats an absent scope header the same way', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }, { scopes: null }))
+    const res = await validateGitHubToken('github_pat_abc')
+    expect(res.fineGrained).toBe(true)
+    expect(res.missingScopes).toEqual([])
+  })
+
+  it('reports an expired or invalid token on 401', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ message: 'Bad credentials' }, { status: 401 }))
+    const res = await validateGitHubToken('ghp_bad')
+    expect(res.valid).toBe(false)
+    expect(res.error).toMatch(/invalid or has expired/i)
+  })
+
+  it('distinguishes a rate-limited 403 from a refused one', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({}, { status: 403, remaining: '0' }))
+    const limited = await validateGitHubToken('ghp_abc')
+    expect(limited.valid).toBe(false)
+    expect(limited.error).toMatch(/rate limit/i)
+
+    fetchMocker.mockResponseOnce(...ghResponse({}, { status: 403, remaining: '100' }))
+    const refused = await validateGitHubToken('ghp_abc')
+    expect(refused.valid).toBe(false)
+    expect(refused.error).toMatch(/refused/i)
+  })
+
+  it('does not claim a rate limit when GitHub sends no rate-limit headers', async () => {
+    // A real 401 carries none, and Number(null) is 0 — so an absent header must
+    // not be read as "zero requests remaining".
+    fetchMocker.mockResponseOnce(JSON.stringify({ message: 'Forbidden' }), { status: 403 })
+    const res = await validateGitHubToken('ghp_abc')
+    expect(res.valid).toBe(false)
+    expect(res.rateLimit).toBeUndefined()
+    expect(res.error).toMatch(/refused/i)
+    expect(res.error).not.toMatch(/rate limit/i)
+  })
+
+  it('omits rateLimit entirely when the headers are absent on a 401', async () => {
+    fetchMocker.mockResponseOnce(JSON.stringify({ message: 'Bad credentials' }), { status: 401 })
+    const res = await validateGitHubToken('ghp_bad')
+    expect(res.rateLimit).toBeUndefined()
+  })
+
+  it('surfaces an unexpected status rather than claiming validity', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({}, { status: 500 }))
+    const res = await validateGitHubToken('ghp_abc')
+    expect(res.valid).toBe(false)
+    expect(res.error).toMatch(/HTTP 500/)
+  })
+
+  it('handles a network failure without throwing', async () => {
+    fetchMocker.mockRejectOnce(new Error('Failed to fetch'))
+    const res = await validateGitHubToken('ghp_abc')
+    expect(res.valid).toBe(false)
+    expect(res.error).toMatch(/Could not reach GitHub/i)
+  })
+
+  it('trims surrounding whitespace before sending', async () => {
+    fetchMocker.mockResponseOnce(...ghResponse({ login: 'octocat' }))
+    await validateGitHubToken('  ghp_abc  ')
+    expect(fetchMocker.requests()[0].headers.get('Authorization')).toBe('Bearer ghp_abc')
   })
 })

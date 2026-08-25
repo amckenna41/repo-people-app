@@ -11,6 +11,8 @@ A full-stack web application that uses the `repo-people` Python package to explo
   <img src="https://raw.githubusercontent.com/amckenna41/repo-people/refs/heads/main/images/logo.png" alt="repo-people logo" width="300"/>
 </p>
 
+# The <b>repo-people-app</b> is available [here](https://repo-people.vercel.app/).
+
 ## Table of Contents
   * [Introduction](#introduction)
   * [Background](#background)
@@ -140,7 +142,7 @@ docker compose up --build
 | Layer | Technology |
 |---|---|
 | Backend | Python 3.11, FastAPI, Uvicorn, sse-starlette |
-| Frontend | React 18, TypeScript, Vite, Tailwind CSS |
+| Frontend | React 19, TypeScript, Vite 8, Tailwind CSS v4 |
 | Charts | Recharts |
 | Data grid | TanStack Table |
 | Icons | Lucide React |

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, ShieldCheck, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw } from 'lucide-react'
 import { Github } from '../components/GithubIcon'
-import { postFetch, postImport, cancelJob, openAuthPopup, openJobStream, beaconCancelJob } from '../utils/api'
+import { postFetch, postImport, cancelJob, openAuthPopup, openJobStream, beaconCancelJob, validateGitHubToken, type TokenValidation } from '../utils/api'
 import { friendlyFetchError } from '../utils/errors'
 import type { JobInfo, AuthUser } from '../types'
 import { ALL_ROLES, ROLE_COLORS } from '../types'
@@ -96,6 +96,8 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
   const [elapsed, setElapsed] = useState(0)
   const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([])
   const [pendingToken, setPendingToken] = useState<string>('')
+  const [tokenCheck, setTokenCheck] = useState<TokenValidation | null>(null)
+  const [checkingToken, setCheckingToken] = useState(false)
 
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
@@ -458,6 +460,15 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
     setPendingToken('')
   }
 
+  async function handleValidateToken() {
+    setCheckingToken(true)
+    try {
+      setTokenCheck(await validateGitHubToken(token))
+    } finally {
+      setCheckingToken(false)
+    }
+  }
+
   function continueWithoutToken() {
     setShowTokenModal(false)
     setError(null)
@@ -671,15 +682,66 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                   </div>
                 </div>
               </div>
-              <input
-                type="password"
-                className="input"
-                placeholder="ghp_••••••••••••••••••••"
-                value={token}
-                onChange={e => setToken(e.target.value.replace(/[^\x20-\x7E]/g, '').trim())}
-                disabled={running}
-                autoComplete="off"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  className="input flex-1 min-w-0"
+                  placeholder="ghp_••••••••••••••••••••"
+                  value={token}
+                  onChange={e => {
+                    setToken(e.target.value.replace(/[^\x20-\x7E]/g, '').trim())
+                    // Any edit invalidates the previous verdict.
+                    setTokenCheck(null)
+                  }}
+                  disabled={running}
+                  autoComplete="off"
+                />
+                <button
+                  type="button"
+                  onClick={handleValidateToken}
+                  disabled={!token || checkingToken || running}
+                  title={token ? 'Check this token against GitHub' : 'Enter a token first'}
+                  className="btn-secondary shrink-0 flex items-center gap-1.5 text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {checkingToken
+                    ? <><Loader2 size={13} className="animate-spin" /> Checking…</>
+                    : <><ShieldCheck size={13} /> Validate</>}
+                </button>
+              </div>
+              {tokenCheck && (
+                <div
+                  className="mt-1.5 text-xs flex items-start gap-1.5 rounded-md px-2 py-1.5"
+                  style={{
+                    background: tokenCheck.valid ? 'rgba(5,150,105,0.10)' : 'rgba(220,38,38,0.10)',
+                    border: `1px solid ${tokenCheck.valid ? 'rgba(5,150,105,0.3)' : 'rgba(220,38,38,0.3)'}`,
+                    color: tokenCheck.valid ? '#6ee7b7' : '#fca5a5',
+                  }}
+                >
+                  {tokenCheck.valid
+                    ? <CheckCircle2 size={13} className="shrink-0 mt-px" />
+                    : <AlertCircle size={13} className="shrink-0 mt-px" />}
+                  <span className="min-w-0">
+                    {tokenCheck.valid ? (
+                      <>
+                        Valid{tokenCheck.login && <> — signed in as <strong>@{tokenCheck.login}</strong></>}
+                        {tokenCheck.rateLimit && <> · {tokenCheck.rateLimit.remaining.toLocaleString()}/{tokenCheck.rateLimit.limit.toLocaleString()} requests left</>}
+                        {tokenCheck.missingScopes && tokenCheck.missingScopes.length > 0 && (
+                          <span className="block mt-0.5 text-amber-300">
+                            Missing scope{tokenCheck.missingScopes.length > 1 ? 's' : ''}:{' '}
+                            <code className="bg-white/10 px-1 rounded-sm">{tokenCheck.missingScopes.join(', ')}</code>
+                            {' '}— some roles may fail to fetch.
+                          </span>
+                        )}
+                        {tokenCheck.fineGrained && (
+                          <span className="block mt-0.5 text-gray-400">
+                            Fine-grained token — scopes can&apos;t be checked here. Ensure it grants read access to public repositories.
+                          </span>
+                        )}
+                      </>
+                    ) : tokenCheck.error}
+                  </span>
+                </div>
+              )}
               <p className="text-xs text-gray-500 mt-1">
                 Or{' '}
                 <button

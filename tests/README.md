@@ -50,3 +50,7 @@ npm run test:coverage # with coverage report
 ```
 
 Frontend tests use **Vitest** + **@testing-library/react** with a jsdom environment. `fetch` is mocked globally via `vitest-fetch-mock`.
+
+## Notes
+
+- Documentation: the main `README.md` was updated to centre the `repo-people-app` availability heading — this is a cosmetic docs change and does not affect tests.

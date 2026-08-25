@@ -372,20 +372,23 @@ export default function App() {
         backdropFilter: 'blur(16px)',
         boxShadow: '0 0 40px rgba(124,58,237,0.08)',
       }}>
-        <div className="max-w-(--breakpoint-xl) mx-auto px-4 h-14 flex items-center">
+        <div className="max-w-(--breakpoint-xl) mx-auto px-4 h-16 flex items-center">
           {/* Left: logo */}
           <div className="flex-1 flex items-center">
             <button
               onClick={() => setView('fetch')}
-              className="flex items-center gap-2 font-bold text-lg transition-opacity hover:opacity-80"
-              style={{
-                background: 'linear-gradient(90deg, #a78bfa, #60a5fa)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-              }}
+              className="flex items-center gap-2.5 transition-opacity hover:opacity-80"
             >
-              <Github size={22} style={{ color: '#a78bfa', fill: 'none' }} />
-              <span>repo-people</span>
+              <span
+                className="font-bold text-xl"
+                style={{
+                  background: 'linear-gradient(90deg, #a78bfa, #60a5fa)',
+                  WebkitBackgroundClip: 'text',
+                  WebkitTextFillColor: 'transparent',
+                }}
+              >
+                repo-people
+              </span>
             </button>
           </div>
           {/* Center: nav */}
@@ -491,6 +494,25 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 max-w-(--breakpoint-xl) mx-auto w-full px-4 py-6">
+        {/* Brand mark at the top of the body. Cropped to the circular mark only —
+            the source image carries its own "repo-people" wordmark, which would
+            duplicate the header text. Decorative: the header already names the
+            app, so alt text here would just be read out twice. Served from
+            /public rather than hotlinked from raw.githubusercontent.com, which
+            is absent from the CSP's img-src and would be blocked in production. */}
+        <div className="flex justify-center pb-6">
+          {/* Source asset is 512px, so this stays sharp up to 256 CSS px even
+              on a 2x display. */}
+          <img
+            src="/logo.png"
+            alt=""
+            aria-hidden="true"
+            width={192}
+            height={192}
+            className="w-36 h-36 sm:w-48 sm:h-48 object-contain"
+          />
+        </div>
+
         <div className={view !== 'fetch' ? 'hidden' : ''}>
           <ErrorBoundary>
             <FetchView
