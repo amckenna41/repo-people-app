@@ -224,6 +224,10 @@ _CSRF_EXEMPT_PATHS = frozenset({"/auth/callback"})
 
 @app.middleware("http")
 async def require_csrf_header(request: Request, call_next):
+    # Allow preflight `OPTIONS` through so CORSMiddleware can answer it.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     if (
         request.method in _CSRF_METHODS
         and request.url.path not in _CSRF_EXEMPT_PATHS
