@@ -8,7 +8,7 @@ aiosqlite>=0.22.1
 psycopg[binary,pool]>=3.2.0
 httpx>=0.28.1
 # Fernet encryption for OAuth session tokens at rest (see SESSION_TOKEN_KEY).
-cryptography>=43.0.0
+cryptography>=50.0.0
 # repo-people is the data engine (role fetchers + profile lookups in worker.py).
 # Pinned to an exact PyPI release for reproducible builds across every deploy
 # target (local, Vercel, Cloud Run, CI). Bump deliberately — Dependabot opens a
