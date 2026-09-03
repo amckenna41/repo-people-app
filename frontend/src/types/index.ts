@@ -116,6 +116,27 @@ export const ALL_ROLES = [
 
 export type Role = typeof ALL_ROLES[number]
 
+/** Roles ordered by depth of engagement, shallowest first — drives the
+ *  Contributor Funnel and Social Presence charts.
+ *
+ *  Derived from ALL_ROLES rather than hand-listed: the two charts previously
+ *  hard-coded an 8-role array that omitted `fork_owners`, so anyone whose only
+ *  role was that one vanished from both charts instead of showing a zero row.
+ *  A build error here is the point — adding a role to ALL_ROLES must force a
+ *  decision about where it sits in the funnel. */
+export const ROLE_FUNNEL_ORDER: readonly Role[] = [
+  'stargazers',
+  'watchers',
+  'fork_owners',
+  'dependents',
+  'issue_authors',
+  'pr_authors',
+  'contributors',
+  'commit_authors',
+  'maintainers',
+]
+
+
 export const ROLE_COLORS: Record<string, string> = {
   contributors: 'bg-emerald-800 text-emerald-200',
   maintainers: 'bg-purple-800 text-purple-200',

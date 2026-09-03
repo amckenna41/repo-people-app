@@ -11,7 +11,7 @@ A full-stack web application that uses the `repo-people` Python package to explo
   <img src="https://raw.githubusercontent.com/amckenna41/repo-people/refs/heads/main/images/logo.png" alt="repo-people logo" width="300"/>
 </p>
 
-# The <b>repo-people-app</b> is available [here](https://repo-people.vercel.app/).
+<h2 align="center">The <b>repo-people-app</b> is available <a href="https://repo-people.vercel.app/">here</a>.</h2>
 
 ## Table of Contents
   * [Introduction](#introduction)
@@ -124,14 +124,24 @@ docker compose up --build
 | DELETE | `/jobs/{job_id}` | Delete a job |
 | PATCH | `/jobs/{job_id}` | Rename a job (body: `{"label": "..."}`) |
 | PATCH | `/jobs/{job_id}/tags` | Update tags on a job (body: `{"tags": [...]}`) |
-| GET | `/results/{job_id}` | Paginated user data — accepts `?page=1&page_size=200` |
+| GET | `/results/{job_id}` | Paginated user data — accepts `?page=1&page_size=200`, all filter params, and returns any `warnings` recorded during the fetch |
 | GET | `/results/{job_id}/summary` | Aggregated summary stats (cached after first call) |
 | GET | `/results/{job_id}/top` | Top N users by field |
 | POST | `/compare` | Compare two jobs |
-| POST | `/compare/multi` | Compare more than two jobs |
+| POST | `/compare/multi` | Compare 2–5 jobs (duplicate ids are rejected with `422`) |
 | GET | `/results/{job_id}/export/json` | Download results as JSON |
 | GET | `/results/{job_id}/export/csv` | Download results as CSV |
 | POST | `/import` | Import a previously exported JSON file (max 5 MB; unsafe URLs stripped) |
+| POST | `/results/{job_id}/share` | Mint a 24-hour read-only share token |
+| GET | `/share/{token}` | Paginated results for a share token (no auth) |
+| GET | `/jobs/{job_id}/history` | Joiners, leavers and retention across runs of the same repo |
+| GET / POST | `/schedules` | List or create a scheduled re-fetch (max 10 per caller) |
+| PATCH / DELETE | `/schedules/{id}` | Enable/disable or delete a schedule |
+| GET | `/auth/login`, `/auth/callback`, `/auth/me` · POST `/auth/logout` | GitHub OAuth |
+
+> **Rate limiting.** `/fetch` and `/import` are limited per caller *and* per IP. A `429` carries a `Retry-After` header with the seconds until a slot frees up (exposed via CORS, so a cross-origin frontend can read it).
+
+> **Retention.** The newest `MAX_JOBS_PER_OWNER` jobs per caller are kept; older ones are evicted when a new job starts, cascading to their share links and schedules.
 
 > **Job scoping.** Jobs are private to the caller — identified by the GitHub login for OAuth users, or an anonymous `rp_client` cookie otherwise. `GET /jobs` returns only your jobs, and every job-specific endpoint returns `404` for jobs you don't own (legacy jobs created before scoping have no owner and remain public). `/fetch` and `/import` are rate-limited per caller. Send credentials (cookies) with every request; for a cross-origin frontend/backend split set `COOKIE_SAMESITE=none`.
 
@@ -185,7 +195,7 @@ The backend is designed to run as a single long-lived container, which maps well
 | `backend/requirements.cloudrun.txt` | Python deps without the local `file://` reference |
 | `cloudrun-service.yaml` | Declarative Cloud Run service definition |
 | `.github/workflows/deploy-cloud-run.yml` | CI/CD — builds image and deploys on push to `main` |
-| `frontend/.env.production` | Sets `VITE_API_BASE_URL` for the production frontend build |
+| `frontend/.env.production` | Sets `API_BASE_URL` for the production frontend build |
 
 ### One-time Google Cloud setup
 
@@ -256,9 +266,16 @@ npm run build   # output in frontend/dist/ — deploy to Vercel / Firebase Hosti
 | `COOKIE_SAMESITE` | `lax` | Set to `none` for a cross-origin frontend/backend split (forces `Secure`) |
 | `ALLOW_DEV_CLEAR` | _(unset)_ | Set to `1` to enable the guarded `POST /clear_cache` dev endpoint |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | _(unset)_ | Enable GitHub OAuth sign-in |
-| `FRONTEND_URL` / `BACKEND_URL` | localhost dev URLs | OAuth redirect targets; `BACKEND_URL` over HTTPS auto-enables `Secure` cookies |
+| `FRONTEND_URL` / `BACKEND_URL` | localhost dev URLs | OAuth redirect targets; `BACKEND_URL` over HTTPS auto-enables `Secure` cookies. **Required whenever OAuth is enabled behind a proxy or on a public host** — the `redirect_uri` is never derived from request headers, so an unset value makes `/auth/login` return `500` for anything but a local, unproxied request |
 | `SESSION_TOKEN_KEY` | _(ephemeral)_ | Fernet key encrypting stored OAuth tokens. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Unset means a per-process key, which signs every user out on restart |
 | `REPO_PEOPLE_DB` | `backend/repo_people_jobs.db` | SQLite job-store path |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string. Without it the app falls back to SQLite, which on Cloud Run lives in `/tmp` and is wiped on every cold start — see [`docs/supabase-evaluation.md`](docs/supabase-evaluation.md) |
+| `MAX_JOBS_PER_OWNER` | `50` | Retention cap: the newest N jobs per caller are kept and older ones evicted when a new job starts. `0` disables |
+| `MAX_CONCURRENT_JOBS` | `3` | Fetch jobs allowed to run at once on one instance. Further jobs queue and report "Queued — waiting for a free fetch slot…" on their progress stream |
+| `FETCH_THREAD_POOL_SIZE` | `24` | Threads in the dedicated fetch executor. Kept off asyncio's shared pool so a burst of fetches cannot starve the rest of the app |
+| `SQLITE_BUSY_TIMEOUT_MS` | `15000` | How long SQLite waits for a competing writer. The driver default (5s) is easily exceeded when several jobs finish together, surfacing as "database is locked" |
+| `SCHEDULE_TICK_SECONDS` | `300` | How often the scheduled re-fetch loop checks for due schedules |
+| `EXPOSE_DOCS` | _(unset)_ | Set to `1` to serve `/docs`, `/redoc` and `/openapi.json`. Off by default so a public deployment does not advertise its whole API surface |
 
 ## Views
 
@@ -288,6 +305,22 @@ npm run test:coverage # with coverage report
 
 Frontend tests use **Vitest** + **@testing-library/react** with a jsdom environment.
 
+### Coverage
+
+**318 passed backend**, **214 frontend**. Neither suite makes a real network call — a
+guard asserts this for the backend, and the frontend stubs `fetch`.
+
+| Area | Suite |
+|---|---|
+| API routes | `test_api_jobs`, `test_api_results`, `test_api_compare`, `test_api_import`, `test_api_ownership` |
+| Store & schema | `test_store` (incl. `logins_json` denormalisation and backfill) |
+| Security | `test_security` — CSRF, OAuth state binding, `redirect_uri` derivation, token encryption, callback response shape, schedule cap |
+| Performance | `test_performance` — metadata-only reads, executor limits, SQLite contention, persisted warnings, `Retry-After`, retention |
+| Worker | `test_worker` — per-role error classification |
+| Repo hygiene | `test_repo_hygiene` — conflict markers, requirements parse, lockfile sync |
+| Frontend utils | `api`, `colors`, `csv`, `errors`, `estimate`, `localResults`, `segments`, `apiFilters` |
+| Frontend components | `UserTable`, `RoleBadges` |
+
 ## Changelog
 See [CHANGELOG.md](CHANGELOG.md) for a full history of additions, changes, fixes, and security improvements.
 
@@ -300,13 +333,13 @@ If you have any questions or comments, please contact amckenna41@qub.ac.uk or ra
 ## License
 Distributed under the MIT License. See [`LICENSE`][license] for more details. 
 
+## Support
+[<img src="https://img.shields.io/github/stars/amckenna41/repo-people?color=green&label=star%20it%20on%20GitHub" width="132" height="20" alt="Star it on GitHub">](https://github.com/amckenna41/repo-people)
 
-<!-- [<img src="https://img.shields.io/github/stars/amckenna41/repo-people-app?color=green&label=star%20it%20on%20GitHub" width="132" height="20" alt="Star it on GitHub">](https://github.com/amckenna41/repo-people-app) -->
-
-
-<!-- <a href="https://www.buymeacoffee.com/amckenna41" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a> -->
+<a href="https://www.buymeacoffee.com/amckenna41" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
 
 [Back to top](#TOP)
+
 
 [Issues]: https://github.com/amckenna41/repo-people-app/issues
 [license]: https://github.com/amckenna41/repo-people-app/blob/master/LICENSE

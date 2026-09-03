@@ -6,14 +6,12 @@ import ResultsView from './views/ResultsView'
 import CompareView from './views/CompareView'
 import GlobalSearchModal from './components/GlobalSearchModal'
 import ErrorBoundary from './components/ErrorBoundary'
+import { useModalEscape } from './hooks/useModalEscape'
 import type { JobInfo, UserRecord, View, AuthUser } from './types'
 import { fetchJobs, deleteJob, updateJobTags, invalidateJobCache, fetchAuthMe, logoutAuth, openAuthPopup, fetchSharedJob, openJobStream } from './utils/api'
 
 function HelpModal({ onClose }: { onClose: () => void }) {
-  useEffect(() => {
-    document.body.style.overflow = 'hidden'
-    return () => { document.body.style.overflow = '' }
-  }, [])
+  useModalEscape(onClose)
   const steps = [
     {
       icon: <Key size={20} />,
@@ -35,7 +33,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
       bullets: [
         'Owner — the GitHub username or organisation (e.g. "facebook")',
         'Repo — the repository name (e.g. "react")',
-        'Roles — choose from Contributors, Stargazers, Forkers, Watchers, Issue Authors, PR Authors, Maintainers',
+        'Roles — Contributors, Maintainers, Stargazers, Watchers, Issue Authors, PR Authors, Fork Owners, Commit Authors, and Dependents (all 9 are selectable)',
         'Click Start Fetch and watch the live progress log',
         "Once done you're automatically taken to the Results page",
       ],
@@ -210,6 +208,10 @@ export default function App() {
   const [showHelp, setShowHelp] = useState(false)
   const [showGlobalSearch, setShowGlobalSearch] = useState(false)
   const [allJobUsers, setAllJobUsers] = useState<Record<string, UserRecord[]>>({})
+  // Rows that exist only in this browser — a shared link has no backend job,
+  // so ResultsView must render these instead of fetching. Kept separate from
+  // allJobUsers, which is a cache of *fetched* jobs and must stay refreshable.
+  const [sharedJobUsers, setSharedJobUsers] = useState<Record<string, UserRecord[]>>({})
   const [authUser, setAuthUser] = useState<AuthUser | null>(null)
 
   // Persist jobs to localStorage whenever they change
@@ -252,10 +254,9 @@ export default function App() {
       }
       setJobs(prev => [...prev, newJob])
       setActiveJobId(tempId)
-      setAllJobUsers(prev => ({
-        ...prev,
-        [tempId]: Object.values(data.users) as UserRecord[],
-      }))
+      const sharedUsers = Object.values(data.users) as UserRecord[]
+      setAllJobUsers(prev => ({ ...prev, [tempId]: sharedUsers }))
+      setSharedJobUsers(prev => ({ ...prev, [tempId]: sharedUsers }))
       setView('results')
       window.location.hash = 'results'
     }).catch(() => { /* invalid/expired token — ignore */ })
@@ -513,6 +514,12 @@ export default function App() {
           />
         </div>
 
+        {/* FetchView stays mounted even when hidden: it owns the running job,
+            its SSE stream and the live log, all of which would be destroyed by
+            an unmount. ResultsView and CompareView are unmounted instead —
+            keeping them alive let a background page-walk, history fetch and
+            schedule poll carry on after the user had switched tabs, and kept
+            Recharts and the world map re-rendering off-screen. */}
         <div className={view !== 'fetch' ? 'hidden' : ''}>
           <ErrorBoundary>
             <FetchView
@@ -525,16 +532,16 @@ export default function App() {
             />
           </ErrorBoundary>
         </div>
-        <div className={view !== 'results' ? 'hidden' : ''}>
+        {view === 'results' && (
           <ErrorBoundary>
-            <ResultsView jobs={jobs} activeJobId={activeJobId} setActiveJobId={setActiveJobId} groupJobIds={groupJobIds} onUsersLoaded={handleUsersLoaded} onJobUpdate={updateJob} onJobDelete={removeJob} onJobTagsUpdate={updateJobTagsHandler} onJobRefresh={handleJobRefresh} />
+            <ResultsView jobs={jobs} activeJobId={activeJobId} setActiveJobId={setActiveJobId} groupJobIds={groupJobIds} onUsersLoaded={handleUsersLoaded} onJobUpdate={updateJob} onJobDelete={removeJob} onJobTagsUpdate={updateJobTagsHandler} onJobRefresh={handleJobRefresh} localJobUsers={sharedJobUsers} />
           </ErrorBoundary>
-        </div>
-        <div className={view !== 'compare' ? 'hidden' : ''}>
+        )}
+        {view === 'compare' && (
           <ErrorBoundary>
             <CompareView jobs={jobs} />
           </ErrorBoundary>
-        </div>
+        )}
       </main>
 
       {/* Footer */}

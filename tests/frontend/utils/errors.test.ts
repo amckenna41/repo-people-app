@@ -79,6 +79,16 @@ describe('friendlyFetchError', () => {
     expect(msg.toLowerCase()).toContain('could not reach')
   })
 
+  it('does not leak the backend URL or env var names into the message', () => {
+    // This message is rendered in the UI. It used to interpolate the configured
+    // backend URL and name the env var that sets it, handing an attacker the
+    // internal origin and the deployment's config vocabulary for free.
+    const msg = friendlyFetchError('Failed to fetch')
+    expect(msg).not.toMatch(/API_BASE_URL/i)
+    expect(msg).not.toMatch(/https?:\/\//)
+    expect(msg).not.toMatch(/\.run\.app|vercel\.app|localhost/i)
+  })
+
   it('returns the original message when no pattern matches', () => {
     const raw = 'Some completely unknown error occurred'
     expect(friendlyFetchError(raw)).toBe(raw)

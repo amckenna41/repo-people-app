@@ -244,9 +244,18 @@ class TestCompareMulti:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_same_job_twice_in_all(self, async_client):
+    async def test_duplicate_job_ids_are_rejected(self, async_client):
+        """Previously returned 200 with wrong numbers: the repeat inflated n,
+        shifting the "in all" threshold and splitting one job into two
+        "exclusive" buckets. Silently wrong statistics, so reject instead."""
         jid = await _seed_done_job({"alice": SAMPLE_USERS["alice"]})
         resp = await async_client.post("/compare/multi", json={"job_ids": [jid, jid]})
-        assert resp.status_code == 200
-        logins = [u["login"] for u in resp.json()["in_all"]]
-        assert "alice" in logins
+        assert resp.status_code == 422
+        assert "duplicate" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_detected_among_distinct_ids(self, async_client):
+        a = await _seed_done_job({"alice": SAMPLE_USERS["alice"]})
+        b = await _seed_done_job({"bob": SAMPLE_USERS["bob"]})
+        resp = await async_client.post("/compare/multi", json={"job_ids": [a, b, a]})
+        assert resp.status_code == 422

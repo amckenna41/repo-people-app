@@ -6,11 +6,14 @@ import {
   type ResultFilters, type JobHistory, type Schedule,
 } from '../utils/api'
 import type { JobInfo, UserRecord, SummaryData } from '../types'
-import { ROLE_COLORS } from '../types'
+import { ROLE_COLORS, ROLE_FUNNEL_ORDER } from '../types'
 import UserTable from '../components/UserTable'
 import type { SortingState } from '@tanstack/react-table'
 import { type FilterState, EMPTY_FILTERS } from '../utils/segments'
 import { toCsv, xlsxCell, downloadText } from '../utils/csv'
+import { inlineComputedColors, buildColorVariableOverrides } from '../utils/colors'
+import { filterAndSortUsers, computeSummary } from '../utils/localResults'
+import { useModalEscape } from '../hooks/useModalEscape'
 const UserDrawer = lazy(() => import('../components/UserDrawer'))
 const WorldMap = lazy(() => import('../components/WorldMap'))
 import {
@@ -29,6 +32,10 @@ interface Props {
   onJobDelete?: (job_id: string) => void
   onJobTagsUpdate?: (job_id: string, tags: string[]) => void
   onJobRefresh?: (newJobId: string, label: string) => void
+  /** Result sets held only in the browser, keyed by job id.
+   *  A shared link (`#share=TOKEN`) has no job on the backend, so its rows
+   *  arrive this way and must never be fetched over the network. */
+  localJobUsers?: Record<string, UserRecord[]>
 }
 
 // The table renders the first page immediately, then the rest streams in behind
@@ -56,6 +63,18 @@ function relativeTime(iso?: string): string {
   return `${Math.floor(months / 12)}yr ago`
 }
 
+// Recharts' hover defaults assume a light theme and are unreadable on this dark
+// card: the tooltip label renders in #000 (1.18:1 against the #111827 tooltip —
+// effectively invisible) and the bar cursor is an opaque #ccc band that washes
+// out the hovered row. These restore contrast; #e5e7eb on #111827 is 14.3:1.
+const TOOLTIP_BASE = {
+  contentStyle: { background: '#111827', border: '1px solid #374151', borderRadius: 6 },
+  labelStyle: { color: '#e5e7eb' },
+} as const
+
+/** Subtle highlight for the hovered category, replacing the opaque #ccc default. */
+const BAR_CURSOR = { fill: 'rgba(255,255,255,0.07)' } as const
+
 const PIE_COLORS = ['#0ea5e9', '#6366f1', '#10b981', '#f59e0b']
 const FUNNEL_COLORS = ['#7c3aed','#6d28d9','#2563eb','#0284c7','#0d9488','#059669','#65a30d','#ca8a04']
 
@@ -66,7 +85,7 @@ const TOP_BY_OPTIONS = [
   { key: 'total_public_stars_sampled', label: 'Stars' },
 ]
 
-export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJobIds, onUsersLoaded, onJobUpdate, onJobDelete, onJobTagsUpdate, onJobRefresh }: Props) {
+export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJobIds, onUsersLoaded, onJobUpdate, onJobDelete, onJobTagsUpdate, onJobRefresh, localJobUsers }: Props) {
   const [users, setUsers] = useState<UserRecord[]>([])
   const [summary, setSummary] = useState<SummaryData | null>(null)
   const [topUsers, setTopUsers] = useState<UserRecord[]>([])
@@ -95,6 +114,8 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const [exportPickerFormat, setExportPickerFormat] = useState<'json' | 'csv' | 'xlsx' | null>(null)
   const [exportPickerFields, setExportPickerFields] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
+  // Persisted per-job fetch warnings, e.g. a role that collected nothing.
+  const [jobWarnings, setJobWarnings] = useState<string[]>([])
   const [renamingJobId, setRenamingJobId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -178,6 +199,37 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
   const activeJobIsDone = jobs.find(j => j.job_id === activeJobId)?.status === 'done'
 
+  // Rows the chart aggregates read.
+  //
+  // The background page-walk calls setUsers() once per fetched page, and nine
+  // O(n) aggregates below are keyed on `users` — so every page re-ran all nine
+  // over the whole set so far. They now key on a snapshot that only advances
+  // when loading settles, so the charts compute once per query rather than once
+  // per page. `users` itself still drives the table, which should stream in.
+  const [chartUsers, setChartUsers] = useState<UserRecord[]>([])
+  useEffect(() => {
+    if (loadingMore) return
+    setChartUsers(users)
+  }, [users, loadingMore])
+
+
+  // GET /schedules returns every schedule for the session, across all repos.
+  // Rendering them unfiltered meant switching the Job dropdown changed nothing,
+  // and one repo's panel offered pause/delete for another repo's schedule —
+  // distinguishable only by reading the label.
+  // A shared link's job exists only in this browser — the backend never created
+  // it. Every owner control (rename, delete, refresh, schedule, share) would
+  // 404 against that id, so they are hidden rather than left to fail.
+  const isReadOnly = !!(activeJobId && localJobUsers?.[activeJobId])
+
+  useModalEscape(exportPickerFormat ? () => setExportPickerFormat(null) : null)
+
+  const jobSchedules = useMemo(
+    () => schedules.filter(s => s.source_job_id === activeJobId),
+    [schedules, activeJobId],
+  )
+
+
   // The result set is bigger than we are willing to hold in the browser.
   const truncated = totalUsers > MAX_CLIENT_ROWS
   // Every row we are ever going to have for this query is in `users`. Derived
@@ -222,6 +274,24 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     const token = ++loadTokenRef.current
     setLoading(true)
     setError(null)
+
+    // Shared links carry their rows with them and have no backend job, so
+    // hitting /results/{id} would 404 and leave the whole view blank.
+    const local = localJobUsers?.[jobId]
+    if (local) {
+      const rows = filterAndSortUsers(
+        local, filters, search, sorting[0]?.id,
+        sorting[0] ? (sorting[0].desc ? 'desc' : 'asc') : 'asc',
+      )
+      setUsers(rows)
+      setTotalUsers(rows.length)
+      setUnfilteredTotal(local.length)
+      setSummary(computeSummary(rows))
+      setJobWarnings([])
+      setLoading(false)
+      return
+    }
+
     try {
       // Load first page immediately for fast render; summary fetched in parallel.
       const [pageData, sum] = await Promise.all([
@@ -233,6 +303,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       setUsers(loadedUsers)
       setTotalUsers(pageData.total)
       setUnfilteredTotal(pageData.unfiltered_total ?? pageData.total)
+      setJobWarnings(pageData.warnings ?? [])
       setSummary(sum)
       onUsersLoaded?.(jobId, loadedUsers)
       if (loadedUsers.length < pageData.total) {
@@ -334,6 +405,24 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
         useCORS: true,
         backgroundColor: '#050510',
         logging: false,
+        // Tailwind v4 emits its palette in oklch(), which html2canvas 1.4.1
+        // cannot parse — it throws rather than degrading, so the whole export
+        // failed. Both steps run on the clone; the live page is untouched.
+        onclone: (clonedDoc, element) => {
+          // 1. Redefine the oklch custom properties as rgb(). Every Tailwind
+          //    utility reads the palette through var(), so this fixes all of
+          //    them at once — including <html>/<body>, whose background
+          //    html2canvas inspects before parsing this subtree.
+          const overrides = buildColorVariableOverrides(clonedDoc)
+          if (overrides) {
+            const style = clonedDoc.createElement('style')
+            style.textContent = overrides
+            clonedDoc.head.appendChild(style)
+          }
+          // 2. Safety net for any non-var oklch (none today, but a hand-written
+          //    rule or an inline style would slip past step 1).
+          inlineComputedColors(element)
+        },
       })
       const imgData = canvas.toDataURL('image/png')
       const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
@@ -352,6 +441,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       pdf.save(`repo-people_${label.replace(/\//g, '_')}_report.pdf`)
     } catch (e) {
       console.error('PDF export failed:', e)
+      alert(`PDF export failed: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
       setExporting(false)
     }
@@ -464,7 +554,10 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     lines.push('')
     lines.push('| Role | Count |')
     lines.push('|------|-------|')
-    roleDistData.sort((a, b) => b.count - a.count).forEach(r => {
+    // Copy before sorting: sort() mutates, and roleDistData is derived during
+    // render (React 19 freezes it, so an in-place sort throws).
+    const rolesByCount = [...roleDistData].sort((a, b) => b.count - a.count)
+    rolesByCount.forEach(r => {
       lines.push(`| ${r.role} | ${r.count} |`)
     })
     lines.push('')
@@ -523,26 +616,26 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
   const locationData = useMemo(() => {
     const counts: Record<string, number> = {}
-    users.forEach(u => { if (u.location_normalized) counts[u.location_normalized] = (counts[u.location_normalized] || 0) + 1 })
+    chartUsers.forEach(u => { if (u.location_normalized) counts[u.location_normalized] = (counts[u.location_normalized] || 0) + 1 })
     return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([location, count]) => ({ location, count }))
-  }, [users])
+  }, [chartUsers])
 
   const languageData = useMemo(() => {
     const counts: Record<string, number> = {}
-    users.forEach(u => { ;(u.top_languages ?? []).forEach(([lang]) => { if (lang) counts[lang] = (counts[lang] || 0) + 1 }) })
+    chartUsers.forEach(u => { ;(u.top_languages ?? []).forEach(([lang]) => { if (lang) counts[lang] = (counts[lang] || 0) + 1 }) })
     return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([language, count]) => ({ language, count }))
-  }, [users])
+  }, [chartUsers])
 
   const orgData = useMemo(() => {
     const counts: Record<string, number> = {}
-    users.forEach(u => { ;(u.public_orgs ?? []).forEach(org => { if (org) counts[org] = (counts[org] || 0) + 1 }) })
+    chartUsers.forEach(u => { ;(u.public_orgs ?? []).forEach(org => { if (org) counts[org] = (counts[org] || 0) + 1 }) })
     return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([org, count]) => ({ org, count }))
-  }, [users])
+  }, [chartUsers])
 
   const emailDomainData = useMemo(() => {
     const PERSONAL = new Set(['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','protonmail.com','me.com','live.com','qq.com','163.com'])
     let academic = 0, corporate = 0, personal = 0, none = 0
-    users.forEach(u => {
+    chartUsers.forEach(u => {
       const d = u.email_domain
       if (!d) { none++; return }
       if (d.endsWith('.edu') || d.endsWith('.ac.uk')) { academic++; return }
@@ -555,15 +648,15 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       { type: 'Personal', count: personal, color: '#0ea5e9' },
       { type: 'No Email', count: none, color: '#4b5563' },
     ].filter(d => d.count > 0)
-  }, [users])
+  }, [chartUsers])
 
   const healthScore = useMemo(() => {
-    if (!users.length) return null
-    const activeCount = users.filter(u => u.recently_active).length
-    const activeRatio = activeCount / users.length
-    const avgAge = users.reduce((s, u) => s + (u.account_age_days ?? 0), 0) / users.length
-    const avgFollowers = users.reduce((s, u) => s + (u.followers ?? 0), 0) / users.length
-    const avgRepos = users.reduce((s, u) => s + (u.public_repos ?? 0), 0) / users.length
+    if (!chartUsers.length) return null
+    const activeCount = chartUsers.filter(u => u.recently_active).length
+    const activeRatio = activeCount / chartUsers.length
+    const avgAge = chartUsers.reduce((s, u) => s + (u.account_age_days ?? 0), 0) / chartUsers.length
+    const avgFollowers = chartUsers.reduce((s, u) => s + (u.followers ?? 0), 0) / chartUsers.length
+    const avgRepos = chartUsers.reduce((s, u) => s + (u.public_repos ?? 0), 0) / chartUsers.length
     const score = Math.round(
       Math.min(activeRatio, 1) * 40 +
       Math.min(avgAge / (365 * 5), 1) * 20 +
@@ -578,10 +671,10 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       avgFollowers: Math.round(avgFollowers),
       avgRepos: Math.round(avgRepos * 10) / 10,
     }
-  }, [users])
+  }, [chartUsers])
 
   const funnelData = useMemo(() => {
-    const ORDER = ['stargazers','watchers','dependents','issue_authors','pr_authors','contributors','commit_authors','maintainers']
+    const ORDER = ROLE_FUNNEL_ORDER
     const dist = summary?.role_distribution ?? {}
     const items = ORDER.map(role => ({ role, count: dist[role] ?? 0 })).filter(d => d.count > 0)
     const max = Math.max(...items.map(d => d.count), 1)
@@ -589,7 +682,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   }, [summary])
 
   const socialPresenceData = useMemo(() => {
-    const ROLE_ORDER = ['stargazers','watchers','dependents','issue_authors','pr_authors','contributors','commit_authors','maintainers']
+    const ROLE_ORDER = ROLE_FUNNEL_ORDER
     const SIGNALS = [
       { key: 'has_public_email', label: 'Email', color: '#10b981' },
       { key: 'has_blog',         label: 'Blog',  color: '#0ea5e9' },
@@ -599,7 +692,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     // Collect per-role counts
     const roleCounts: Record<string, Record<string, number>> = {}
     const roleTotals: Record<string, number> = {}
-    users.forEach(u => {
+    chartUsers.forEach(u => {
       const roles = u.roles ?? []
       if (!roles.length) return
       roles.forEach(role => {
@@ -622,7 +715,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       return entry
     })
     return { rows, signals: SIGNALS }
-  }, [users])
+  }, [chartUsers])
 
   // Overlap analysis — users that appear in 2+ roles are the most engaged.
   const overlapData = useMemo(() => {
@@ -631,7 +724,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       .sort((a, b) => (b.roles?.length ?? 0) - (a.roles?.length ?? 0))
     // Role pair co-occurrence matrix for the heatmap data
     const pairCounts: Record<string, number> = {}
-    users.forEach(u => {
+    chartUsers.forEach(u => {
       const roles = u.roles ?? []
       for (let i = 0; i < roles.length; i++) {
         for (let j = i + 1; j < roles.length; j++) {
@@ -648,12 +741,12 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
         return { pair: `${a.replace(/_/g, ' ')} + ${b.replace(/_/g, ' ')}`, count }
       })
     return { multiRole, pairs, totalMultiRole: multiRole.length }
-  }, [users])
+  }, [chartUsers])
 
   // Growth over time — cumulative users by GitHub account creation month.
   const growthData = useMemo(() => {
     const monthCounts: Record<string, number> = {}
-    users.forEach(u => {
+    chartUsers.forEach(u => {
       const ts = u.created_at
       if (!ts) return
       const month = ts.slice(0, 7) // "YYYY-MM"
@@ -666,7 +759,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       cumulative += count
       return { month, new: count, cumulative }
     })
-  }, [users])
+  }, [chartUsers])
 
   if (doneJobs.length === 0) {
     return (
@@ -780,6 +873,15 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </option>
           ))}
         </select>
+        {isReadOnly && (
+          <span
+            className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-md"
+            style={{ background: 'rgba(56,189,248,0.10)', border: '1px solid rgba(56,189,248,0.3)', color: '#7dd3fc' }}
+            title="Opened from a share link. This result set lives in your browser only — it is not saved to your account."
+          >
+            <Link size={11} /> Shared · read-only
+          </span>
+        )}
         {/* Relative timestamp for active job */}
         {activeJobId && (() => {
           const activeJob = doneJobs.find(j => j.job_id === activeJobId)
@@ -792,7 +894,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
         })()
         }
         {/* Refresh active job — re-run with its original fetch parameters */}
-        {activeJobId && onJobRefresh && (
+        {activeJobId && onJobRefresh && !isReadOnly && (
           <button
             title="Refresh — re-fetch this repository with the same settings"
             disabled={refreshing}
@@ -815,7 +917,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
           </button>
         )}
         {/* Delete active job */}
-        {activeJobId && (
+        {activeJobId && !isReadOnly && (
           <button
             title="Delete this job"
             onClick={() => {
@@ -830,7 +932,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
           </button>
         )}
         {/* Inline rename */}
-        {activeJobId && (
+        {activeJobId && !isReadOnly && (
           renamingJobId === activeJobId ? (
             <div className="flex items-center gap-1">
               <input
@@ -989,8 +1091,8 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 <FileText size={14} /> Markdown
               </button>
             )}
-            {/* Share (copy link) */}
-            {activeJobId && (
+            {/* Share (copy link) — needs a backend job, so not for shared views. */}
+            {activeJobId && !isReadOnly && (
               <button
                 onClick={handleShare}
                 disabled={shareLoading}
@@ -1044,7 +1146,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             <SummaryCard
               icon={<Star size={18} />}
               label="Top Role"
-              value={roleDistData.sort((a, b) => b.count - a.count)[0]?.role ?? '–'}
+              value={[...roleDistData].sort((a, b) => b.count - a.count)[0]?.role ?? '–'}
               gradient="linear-gradient(90deg,#38bdf8,#0ea5e9)"
               small
             />
@@ -1070,6 +1172,25 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                   <div className="px-2 py-1 text-white font-bold" style={{ background: b.bg }}>{b.value}</div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {jobWarnings.length > 0 && (
+            <div
+              className="rounded-lg px-3 py-2 text-xs"
+              style={{
+                background: 'rgba(217,119,6,0.1)',
+                border: '1px solid rgba(217,119,6,0.25)',
+                color: '#fcd34d',
+              }}
+            >
+              <div className="flex items-center gap-1.5 font-medium mb-1">
+                <Info size={12} className="shrink-0" />
+                This fetch reported {jobWarnings.length} warning{jobWarnings.length === 1 ? '' : 's'} — the result set may be incomplete.
+              </div>
+              <ul className="space-y-0.5 ml-5 list-disc">
+                {jobWarnings.map((w, i) => <li key={i}>{w}</li>)}
+              </ul>
             </div>
           )}
 
@@ -1108,7 +1229,12 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                   <XAxis type="number" tick={{ fill: '#9ca3af', fontSize: 11 }} />
                   <YAxis type="category" dataKey="role" width={100} tick={{ fill: '#9ca3af', fontSize: 11 }} />
                   <Tooltip
-                    contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 6 }}
+                    {...TOOLTIP_BASE}
+                    cursor={BAR_CURSOR}
+                    // Single series, so the bar colour carries no extra meaning
+                    // in the tooltip — and several of the palette colours fall
+                    // below 4.5:1 as text (purple 4.19, indigo 3.97).
+                    itemStyle={{ color: '#e5e7eb' }}
                   />
                   <Bar dataKey="count" radius={[0, 4, 4, 0]}>
                     {roleDistData.map(entry => (
@@ -1519,7 +1645,9 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </div>
           )}
 
-          {/* Scheduled re-fetch */}
+          {/* Scheduled re-fetch — requires a backend job, so hidden for a
+              read-only shared view whose id the server never created. */}
+          {!isReadOnly && (
           <div className="card">
             <h3 className="text-sm font-semibold gradient-heading mb-3 flex items-center gap-1.5">
               <CalendarClock size={14} /> Scheduled Re-fetch
@@ -1553,11 +1681,14 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 </button>
               </div>
             )}
-            {schedules.length === 0 ? (
-              <p className="text-xs text-gray-600">No schedules yet.</p>
+            {jobSchedules.length === 0 ? (
+              <p className="text-xs text-gray-600">
+                No schedule for this job yet.
+                {schedules.length > 0 && ` (${schedules.length} on other jobs)`}
+              </p>
             ) : (
               <div className="space-y-1.5">
-                {schedules.map(s => (
+                {jobSchedules.map(s => (
                   <div
                     key={s.schedule_id}
                     className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm"
@@ -1588,6 +1719,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
               </div>
             )}
           </div>
+          )}
 
           {/* Top N leaderboard */}
           <div className="card">

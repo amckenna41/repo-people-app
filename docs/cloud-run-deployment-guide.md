@@ -192,13 +192,19 @@ Set these on the Cloud Run service after first deploy (Cloud Console → Cloud R
 
 | Variable | Value |
 |---|---|
-| `BACKEND_URL` | Your Cloud Run service URL (e.g. `https://repo-people-app-xxxxx-ew.a.run.app`) |
+| `BACKEND_URL` | Your Cloud Run service URL (e.g. `https://repo-people-app-xxxxx-ew.a.run.app`). **Mandatory when OAuth is enabled** — see note below |
 | `FRONTEND_URL` | Your Vercel frontend URL (e.g. `https://repo-people.vercel.app`) |
 | `CORS_ORIGINS` | Same as `FRONTEND_URL` |
 | `REPO_PEOPLE_DB` | `/tmp/repo_people_jobs.db` (SQLite database path for Cloud Run) |
 | `GITHUB_CLIENT_ID` | Set via Secret Manager (see GitHub OAuth App Setup section) |
 | `GITHUB_CLIENT_SECRET` | Set via Secret Manager (see GitHub OAuth App Setup section) |
 | `SESSION_TOKEN_KEY` | Set via Secret Manager — Fernet key encrypting stored OAuth tokens (see below) |
+
+> **`BACKEND_URL` is mandatory for OAuth.** The `redirect_uri` sent to GitHub is
+> taken from this variable and is never inferred from `Host` / `X-Forwarded-Host`,
+> since those are client-supplied and Cloud Run sits behind a proxy. If it is
+> unset, `/auth/login` returns `500` with an explanatory message and a warning is
+> logged at startup.
 
 > **Note:** OAuth credentials should be stored in Secret Manager, not as plain environment variables. See the **GitHub OAuth App Setup** section below for detailed instructions.
 

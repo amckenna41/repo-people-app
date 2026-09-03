@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useDeferredValue } from 'react'
 import { X, ExternalLink, Search } from 'lucide-react'
+import { useModalEscape } from '../hooks/useModalEscape'
 import type { UserRecord, JobInfo } from '../types'
 import RoleBadges from './RoleBadges'
 
@@ -21,14 +22,8 @@ export default function GlobalSearchModal({ allJobUsers, jobs, onClose, onSelect
     inputRef.current?.focus()
   }, [])
 
-  // Close on Escape
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useModalEscape(onClose, { lockScroll: false })
+
 
   const results = useMemo(() => {
     const q = deferredQuery.trim().toLowerCase()

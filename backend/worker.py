@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -19,15 +20,31 @@ from github import Github, Auth, GithubException
 from store import emit_event, get_job, persist_job
 
 
-def _classify_role_error(exc: Exception, role: str) -> str:
+# Roles whose GitHub endpoints reject unauthenticated requests outright.
+# Listing stargazers and watchers now returns 401 even for a public repo, and
+# collaborators (used to derive maintainers) always required a token. Without
+# one these roles contribute nothing, which silently halves the result set for
+# a repo whose community is mostly stargazers.
+_AUTH_REQUIRED_ROLES = frozenset({"stargazers", "watchers", "maintainers"})
+
+
+def _classify_role_error(exc: Exception, role: str, has_token: bool = True) -> str:
     """Return a user-friendly warning message for a per-role fetch failure."""
     if isinstance(exc, GithubException):
         data_str = str(getattr(exc, 'data', '') or '').lower()
         if exc.status == 401:
+            if not has_token:
+                # Saying "invalid or expired" when none was supplied sends people
+                # off to regenerate a token they never had.
+                return (f"⚠️ {role}: GitHub requires a token for this role — "
+                        f"0 users collected. Add a PAT or sign in, then re-run.")
             return f"⚠️ {role}: Authentication failed — token is invalid or expired."
         if exc.status == 403:
             if 'rate limit' in data_str or 'x-ratelimit' in data_str:
                 return f"⚠️ {role}: Rate limit exceeded — add a PAT or wait for reset."
+            if not has_token and role in _AUTH_REQUIRED_ROLES:
+                return (f"⚠️ {role}: GitHub requires a token for this role — "
+                        f"0 users collected. Add a PAT or sign in, then re-run.")
             return f"⚠️ {role}: Access denied — repository may be private or token lacks scope."
         if exc.status == 404:
             return f"⚠️ {role}: Repository not found — check owner/repo name."
@@ -35,6 +52,31 @@ def _classify_role_error(exc: Exception, role: str) -> str:
             return f"⚠️ {role}: Secondary rate limit hit — reduce workers or wait a moment."
         return f"⚠️ {role}: GitHub API error {exc.status}."
     return f"⚠️ {role}: Unexpected error — {type(exc).__name__}: {exc}"
+
+# ---------------------------------------------------------------------------
+# Executor and concurrency limits
+# ---------------------------------------------------------------------------
+# Every blocking GitHub call used run_in_executor(None, ...) — asyncio's shared,
+# process-wide ThreadPoolExecutor (min(32, cpu_count+4) threads). The per-job
+# `workers` semaphore bounds concurrency *within* one job, but nothing bounded
+# how many jobs ran at once, so a handful of simultaneous fetches could saturate
+# the default pool and starve every other coroutine that needs a thread.
+#
+# A dedicated executor keeps fetch work off the shared pool, and a global
+# semaphore caps how many jobs may run concurrently on this instance.
+_MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
+_FETCH_THREADS = int(os.environ.get("FETCH_THREAD_POOL_SIZE", "24"))
+
+_fetch_executor = ThreadPoolExecutor(
+    max_workers=_FETCH_THREADS, thread_name_prefix="repo-people-fetch"
+)
+_job_slots = asyncio.Semaphore(_MAX_CONCURRENT_JOBS)
+
+
+def shutdown_executor() -> None:
+    """Release the fetch thread pool. Called from the app's shutdown hook."""
+    _fetch_executor.shutdown(wait=False, cancel_futures=True)
+
 
 _SAVE_BLOCK = 25  # write partial checkpoint every N users when save_each_user=True
 
@@ -65,11 +107,42 @@ async def run_fetch_job(
     queue: asyncio.Queue = job["events"]
     partial_path = os.path.join(tempfile.gettempdir(), f"repo-people-{job_id}-partial.json")
 
+    # Warnings are persisted with the job as well as streamed, so the reason a
+    # result set came back short survives the SSE connection (and the tab).
+    warnings: list[str] = []
+
     async def emit(event_type: str, data: dict) -> None:
+        if event_type == "warning":
+            message = data.get("message")
+            if message and message not in warnings:
+                warnings.append(message)
         # Never blocks: the queue is bounded and drops its oldest events when
         # nobody is draining it (no SSE client attached, or one that went away).
         emit_event(queue, {"event": event_type, "data": data})
 
+    # Wait for a slot rather than piling onto the thread pool. The job stays
+    # "pending" while queued, and the client's SSE stream is already open, so
+    # tell them what is happening instead of leaving the log silent.
+    if _job_slots.locked():
+        await emit("status", {"message": "Queued — waiting for a free fetch slot…"})
+    async with _job_slots:
+        await _run_fetch_job_inner(
+            job=job, job_id=job_id, owner=owner, repo=repo, token=token, roles=roles,
+            limit=limit, exclude_bots=exclude_bots,
+            include_social_accounts=include_social_accounts, workers=workers,
+            save_each_user=save_each_user, max_total=max_total,
+            queue=queue, emit=emit, partial_path=partial_path, warnings=warnings,
+        )
+
+
+async def _run_fetch_job_inner(
+    *, job, job_id: str, owner: str, repo: str, token: str, roles, limit,
+    exclude_bots: bool, include_social_accounts: bool, workers: int,
+    save_each_user: bool, max_total, queue, emit, partial_path: str,
+    warnings: list[str],
+) -> None:
+    """The fetch itself. Split out so run_fetch_job can hold a concurrency slot
+    for exactly the duration of the work."""
     job["status"] = "running"
     loop = asyncio.get_event_loop()
     # Declare results before try so the except clause can access partial data
@@ -108,14 +181,14 @@ async def run_fetch_job(
             t_role = time.monotonic()
             await emit("status", {"message": f"  → fetching {role}…"})
             try:
-                data = await loop.run_in_executor(None, role_funcs[role])
+                data = await loop.run_in_executor(_fetch_executor, role_funcs[role])
                 elapsed_role = time.monotonic() - t_role
                 await emit("status", {"message": f"  ✓ {role}: {len(data)} users ({elapsed_role:.1f}s)"})
                 return role, data
             except Exception as role_exc:
                 elapsed_role = time.monotonic() - t_role
                 _logger.warning("Role fetch failed for %s/%s [%s] after %.1fs: %s", owner, repo, role, elapsed_role, role_exc)
-                friendly = _classify_role_error(role_exc, role)
+                friendly = _classify_role_error(role_exc, role, has_token=bool(token))
                 await emit("warning", {"message": friendly})
                 return role, []  # Continue with remaining roles
 
@@ -177,7 +250,7 @@ async def run_fetch_job(
                 if job.get("cancelled"):
                     return
                 try:
-                    _login, user_dict = await loop.run_in_executor(None, _fetch_one, login)
+                    _login, user_dict = await loop.run_in_executor(_fetch_executor, _fetch_one, login)
                 except Exception as fetch_exc:
                     await emit("status", {"message": f"Warning: failed to fetch {login} — {fetch_exc}"})
                     return
@@ -251,7 +324,8 @@ async def run_fetch_job(
 
         # B3: persist the terminal state in one awaited write so result/status/total
         # can't land out of order via fire-and-forget _JobProxy writes.
-        await persist_job(job_id, result=results, status="done", total_fetched=len(results))
+        await persist_job(job_id, result=results, status="done",
+                          total_fetched=len(results), warnings=warnings)
 
         if job.get("cancelled"):
             await emit("status", {"message": f"Fetch stopped by user. {len(results)} users saved."})
@@ -272,7 +346,8 @@ async def run_fetch_job(
         # If save_each_user is enabled, try to salvage partial results rather than failing
         if save_each_user:
             if results:
-                await persist_job(job_id, result=results, status="done", total_fetched=len(results))
+                await persist_job(job_id, result=results, status="done",
+                                  total_fetched=len(results), warnings=warnings)
                 await emit("status", {"message": f"Fetch interrupted. Using {len(results)} users fetched so far."})
                 await emit("done", {"total": len(results)})
                 return
@@ -280,12 +355,13 @@ async def run_fetch_job(
                 try:
                     with open(partial_path) as pf:
                         partial_results = json.load(pf)
-                    await persist_job(job_id, result=partial_results, status="done", total_fetched=len(partial_results))
+                    await persist_job(job_id, result=partial_results, status="done",
+                                      total_fetched=len(partial_results), warnings=warnings)
                     await emit("status", {"message": f"Fetch failed. Restored {len(partial_results)} users from last saved checkpoint."})
                     await emit("done", {"total": len(partial_results)})
                     return
                 except Exception:
                     pass
-        await persist_job(job_id, status="error", message=sanitised_message)
+        await persist_job(job_id, status="error", message=sanitised_message, warnings=warnings)
         await emit("error", {"message": sanitised_message})
         await emit("done", {})

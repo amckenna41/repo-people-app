@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { ComposableMap, Geographies, Geography, ZoomableGroup } from 'react-simple-maps'
 import { X } from 'lucide-react'
+import VirtualList from './VirtualList'
+import { useModalEscape } from '../hooks/useModalEscape'
 import type { UserRecord } from '../types'
 
 // Natural Earth 110m TopoJSON — tiny, no server required
@@ -650,45 +652,33 @@ export default function WorldMap({ users }: Props) {
   function resetZoom() { setZoom(1) }
 
   // Build country → count from location_normalized
-  const countryCounts = useMemo(() => {
+  // One pass over the users for all three country lookups.
+  //
+  // These were three separate memos, each iterating the full list and calling
+  // getCountryNum() — which, for any free-text location, falls back to a
+  // whole-word regex scan across ~250 countries and ~400 cities. That is the
+  // expensive part, and it was being paid three times per render.
+  const { countryCounts, countryUsers, countryLabel } = useMemo(() => {
     const counts: Record<number, number> = {}
+    const byCountry: Record<number, UserRecord[]> = {}
+    const labels: Record<number, string> = {}
+
     for (const u of users) {
       const loc = u.location_normalized ?? u.location
       if (!loc) continue
       const num = getCountryNum(loc)
-      if (num !== null) counts[num] = (counts[num] ?? 0) + 1
+      if (num === null) continue
+      counts[num] = (counts[num] ?? 0) + 1
+      ;(byCountry[num] ??= []).push(u)
+      labels[num] ??= loc
     }
-    return counts
+    return { countryCounts: counts, countryUsers: byCountry, countryLabel: labels }
   }, [users])
 
-  // Build country → users list
-  const countryUsers = useMemo(() => {
-    const map: Record<number, UserRecord[]> = {}
-    for (const u of users) {
-      const loc = u.location_normalized ?? u.location
-      if (!loc) continue
-      const num = getCountryNum(loc)
-      if (num !== null) {
-        if (!map[num]) map[num] = []
-        map[num].push(u)
-      }
-    }
-    return map
-  }, [users])
+  // The map itself scrolls behind the modal, so background scroll stays free.
+  useModalEscape(selected ? () => setSelected(null) : null, { lockScroll: false })
 
   const maxCount = useMemo(() => Math.max(1, ...Object.values(countryCounts)), [countryCounts])
-
-  // Build tooltip-friendly name map (numeric → first location string that matched it)
-  const countryLabel = useMemo(() => {
-    const m: Record<number, string> = {}
-    for (const u of users) {
-      const loc = u.location_normalized ?? u.location
-      if (!loc) continue
-      const num = getCountryNum(loc)
-      if (num !== null && !m[num]) m[num] = loc
-    }
-    return m
-  }, [users])
 
   // Sorted list of countries that have at least one user, for the dropdown
   const countryOptions = useMemo(() =>
@@ -853,10 +843,16 @@ export default function WorldMap({ users }: Props) {
             </div>
 
             {/* User list */}
-            <div className="overflow-y-auto flex-1 px-3 py-3 space-y-1">
-              {selected.users.map(u => (
+            {/* Virtualized: a populous country can hold thousands of users,
+                and every one of them used to mount at once on click. */}
+            <VirtualList
+              items={selected.users}
+              rowHeight={60}
+              maxHeight="100%"
+              className="flex-1 px-3 py-3"
+              keyOf={u => u.login}
+              renderRow={u => (
                 <a
-                  key={u.login}
                   href={u.html_url ?? `https://github.com/${u.login}`}
                   target="_blank"
                   rel="noopener noreferrer"
@@ -864,7 +860,7 @@ export default function WorldMap({ users }: Props) {
                 >
                   {u.avatar_url
                     ? <img src={u.avatar_url} alt={u.login} className="w-8 h-8 rounded-full shrink-0 opacity-90 group-hover:opacity-100" />
-                    : <div className="w-8 h-8 rounded-full shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{u.login[0].toUpperCase()}</div>
+                    : <div className="w-8 h-8 rounded-full shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{(u.login?.[0] ?? '?').toUpperCase()}</div>
                   }
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-white font-medium truncate group-hover:text-purple-300 transition-colors">
@@ -885,8 +881,8 @@ export default function WorldMap({ users }: Props) {
                     )}
                   </div>
                 </a>
-              ))}
-            </div>
+              )}
+            />
           </div>
         </div>
       )}

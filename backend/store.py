@@ -73,6 +73,14 @@ _DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "repo_people_jobs.db"),
 )
 
+# How long SQLite waits for a competing writer before giving up. The driver
+# default (5s) is easily exceeded when several jobs finish together.
+# ponytail: a longer wait, not a connection pool. aiosqlite opens a connection
+# per _db() call, which is cheap for a local file; revisit if profiling says
+# otherwise, or move to Postgres (see docs/supabase-evaluation.md).
+_SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "15000"))
+_SQLITE_TIMEOUT_SECONDS = _SQLITE_BUSY_TIMEOUT_MS / 1000
+
 # Runtime-only overlay: stores asyncio.Queue and cancelled flag keyed by job_id
 _runtime: dict[str, dict[str, Any]] = {}
 
@@ -224,6 +232,11 @@ async def _init_schema(c: _Conn) -> None:
         # set of members, and parsing every run's full result blob to rebuild it
         # made /jobs/{id}/history read tens of MB on a hot path.
         ("logins_json", "ALTER TABLE jobs ADD COLUMN logins_json TEXT"),
+        # Per-role failures and caps hit during the fetch. These were emitted
+        # only on the ephemeral SSE queue, so a user who closed the tab — or who
+        # simply looked at the results later — had no way to learn why the set
+        # came back smaller than expected.
+        ("warnings_json", "ALTER TABLE jobs ADD COLUMN warnings_json TEXT"),
     ):
         if IS_POSTGRES:
             # Postgres aborts the surrounding transaction on a duplicate-column
@@ -258,12 +271,22 @@ async def _db():
             yield c
     else:
         import aiosqlite
-        async with aiosqlite.connect(_DB_PATH) as raw:
+        async with aiosqlite.connect(_DB_PATH, timeout=_SQLITE_TIMEOUT_SECONDS) as raw:
             raw.row_factory = aiosqlite.Row
             # PRAGMA returns a row, so its cursor must be closed — an open
             # cursor holds a read lock and makes later DDL on this connection
             # fail with "database table is locked".
             async with raw.execute("PRAGMA journal_mode=WAL"):
+                pass
+            # SQLite serialises writers. Several jobs finishing at once, plus the
+            # maintenance and schedule loops, can exceed the default 5s wait and
+            # surface as an unexplained 5xx ("database is locked"). Wait longer
+            # instead — a slow write beats a failed one.
+            async with raw.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"):
+                pass
+            # NORMAL is durable under WAL for everything except OS-level crash,
+            # and removes an fsync from every commit.
+            async with raw.execute("PRAGMA synchronous=NORMAL"):
                 pass
             c = _Conn(raw)
             await _init_schema(c)
@@ -372,21 +395,44 @@ def get_job(job_id: str) -> dict[str, Any] | None:
     return _JobProxy(job_id, rt)
 
 
-async def get_job_async(job_id: str) -> dict[str, Any] | None:
-    """Async version — always reads latest state from the DB."""
-    row = await _load_job_row(job_id)
+async def get_job_async(job_id: str, include_result: bool = True) -> dict[str, Any] | None:
+    """Async version — always reads latest state from the DB.
+
+    Pass `include_result=False` when only metadata is needed; the returned job's
+    `result` will be None regardless of what is stored.
+    """
+    row = await _load_job_row(job_id, include_result=include_result)
     if row is None:
         return None
     rt = _runtime.setdefault(job_id, _new_runtime())
     return _row_to_job(row, rt)
 
 
-async def _load_job_row(job_id: str) -> dict | None:
+# Every column except result_json — the one that holds the whole profile map and
+# costs tens of MB to fetch and parse on a large job.
+_JOB_META_COLUMNS = (
+    "job_id, status, message, total_fetched, label, summary_json, created_at, "
+    "tags, owner_key, params_json, repo_owner, repo_name, logins_json, warnings_json"
+)
+
+
+async def _load_job_row(job_id: str, include_result: bool = True) -> dict | None:
+    """Load a job row.
+
+    `include_result=False` skips `result_json`, which most job-scoped routes
+    never touch — an ownership check, a rename, a tag edit or an SSE connect
+    used to drag the entire result blob out of the database and json.loads() it
+    for nothing.
+    """
+    columns = "*" if include_result else _JOB_META_COLUMNS
     async with _db() as c:
-        return await c.one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+        return await c.one(f"SELECT {columns} FROM jobs WHERE job_id = ?", (job_id,))
 
 
 def _row_to_job(row: dict, rt: dict[str, Any]) -> dict[str, Any]:
+    # A metadata-only row has no result_json key at all; `result` is then None,
+    # which is indistinguishable from a job that has not finished. Callers that
+    # need the payload must not ask for a metadata row.
     result = json.loads(row["result_json"]) if row.get("result_json") else None
     summary = json.loads(row["summary_json"]) if row.get("summary_json") else None
     params = json.loads(row["params_json"]) if row.get("params_json") else None
@@ -397,6 +443,7 @@ def _row_to_job(row: dict, rt: dict[str, Any]) -> dict[str, Any]:
         "label": row.get("label"),
         "result": result,
         "summary": summary,
+        "warnings": json.loads(row["warnings_json"]) if row.get("warnings_json") else [],
         "owner_key": row.get("owner_key"),
         "params": params,
         "repo_owner": row.get("repo_owner"),
@@ -456,11 +503,12 @@ class _JobProxy(dict):
             task.add_done_callback(_log_task_error)
 
 
-_DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary"}
+_DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary", "warnings"}
 
 _COL_MAP = {
     "status": "status", "message": "message", "total_fetched": "total_fetched",
     "label": "label", "result": "result_json", "summary": "summary_json",
+    "warnings": "warnings_json",
 }
 
 
@@ -542,7 +590,7 @@ async def load_all_jobs_into_runtime() -> None:
 
 async def delete_job(job_id: str) -> bool:
     """Remove a job, its share tokens and its schedules. True if it existed."""
-    existed = job_id in _runtime or await _load_job_row(job_id) is not None
+    existed = job_id in _runtime or await _load_job_row(job_id, include_result=False) is not None
     _runtime.pop(job_id, None)
     async with _db() as c:
         await c.exec("DELETE FROM jobs WHERE job_id = ?", (job_id,))
@@ -555,7 +603,7 @@ async def delete_job(job_id: str) -> bool:
 
 
 async def get_job_tags(job_id: str) -> list[str]:
-    row = await _load_job_row(job_id)
+    row = await _load_job_row(job_id, include_result=False)
     if row is None:
         return []
     try:
@@ -566,7 +614,7 @@ async def get_job_tags(job_id: str) -> list[str]:
 
 async def set_job_tags(job_id: str, tags: list[str]) -> bool:
     """Persist a new tags list for a job. Returns False if job not found."""
-    row = await _load_job_row(job_id)
+    row = await _load_job_row(job_id, include_result=False)
     if row is None:
         return False
     cleaned = sorted({t.strip().lower() for t in tags if t.strip()})
@@ -586,6 +634,38 @@ async def clear_all_jobs() -> int:
         await c.exec("DELETE FROM schedules")
         await c.commit()
     return max(deleted, 0)
+
+
+async def count_jobs(owner_key: str) -> int:
+    async with _db() as c:
+        row = await c.one("SELECT COUNT(*) AS n FROM jobs WHERE owner_key = ?", (owner_key,))
+    return (row["n"] or 0) if row else 0
+
+
+async def prune_oldest_jobs(owner_key: str, keep: int) -> list[str]:
+    """Delete an owner's oldest jobs beyond *keep*, returning the ids removed.
+
+    Only a per-minute rate limit existed, so a caller staying comfortably inside
+    it could accumulate job rows without bound — each holding up to FETCH_LIMIT
+    profiles. Oldest-first, because the newest run is the one being looked at.
+    """
+    async with _db() as c:
+        rows = await c.all(
+            "SELECT job_id FROM jobs WHERE owner_key = ? ORDER BY created_at DESC, job_id DESC",
+            (owner_key,),
+        )
+        doomed = [r["job_id"] for r in rows[keep:]]
+        for job_id in doomed:
+            # Same cascade as delete_job: a dangling share link or schedule must
+            # not outlive the data it points at.
+            await c.exec("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            await c.exec("DELETE FROM share_tokens WHERE job_id = ?", (job_id,))
+            await c.exec("DELETE FROM schedules WHERE source_job_id = ?", (job_id,))
+        if doomed:
+            await c.commit()
+    for job_id in doomed:
+        _runtime.pop(job_id, None)
+    return doomed
 
 
 async def load_repo_history(owner_key: str, repo_owner: str, repo_name: str) -> list[dict]:
@@ -808,19 +888,61 @@ async def get_share_token(token: str) -> dict[str, Any] | None:
 # Scheduled re-fetch
 # ---------------------------------------------------------------------------
 
+# Serialises schedule creation within this process so the per-owner cap cannot
+# be raced. The INSERT ... WHERE (SELECT COUNT(*) ...) below is a single
+# statement, but each _db() call opens its own connection, so two coroutines can
+# otherwise interleave their reads.
+# ponytail: per-process only. Under multi-instance Postgres the cap becomes
+# approximate; add an advisory lock or SERIALIZABLE if it must be exact.
+_create_schedule_lock = asyncio.Lock()
+
+
 async def create_schedule(
-    owner_key: str, source_job_id: str, params: dict, label: str | None, interval_hours: int
-) -> dict:
+    owner_key: str, source_job_id: str, params: dict, label: str | None, interval_hours: int,
+    max_per_owner: int | None = None,
+) -> dict | None:
+    """Create a schedule, returning None if it would exceed *max_per_owner*.
+
+    The count and the insert share one connection and one commit, so two
+    concurrent callers cannot both observe an under-cap count and both insert.
+
+    ponytail: relies on the surrounding transaction rather than a DB constraint,
+    because the limit is per-owner rather than per-row. Under multi-instance
+    Postgres, wrap in SERIALIZABLE or add a partial unique index if the cap ever
+    has to be exact rather than merely enforced.
+    """
     schedule_id = str(uuid.uuid4())
     next_run = _iso_in(interval_hours * 3600)
-    async with _db() as c:
-        await c.exec(
-            "INSERT INTO schedules (schedule_id, owner_key, source_job_id, params_json, label, "
-            "interval_hours, next_run_at, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (schedule_id, owner_key, source_job_id, json.dumps(params), label,
-             interval_hours, next_run, _utcnow_iso()),
-        )
-        await c.commit()
+    values = (schedule_id, owner_key, source_job_id, json.dumps(params), label,
+              interval_hours, next_run, _utcnow_iso())
+
+    # Written out in full rather than concatenated from a shared prefix: every
+    # value is parameterised either way, but a literal keeps static analysis
+    # quiet instead of flagging string-built SQL on a security-relevant path.
+    _INSERT = (
+        "INSERT INTO schedules (schedule_id, owner_key, source_job_id, params_json, "
+        "label, interval_hours, next_run_at, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)"
+    )
+    # One statement, so the count cannot go stale between reading it and
+    # inserting. `_create_schedule_lock` additionally serialises callers within
+    # this process, because each _db() call opens its own connection.
+    _INSERT_CAPPED = (
+        "INSERT INTO schedules (schedule_id, owner_key, source_job_id, params_json, "
+        "label, interval_hours, next_run_at, enabled, created_at) "
+        "SELECT ?, ?, ?, ?, ?, ?, ?, 1, ? WHERE "
+        "(SELECT COUNT(*) FROM schedules WHERE owner_key = ?) < ?"
+    )
+
+    async with _create_schedule_lock:
+        async with _db() as c:
+            if max_per_owner is None:
+                await c.exec(_INSERT, values)
+            else:
+                inserted = await c.exec(_INSERT_CAPPED, (*values, owner_key, max_per_owner))
+                if inserted < 1:
+                    return None
+            await c.commit()
     return {
         "schedule_id": schedule_id, "source_job_id": source_job_id, "label": label,
         "interval_hours": interval_hours, "next_run_at": next_run, "enabled": True,

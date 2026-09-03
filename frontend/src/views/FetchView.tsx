@@ -6,6 +6,8 @@ import { friendlyFetchError } from '../utils/errors'
 import type { JobInfo, AuthUser } from '../types'
 import { ALL_ROLES, ROLE_COLORS } from '../types'
 import { useNotification } from '../hooks/useNotification'
+import { useModalEscape } from '../hooks/useModalEscape'
+import { estimateFetch, humaniseDuration } from '../utils/estimate'
 
 interface Props {
   jobs: JobInfo[]
@@ -111,7 +113,22 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const currentJobIdRef = useRef<string | null>(null)
   const stoppingRef = useRef(false)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const currentResolveRef = useRef<((v: string | null) => void) | null>(null)
+
+  // Rough pre-flight cost. On a self-hosted install with FETCH_LIMIT=0 nothing
+  // caps the run, so an unbounded selection is called out explicitly rather
+  // than discovered an hour into a crawl.
+  const estimate = useMemo(() => estimateFetch({
+    roleCount: roles.size,
+    perRoleLimit: limit ? Number(limit) : null,
+    serverCap: FETCH_LIMIT,
+    workers,
+    repoCount: repos.filter(r => r.owner.trim() && r.repo.trim()).length || 1,
+  }), [roles.size, limit, FETCH_LIMIT, workers, repos])
+
+  useModalEscape(recentMatches.length > 0 ? cancelRefetch : null)
+  useModalEscape(showTokenModal ? () => setShowTokenModal(false) : null)
 
   // Cancel the active job if the user refreshes or closes the tab
   useEffect(() => {
@@ -122,7 +139,12 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
       }
     }
     window.addEventListener('beforeunload', handleUnload)
-    return () => window.removeEventListener('beforeunload', handleUnload)
+    return () => {
+      window.removeEventListener('beforeunload', handleUnload)
+      // Drop a queued reconnect so it cannot fire after unmount.
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+      esRef.current?.close()
+    }
   }, [])
 
   useEffect(() => {
@@ -189,7 +211,11 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
     stoppingRef.current = true
     setStopping(true)
     setStoppedByUser(true)
-    // Close the SSE stream immediately
+    // Close the SSE stream immediately, and drop any reconnect already queued.
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
     if (esRef.current) {
       esRef.current.close()
       esRef.current = null
@@ -351,7 +377,16 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                 reconnectAttempts++
                 const delay = reconnectAttempts * 1000
                 setLog(prev => [...prev, { text: `${prefix}Connection lost, reconnecting (${reconnectAttempts}/${MAX_RECONNECT})…`, ts: Date.now() }])
-                setTimeout(connectSSE, delay)
+                // Re-check on *fire*, not only when scheduling: handleStop closes
+                // the current stream, but a timer already queued here would still
+                // run, open a fresh connection and overwrite esRef — resuming a
+                // stream the UI has told the user is stopped, with no Stop button
+                // left to close it. The handle is tracked so unmount clears it too.
+                reconnectTimerRef.current = setTimeout(() => {
+                  reconnectTimerRef.current = null
+                  if (stoppingRef.current) return
+                  connectSSE()
+                }, delay)
               } else {
                 setLog(prev => [...prev, { text: `${prefix}Connection lost for ${owner}/${repo}`, ts: Date.now() }])
                 repoDone = true
@@ -799,6 +834,13 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                 <span className="ml-1.5 text-xs text-amber-400">(max {FETCH_LIMIT} on hosted app)</span>
               )}
             </label>
+            {/* Pre-flight cost. An uncapped self-hosted install has no ceiling
+                at all, so say so before the run rather than after. */}
+            <p className={`text-xs mb-2 ${estimate.unbounded ? 'text-amber-400' : 'text-gray-500'}`}>
+              {estimate.unbounded
+                ? '⚠ No limit set — this will fetch every user in every selected role, which can take hours and exhaust your API quota.'
+                : `≈ up to ${estimate.users!.toLocaleString()} profiles · ${humaniseDuration(estimate.seconds!)} · ~${estimate.apiCalls!.toLocaleString()} API calls`}
+            </p>
             {/* Quick-select presets */}
             <div className="flex gap-1.5 mb-2 flex-wrap">
               {(FETCH_LIMIT > 0

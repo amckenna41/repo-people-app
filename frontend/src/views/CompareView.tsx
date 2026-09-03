@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { postCompare, postCompareMulti } from '../utils/api'
 import type { CompareResult, MultiCompareResult, JobInfo } from '../types'
+import VirtualList from '../components/VirtualList'
 import { GitCompare, Loader2, ExternalLink, Plus, Trash2 }  from 'lucide-react'
 
 interface Props {
@@ -276,10 +277,17 @@ function UserColumn({
       <div className={`text-sm font-semibold ${headerClass}`}>
         {title} <span className="text-gray-500 font-normal">({count})</span>
       </div>
-      <div className="flex-1 overflow-y-auto max-h-96 space-y-1.5 pr-1">
-        {users.map(u => (
+      {/* Virtualized: /compare returns the full uncapped overlap, so two large
+          repos used to mount thousands of rows at once. */}
+      <VirtualList
+        items={users}
+        rowHeight={40}
+        maxHeight="24rem"
+        className="flex-1 pr-1"
+        keyOf={u => u.login}
+        empty={<div className="text-gray-600 text-sm text-center py-4">None</div>}
+        renderRow={u => (
           <a
-            key={u.login}
             href={u.html_url}
             target="_blank"
             rel="noopener noreferrer"
@@ -289,11 +297,8 @@ function UserColumn({
             <span className="text-sm text-gray-300 truncate group-hover:text-white">{u.login}</span>
             <ExternalLink size={10} className="shrink-0 text-gray-600 group-hover:text-gray-400 ml-auto" />
           </a>
-        ))}
-        {users.length === 0 && (
-          <div className="text-gray-600 text-sm text-center py-4">None</div>
         )}
-      </div>
+      />
     </div>
   )
 }

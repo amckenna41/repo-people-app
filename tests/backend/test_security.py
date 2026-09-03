@@ -11,6 +11,7 @@ Covers the three server-side hardening measures:
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 
 import store
 from conftest import TEST_CLIENT_COOKIE, _seed_done_job
@@ -222,3 +223,279 @@ class TestEventQueueBound:
         assert events[-1]["event"] == "done"
         # The first event pushed is the one that got evicted.
         assert events[0]["data"]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# OAuth redirect_uri derivation
+# ---------------------------------------------------------------------------
+
+class TestBackendBaseUrl:
+    """The redirect_uri sent to GitHub must come from configuration, never from
+    the request.
+
+    It used to fall back to X-Forwarded-Host / Host whenever BACKEND_URL was
+    unset *or* still at the localhost default. Both are client-supplied, so
+    anyone able to set X-Forwarded-Host on /auth/login — directly, or through an
+    edge proxy that passes client headers through — could make the server
+    advertise a callback host of their choosing, leaving GitHub's exact-match
+    callback check as the only remaining defence.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _oauth_configured(self, async_client, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "GITHUB_CLIENT_ID", "test-client-id")
+
+    @pytest.mark.asyncio
+    async def test_configured_url_is_used_verbatim(self, async_client, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "BACKEND_URL_IS_CONFIGURED", True)
+        monkeypatch.setattr(main, "BACKEND_URL", "https://api.example.com")
+
+        res = await async_client.get("/auth/login", follow_redirects=False)
+        assert res.status_code == 307
+        assert "redirect_uri=https%3A%2F%2Fapi.example.com%2Fauth%2Fcallback" in res.headers["location"]
+
+    @pytest.mark.asyncio
+    async def test_spoofed_forwarded_host_cannot_influence_redirect_uri(
+        self, async_client, monkeypatch
+    ):
+        import main
+        monkeypatch.setattr(main, "BACKEND_URL_IS_CONFIGURED", True)
+        monkeypatch.setattr(main, "BACKEND_URL", "https://api.example.com")
+
+        res = await async_client.get(
+            "/auth/login",
+            headers={"X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"},
+            follow_redirects=False,
+        )
+        assert res.status_code == 307
+        assert "evil.example" not in res.headers["location"]
+        assert "api.example.com" in res.headers["location"]
+
+    @pytest.mark.asyncio
+    async def test_spoofed_host_header_cannot_influence_redirect_uri(
+        self, async_client, monkeypatch
+    ):
+        import main
+        monkeypatch.setattr(main, "BACKEND_URL_IS_CONFIGURED", True)
+        monkeypatch.setattr(main, "BACKEND_URL", "https://api.example.com")
+
+        res = await async_client.get(
+            "/auth/login", headers={"Host": "evil.example"}, follow_redirects=False
+        )
+        assert res.status_code == 307
+        assert "evil.example" not in res.headers["location"]
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_backend_url_refuses_a_proxied_request(
+        self, async_client, monkeypatch
+    ):
+        """The dangerous case: no BACKEND_URL and a proxy in front. Previously
+        this built the callback from the forwarded header."""
+        import main
+        monkeypatch.setattr(main, "BACKEND_URL_IS_CONFIGURED", False)
+
+        res = await async_client.get(
+            "/auth/login",
+            headers={"X-Forwarded-Host": "evil.example"},
+            follow_redirects=False,
+        )
+        assert res.status_code == 500
+        assert "BACKEND_URL" in res.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_backend_url_still_serves_local_development(
+        self, async_client, monkeypatch
+    ):
+        """A plain local request with no proxy keeps working, so `uvicorn` +
+        OAuth on a laptop needs no extra configuration."""
+        import main
+        monkeypatch.setattr(main, "BACKEND_URL_IS_CONFIGURED", False)
+        monkeypatch.setattr(main, "BACKEND_URL", "http://localhost:8000")
+
+        res = await async_client.get("/auth/login", follow_redirects=False)
+        assert res.status_code == 307
+        assert "localhost%3A8000%2Fauth%2Fcallback" in res.headers["location"]
+
+    @pytest.mark.parametrize("bad", ["not-a-url", "javascript:alert(1)", "ftp://x", "//evil.example"])
+    def test_malformed_backend_url_is_rejected(self, bad):
+        """A bad value would otherwise be handed to GitHub as the redirect_uri."""
+        import main
+        with pytest.raises(RuntimeError, match="BACKEND_URL"):
+            main._resolve_backend_url(bad)
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("https://api.example.com", "https://api.example.com"),
+        ("https://api.example.com/", "https://api.example.com"),   # trailing slash trimmed
+        ("  https://api.example.com  ", "https://api.example.com"),
+        ("http://localhost:8000", "http://localhost:8000"),
+    ])
+    def test_valid_backend_url_is_normalised_and_marked_configured(self, raw, expected):
+        import main
+        url, configured = main._resolve_backend_url(raw)
+        assert (url, configured) == (expected, True)
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_backend_url_falls_back_to_the_local_default(self, raw):
+        import main
+        url, configured = main._resolve_backend_url(raw)
+        assert url == main._DEFAULT_BACKEND_URL
+        # Explicitly *not* configured — this is what gates the header fallback.
+        assert configured is False
+
+    def test_explicit_localhost_counts_as_configured(self):
+        """Previously any value equal to the localhost default was treated as
+        unset, which is precisely what dropped requests into the header
+        fallback even when an operator had set it deliberately."""
+        import main
+        _, configured = main._resolve_backend_url("http://localhost:8000")
+        assert configured is True
+
+
+# ---------------------------------------------------------------------------
+# OAuth callback robustness
+# ---------------------------------------------------------------------------
+
+class TestAuthCallbackResponseShape:
+    """GitHub's response shape was trusted unguarded: `.json()` on both calls
+    and `user_data["login"]`. A non-JSON body or unexpected payload raised
+    JSONDecodeError/KeyError and surfaced as a bare 500."""
+
+    @pytest_asyncio.fixture
+    async def primed(self, async_client, monkeypatch):
+        """A callback that has passed both state checks and reached the exchange."""
+        import main
+        monkeypatch.setattr(main, "GITHUB_CLIENT_SECRET", "test-secret")
+        await store.add_oauth_state("shape-state", ttl_seconds=600)
+        async_client.cookies.set(main.OAUTH_STATE_COOKIE, "shape-state")
+        yield async_client
+        async_client.cookies.delete(main.OAUTH_STATE_COOKIE)
+
+    @staticmethod
+    def _mock_post(monkeypatch, token_body, user_body=None, user_status=200):
+        """Stub httpx so the token/profile calls return controlled payloads."""
+        import main
+
+        class _Resp:
+            def __init__(self, body, status=200):
+                self._body, self.status_code = body, status
+
+            def json(self):
+                if isinstance(self._body, Exception):
+                    raise self._body
+                return self._body
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _Resp(token_body)
+
+            async def get(self, *a, **k):
+                return _Resp(user_body, user_status)
+
+        monkeypatch.setattr(main.httpx, "AsyncClient", lambda *a, **k: _Client())
+
+    @pytest.mark.asyncio
+    async def test_non_json_token_response_returns_502(self, primed, monkeypatch):
+        self._mock_post(monkeypatch, ValueError("not json"))
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 502
+        assert "unreadable" in res.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_non_dict_token_response_returns_502(self, primed, monkeypatch):
+        self._mock_post(monkeypatch, ["unexpected", "list"])
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_non_json_profile_response_returns_502(self, primed, monkeypatch):
+        self._mock_post(monkeypatch, {"access_token": "t"}, ValueError("not json"))
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_profile_without_a_login_returns_502(self, primed, monkeypatch):
+        # `login` keys every job (`gh:{login}`), so a missing value must not be
+        # allowed to create a session keyed on None.
+        self._mock_post(monkeypatch, {"access_token": "t"}, {"name": "No Login"})
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 502
+        assert "login" in res.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_non_string_login_returns_502(self, primed, monkeypatch):
+        self._mock_post(monkeypatch, {"access_token": "t"}, {"login": 12345})
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_valid_response_creates_a_session(self, primed, monkeypatch):
+        self._mock_post(monkeypatch, {"access_token": "tok"}, {"login": "octocat", "name": "Octo"})
+        res = await primed.get("/auth/callback?code=abc&state=shape-state", follow_redirects=False)
+        assert res.status_code == 302
+        assert "auth=success" in res.headers["location"]
+
+
+# ---------------------------------------------------------------------------
+# Schedule cap
+# ---------------------------------------------------------------------------
+
+class TestScheduleCap:
+    @pytest.mark.asyncio
+    async def test_cap_is_enforced_inside_the_write(self):
+        """The cap used to be a read-then-write in the endpoint, so concurrent
+        callers could both see an under-cap count and both insert."""
+        import main
+        owner = "anon:cap-test"
+        for _ in range(main.MAX_SCHEDULES_PER_OWNER):
+            assert await store.create_schedule(
+                owner_key=owner, source_job_id="j", params={}, label=None,
+                interval_hours=24, max_per_owner=main.MAX_SCHEDULES_PER_OWNER,
+            ) is not None
+
+        # One over the cap is refused by the store itself, not by the caller.
+        assert await store.create_schedule(
+            owner_key=owner, source_job_id="j", params={}, label=None,
+            interval_hours=24, max_per_owner=main.MAX_SCHEDULES_PER_OWNER,
+        ) is None
+        assert len(await store.list_schedules(owner)) == main.MAX_SCHEDULES_PER_OWNER
+
+    @pytest.mark.asyncio
+    async def test_concurrent_creates_cannot_exceed_the_cap(self):
+        """Fire the requests together; the total must still land on the cap."""
+        import asyncio
+        import main
+        owner = "anon:cap-race"
+        results = await asyncio.gather(*[
+            store.create_schedule(
+                owner_key=owner, source_job_id="j", params={}, label=None,
+                interval_hours=24, max_per_owner=main.MAX_SCHEDULES_PER_OWNER,
+            )
+            for _ in range(main.MAX_SCHEDULES_PER_OWNER + 6)
+        ])
+        assert sum(r is not None for r in results) <= main.MAX_SCHEDULES_PER_OWNER
+        assert len(await store.list_schedules(owner)) <= main.MAX_SCHEDULES_PER_OWNER
+
+    @pytest.mark.asyncio
+    async def test_cap_is_per_owner(self):
+        import main
+        a = await store.create_schedule(owner_key="anon:a", source_job_id="j", params={},
+                                        label=None, interval_hours=24, max_per_owner=1)
+        b = await store.create_schedule(owner_key="anon:b", source_job_id="j", params={},
+                                        label=None, interval_hours=24, max_per_owner=1)
+        assert a is not None and b is not None
+
+    @pytest.mark.asyncio
+    async def test_no_cap_argument_keeps_the_old_unlimited_behaviour(self):
+        for _ in range(3):
+            assert await store.create_schedule(
+                owner_key="anon:nocap", source_job_id="j", params={},
+                label=None, interval_hours=24,
+            ) is not None

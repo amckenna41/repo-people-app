@@ -4,6 +4,7 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import RoleBadges from '../../../frontend/src/components/RoleBadges'
+import { ALL_ROLES, ROLE_FUNNEL_ORDER } from '../../../frontend/src/types'
 
 describe('RoleBadges', () => {
   it('renders nothing when roles is empty', () => {
@@ -69,5 +70,27 @@ describe('RoleBadges', () => {
     for (const badge of badges) {
       expect(badge.tagName.toLowerCase()).toBe('span')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Role ordering (regression for the funnel/social charts dropping a role)
+// ---------------------------------------------------------------------------
+describe('ROLE_FUNNEL_ORDER', () => {
+  it('covers every role in ALL_ROLES', () => {
+    // The two charts previously hard-coded an 8-role list that omitted
+    // fork_owners, so a user holding only that role vanished from both.
+    expect([...ROLE_FUNNEL_ORDER].sort()).toEqual([...ALL_ROLES].sort())
+  })
+
+  it('lists each role exactly once', () => {
+    expect(new Set(ROLE_FUNNEL_ORDER).size).toBe(ROLE_FUNNEL_ORDER.length)
+  })
+
+  it('runs shallowest to deepest engagement', () => {
+    const at = (r: string) => ROLE_FUNNEL_ORDER.indexOf(r as never)
+    expect(at('stargazers')).toBeLessThan(at('contributors'))
+    expect(at('contributors')).toBeLessThan(at('maintainers'))
+    expect(at('fork_owners')).toBeLessThan(at('pr_authors'))
   })
 })

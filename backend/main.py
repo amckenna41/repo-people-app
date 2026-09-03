@@ -9,7 +9,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -31,12 +31,16 @@ from store import (
     create_session, get_session, delete_session,
     add_oauth_state, consume_oauth_state, add_share_token, get_share_token,
     create_schedule, list_schedules, get_schedule, set_schedule_enabled,
+    count_jobs, prune_oldest_jobs,
     delete_schedule, claim_due_schedules, record_schedule_run, close_pool,
 )
-from worker import run_fetch_job
+from worker import run_fetch_job, shutdown_executor
 
 from pathlib import Path as _Path
 load_dotenv(_Path(__file__).resolve().parent / ".env", override=True)
+
+# Basic logging so startup prints are visible in Cloud Run logs
+logging.basicConfig(level=logging.INFO)
 
 # Maximum users fetchable per job on the hosted service.
 # Set FETCH_LIMIT=0 in .env to disable the cap (local installs).
@@ -52,7 +56,29 @@ FETCH_LIMIT: int = int(_raw_limit) if _raw_limit.isdigit() else 500
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+# BACKEND_URL is the redirect_uri this server advertises to GitHub. It must come
+# from configuration, never from the request — see _backend_base_url().
+_DEFAULT_BACKEND_URL = "http://localhost:8000"
+
+
+def _resolve_backend_url(raw: str | None) -> tuple[str, bool]:
+    """Normalise the configured BACKEND_URL, returning (url, was_configured).
+
+    A malformed value would be handed to GitHub as a redirect_uri, so it is
+    rejected here — at import — rather than at the first login attempt.
+    """
+    cleaned = (raw or "").strip().rstrip("/")
+    if not cleaned:
+        return _DEFAULT_BACKEND_URL, False
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError(
+            f"BACKEND_URL must be an absolute http(s) URL (got {cleaned!r})."
+        )
+    return cleaned, True
+
+
+BACKEND_URL, BACKEND_URL_IS_CONFIGURED = _resolve_backend_url(os.environ.get("BACKEND_URL"))
 SESSION_COOKIE = "rp_session"
 ANON_COOKIE = "rp_client"
 OAUTH_STATE_COOKIE = "rp_oauth_state"
@@ -66,14 +92,48 @@ if _cookie_samesite == "none":
     _cookie_secure = True
 
 
+# Hosts that can only be reached from this machine. Used to decide whether the
+# unconfigured localhost default is plausibly correct.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Presence of any of these means a proxy sits in front, so the externally
+# reachable URL is not something this process can infer.
+_FORWARDING_HEADERS = ("x-forwarded-host", "x-forwarded-proto", "forwarded")
+
+
 def _backend_base_url(request: Request) -> str:
-    """Return the externally reachable backend base URL for OAuth callbacks."""
-    configured = (BACKEND_URL or "").strip().rstrip("/")
-    if configured and configured != "http://localhost:8000":
-        return configured
-    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
+    """Return the externally reachable backend base URL for OAuth callbacks.
+
+    Derived from configuration only. This value becomes the `redirect_uri` sent
+    to GitHub, and it previously fell back to `X-Forwarded-Host`/`Host` whenever
+    BACKEND_URL was unset *or* left at the localhost default — both of which are
+    client-supplied. Anyone able to set `X-Forwarded-Host` on a request to
+    /auth/login (directly, or via an edge proxy that forwards client-supplied
+    headers) could make the server advertise a callback host of their choosing,
+    leaving GitHub's exact-match callback check as the only remaining defence.
+
+    Now: an explicitly configured BACKEND_URL is always used verbatim, and when
+    it is unset the localhost default is served only to a genuinely local
+    request with no proxy in front. Anything else is a misconfiguration and is
+    refused rather than guessed at.
+    """
+    if BACKEND_URL_IS_CONFIGURED:
+        return BACKEND_URL
+
+    client_host = request.client.host if request.client else ""
+    proxied = any(request.headers.get(h) for h in _FORWARDING_HEADERS)
+    if proxied or client_host not in _LOOPBACK_HOSTS:
+        logging.getLogger(__name__).error(
+            "Refusing to build an OAuth redirect_uri from request headers "
+            "(client=%s, proxied=%s). Set BACKEND_URL to this service's public URL.",
+            client_host or "unknown", proxied,
+        )
+        raise HTTPException(
+            500,
+            "GitHub OAuth is misconfigured on this server: BACKEND_URL is not set. "
+            "The administrator must set it to this service's public URL.",
+        )
+    return BACKEND_URL
 
 # Per-caller rate limit for expensive endpoints (/fetch, /import).
 # ponytail: in-memory per-instance window; move to Redis if you run >1 instance.
@@ -108,6 +168,7 @@ async def startup():
 async def shutdown():
     for task in _background:
         task.cancel()
+    shutdown_executor()
     await close_pool()
 
 
@@ -157,16 +218,46 @@ def _can_access(job: dict, key: str | None) -> bool:
     return owner is not None and key is not None and owner == key
 
 
-async def _get_owned_job(job_id: str, rp_session: str | None, rp_client: str | None):
+async def _get_owned_job(
+    job_id: str, rp_session: str | None, rp_client: str | None,
+    include_result: bool = True,
+):
     """Return the job only if the caller may access it, else None (missing OR forbidden —
-    callers raise 404 without leaking which)."""
-    job = await get_job_async(job_id)
+    callers raise 404 without leaking which).
+
+    Most job-scoped routes only need ownership and a little metadata. Reading the
+    result blob for those meant a rename, a tag edit, a delete or an SSE connect
+    pulled tens of MB out of the database and json.loads()'d it to decide whether
+    the caller owned the row. Pass `include_result=False` unless the payload is
+    actually used — the returned job's `result` is then always None.
+    """
+    job = await get_job_async(job_id, include_result=include_result)
     if job is None:
         return None
     key = await _reader_key(rp_session, rp_client)
     if not _can_access(job, key):
         return None
     return job
+
+
+async def _enforce_job_retention(owner_key: str) -> None:
+    """Evict an owner's oldest jobs once they exceed the retention cap.
+
+    Runs after the new job is inserted, so the freshly created one is always
+    among those kept. Best-effort: a pruning failure must not fail the fetch the
+    caller actually asked for.
+    """
+    if MAX_JOBS_PER_OWNER <= 0:
+        return
+    try:
+        if await count_jobs(owner_key) > MAX_JOBS_PER_OWNER:
+            removed = await prune_oldest_jobs(owner_key, keep=MAX_JOBS_PER_OWNER)
+            if removed:
+                logging.getLogger(__name__).info(
+                    "Retention: pruned %d job(s) for %s", len(removed), owner_key
+                )
+    except Exception:
+        logging.getLogger(__name__).exception("Job retention pruning failed")
 
 
 def _client_ip(request: Request) -> str:
@@ -191,7 +282,16 @@ def _rate_check(*keys: str) -> None:
             continue
         hits = [t for t in _rate_hits[key] if t > now - _RATE_WINDOW]
         if len(hits) >= _RATE_LIMIT:
-            raise HTTPException(429, f"Rate limit exceeded — max {_RATE_LIMIT} requests per minute.")
+            # Seconds until the oldest hit leaves the window — i.e. when a slot
+            # actually frees up. Without this the client can only guess, and
+            # retries either hammer the endpoint or wait far longer than needed.
+            retry_after = max(1, int(hits[0] + _RATE_WINDOW - now) + 1)
+            raise HTTPException(
+                429,
+                f"Rate limit exceeded — max {_RATE_LIMIT} requests per minute. "
+                f"Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
         hits.append(now)
         _rate_hits[key] = hits
 
@@ -257,7 +357,23 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Response headers are hidden from cross-origin JS unless named here, and
+    # the frontend and backend are on different origins in the hosted
+    # deployment — without this the Retry-After we set on 429 is unreadable.
+    expose_headers=["Retry-After"],
 )
+
+logging.info(f"CORS allowed origins: {_allowed_origins}")
+
+# OAuth needs an explicit public URL: the redirect_uri can no longer be inferred
+# from request headers, so an unset BACKEND_URL means logins fail anywhere except
+# a local, unproxied dev server. Surface that at boot rather than at first login.
+if GITHUB_CLIENT_ID and not BACKEND_URL_IS_CONFIGURED:
+    logging.warning(
+        "GitHub OAuth is enabled but BACKEND_URL is not set. Sign-in will only "
+        "work for local, unproxied requests. Set BACKEND_URL to this service's "
+        "public URL (e.g. https://your-service.run.app)."
+    )
 
 # ---------------------------------------------------------------------------
 # POST /fetch
@@ -315,6 +431,7 @@ async def fetch_users(
     # B4: Await DB insert before starting worker to avoid race condition.
     # Store params (no secrets) so the job can be refreshed later.
     job_id = await create_job_async(owner_key=owner_key, params=req.model_dump())
+    await _enforce_job_retention(owner_key)
     _start_fetch(background_tasks, job_id, req, token)
     return {"job_id": job_id}
 
@@ -333,7 +450,7 @@ async def refresh_job(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    job = await _get_owned_job(job_id, rp_session, rp_client)
+    job = await _get_owned_job(job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     params = job.get("params")
@@ -358,7 +475,7 @@ async def stream_job(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+    if await _get_owned_job(job_id, rp_session, rp_client, include_result=False) is None:
         raise HTTPException(status_code=404, detail="Job not found")
     job = get_job(job_id)
     if job is None:
@@ -393,7 +510,7 @@ async def cancel_job(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+    if await _get_owned_job(job_id, rp_session, rp_client, include_result=False) is None:
         raise HTTPException(status_code=404, detail="Job not found")
     job = get_job(job_id)
     if job is None:
@@ -426,7 +543,7 @@ async def remove_job(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+    if await _get_owned_job(job_id, rp_session, rp_client, include_result=False) is None:
         raise HTTPException(status_code=404, detail="Job not found")
     await delete_job(job_id)
     return {"deleted": True}
@@ -443,7 +560,7 @@ async def update_job_tags(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    if await _get_owned_job(job_id, rp_session, rp_client) is None:
+    if await _get_owned_job(job_id, rp_session, rp_client, include_result=False) is None:
         raise HTTPException(status_code=404, detail="Job not found")
     # BE2: Validated TagsRequest model (max 10 tags, max 50 chars each).
     cleaned = sorted({t.strip().lower() for t in body.tags if t.strip()})
@@ -465,7 +582,7 @@ async def rename_job(
     rp_client: str | None = Cookie(default=None),
 ):
     # BE1: Typed RenameJobRequest model. H4/B1: use get_job_async to avoid stale proxy.
-    job = await _get_owned_job(job_id, rp_session, rp_client)
+    job = await _get_owned_job(job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     # Awaited rather than assigned through the job proxy: a proxy write is
@@ -605,6 +722,10 @@ async def get_results(
     page_users = {u["login"]: u for u in all_users[start:start + page_size]}
     return {
         "users": page_users,
+        # Why the set may be smaller than expected — e.g. a role that needed a
+        # token and collected nothing. Streamed during the fetch, but the SSE
+        # queue is gone by the time anyone reads the results.
+        "warnings": job.get("warnings") or [],
         "total": total,
         "unfiltered_total": unfiltered_total,
         "page": page,
@@ -623,7 +744,9 @@ async def get_summary(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    job = await _get_owned_job(job_id, rp_session, rp_client)
+    # Metadata first: the summary is cached after the first call, so the common
+    # path returns without ever reading the result blob.
+    job = await _get_owned_job(job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -632,6 +755,11 @@ async def get_summary(
     # H7/B2/P4: Serve cached summary from DB when available — avoids recomputing on every call.
     if job.get("summary"):
         return job["summary"]
+
+    # Cache miss: now the payload really is needed. Ownership is already proven.
+    job = await get_job_async(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     result: dict[str, Any] = job["result"] or {}
     users = list(result.values())
@@ -740,7 +868,7 @@ async def get_job_history(
     retention (share of the previous run's members still present). One run
     returns a baseline with no deltas.
     """
-    job = await _get_owned_job(job_id, rp_session, rp_client)
+    job = await _get_owned_job(job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -812,7 +940,7 @@ async def add_schedule(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    job = await _get_owned_job(body.job_id, rp_session, rp_client)
+    job = await _get_owned_job(body.job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     params = job.get("params")
@@ -822,17 +950,24 @@ async def add_schedule(
             detail="This job has no saved parameters and cannot be scheduled.",
         )
     owner_key = await _owner_key(response, rp_session, rp_client)
-    existing = await list_schedules(owner_key)
-    # Each schedule is a recurring cost; cap how many one caller can create.
-    if len(existing) >= 10:
-        raise HTTPException(status_code=409, detail="Maximum of 10 schedules per account.")
-    return await create_schedule(
+    # Each schedule is a recurring cost, so cap how many one caller can create.
+    # Enforced inside create_schedule's transaction: a check here followed by an
+    # insert is a read-then-write race, and two concurrent POSTs (a double-click
+    # is enough) could both see the same under-cap count and both succeed.
+    created = await create_schedule(
         owner_key=owner_key,
         source_job_id=body.job_id,
         params=params,
         label=job.get("label"),
         interval_hours=body.interval_hours,
+        max_per_owner=MAX_SCHEDULES_PER_OWNER,
     )
+    if created is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Maximum of {MAX_SCHEDULES_PER_OWNER} schedules per account.",
+        )
+    return created
 
 
 @app.patch("/schedules/{schedule_id}")
@@ -864,6 +999,14 @@ async def remove_schedule(
 # Background loops
 # ---------------------------------------------------------------------------
 
+MAX_SCHEDULES_PER_OWNER = 10
+
+# Retention: the newest N jobs per owner are kept and older ones are evicted when
+# a new job is created. Only a per-minute rate limit existed before, so a caller
+# well inside it could accumulate rows indefinitely, each up to FETCH_LIMIT
+# profiles. Set MAX_JOBS_PER_OWNER=0 to disable (local installs).
+_raw_job_cap = os.environ.get("MAX_JOBS_PER_OWNER", "50")
+MAX_JOBS_PER_OWNER: int = int(_raw_job_cap) if _raw_job_cap.isdigit() else 50
 _SCHEDULE_TICK_SECONDS = int(os.environ.get("SCHEDULE_TICK_SECONDS", "300"))
 _MAINTENANCE_TICK_SECONDS = 3600
 
@@ -989,6 +1132,10 @@ async def compare_multi(
         raise HTTPException(status_code=422, detail="Need at least 2 job IDs")
     if len(req.job_ids) > 5:
         raise HTTPException(status_code=422, detail="Max 5 job IDs")
+    # A repeated id inflates n, which shifts the "in all" threshold and splits
+    # one job across two "exclusive" buckets — wrong numbers, returned silently.
+    if len(set(req.job_ids)) != len(req.job_ids):
+        raise HTTPException(status_code=422, detail="Duplicate job IDs are not allowed.")
 
     jobs_data: list[dict] = []
     for jid in req.job_ids:
@@ -1098,7 +1245,7 @@ async def create_share_token(
     rp_session: str | None = Cookie(default=None),
     rp_client: str | None = Cookie(default=None),
 ):
-    job = await _get_owned_job(job_id, rp_session, rp_client)
+    job = await _get_owned_job(job_id, rp_session, rp_client, include_result=False)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -1305,7 +1452,14 @@ async def auth_callback(
             headers={"Accept": "application/json"},
             timeout=15,
         )
-    token_data = token_resp.json()
+    try:
+        token_data = token_resp.json()
+    except ValueError:
+        # Non-JSON body: a GitHub incident, or an intercepting proxy returning
+        # an HTML error page. Previously surfaced as an uncaught JSONDecodeError.
+        raise HTTPException(502, "GitHub returned an unreadable token response.")
+    if not isinstance(token_data, dict):
+        raise HTTPException(502, "GitHub returned an unexpected token response.")
     access_token = token_data.get("access_token")
     if not access_token:
         error = token_data.get("error_description", "Unknown error from GitHub")
@@ -1323,13 +1477,21 @@ async def auth_callback(
         )
     if user_resp.status_code != 200:
         raise HTTPException(502, "Failed to fetch GitHub user profile.")
-    user_data = user_resp.json()
+    try:
+        user_data = user_resp.json()
+    except ValueError:
+        raise HTTPException(502, "GitHub returned an unreadable profile response.")
+    # `login` is the identity every job is keyed on (`gh:{login}`), so a missing
+    # or non-string value must fail loudly rather than key data under "None".
+    login = user_data.get("login") if isinstance(user_data, dict) else None
+    if not isinstance(login, str) or not login:
+        raise HTTPException(502, "GitHub profile response did not include a login.")
 
     session_id = secrets.token_urlsafe(32)
     await create_session(
         session_id=session_id,
         token=access_token,
-        login=user_data["login"],
+        login=login,
         name=user_data.get("name"),
         avatar=user_data.get("avatar_url"),
     )

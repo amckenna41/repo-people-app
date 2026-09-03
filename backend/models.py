@@ -11,7 +11,10 @@ class FetchRequest(BaseModel):
     repo: str = Field(..., min_length=1, max_length=100, pattern=_GITHUB_NAME_PATTERN)
     # Token is now sent via Authorization: Bearer header — removed from body (S1).
     roles: Optional[list[str]] = None
-    limit: Optional[int] = Field(default=None, ge=1)
+    # Upper bound so a typo (or a script) cannot request an effectively
+    # unbounded crawl on a self-hosted install running FETCH_LIMIT=0. Per role,
+    # matching how the worker applies it.
+    limit: Optional[int] = Field(default=None, ge=1, le=100_000)
     exclude_bots: bool = False
     include_social_accounts: bool = False
     workers: int = Field(default=5, ge=1, le=20)  # S4: cap worker count

@@ -173,6 +173,9 @@ export async function fetchResultsPage(
   filters: ResultFilters = {},
 ): Promise<{
   users: Record<string, unknown>
+  /** Why the set may be short — e.g. a role that needed a token. Persisted with
+   *  the job, so it survives the fetch's SSE stream. */
+  warnings?: string[]
   total: number
   unfiltered_total: number
   page: number

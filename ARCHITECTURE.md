@@ -88,6 +88,11 @@ manual chunks (`vite.config.ts:10-18`), so they don't load until an export runs.
 | `frontend/src/utils/errors.ts` | `friendlyFetchError` string mapper | Turning raw HTTP errors into prose | `FetchView` |
 | `frontend/src/types/index.ts` | TS interfaces + `ALL_ROLES` constant | Shared types; the *implicit* user schema | everything frontend |
 | `frontend/src/hooks/useNotification.ts` | Browser Notification wrapper | Desktop notification on fetch done | `FetchView` |
+| `frontend/src/hooks/useModalEscape.ts` | Escape-to-close + scroll lock | Consistent modal keyboard behaviour | all six modals |
+| `frontend/src/utils/localResults.ts` | Client-side filter/sort/summary | Rendering a shared link, which has no backend job | `ResultsView` |
+| `frontend/src/utils/colors.ts` | oklch → rgb shim | PDF export; html2canvas cannot parse CSS Color 4 | `ResultsView` |
+| `frontend/src/utils/estimate.ts` | Pre-flight fetch cost | Warning before an unbounded crawl | `FetchView` |
+| `frontend/src/components/VirtualList.tsx` | Row virtualization | Compare columns and the map modal | `CompareView`, `WorldMap` |
 | `tests/backend/` | pytest suites | Backend API + store tests | CI |
 | `frontend/src/tests/` | vitest suites | Frontend api/component tests | CI |
 | `vercel.json` | Vercel build + routes | One deploy target | Vercel |
@@ -192,9 +197,15 @@ Four tables:
 - Added by ad-hoc migrations: `tags` TEXT (JSON array, default `'[]'`),
   `owner_key` TEXT (scopes a job to its creator), `params_json` TEXT (original
   fetch request, for refresh), `repo_owner`/`repo_name` TEXT (denormalised so
-  history can group runs of a repo), and `logins_json` TEXT (the run's member
-  list, denormalised from `result_json` so `/jobs/{id}/history` never parses a
-  full result blob; legacy rows are backfilled on first read).
+  history can group runs of a repo), `logins_json` TEXT (the run's member list,
+  denormalised from `result_json` so `/jobs/{id}/history` never parses a full
+  result blob; legacy rows are backfilled on first read), and `warnings_json`
+  TEXT (per-role failures recorded during the fetch, so the reason a result set
+  came back short survives the SSE stream and the browser tab).
+- **Reads are split.** `_load_job_row(job_id, include_result=False)` selects an
+  explicit column list omitting `result_json`. Ownership checks, renames, tag
+  edits, deletes and SSE connects use it; only the routes that serve the payload
+  read the blob. On a 10,000-user job this is ~20 ms → ~1.5 ms per check.
 - `result_json` holds the whole `{login: userRecord}` map as a JSON string.
   **The per-user record itself has no schema on the backend** — it is whatever
   `repo_people.GitHubUserInfo.to_dict()` produces, stored verbatim. The only
