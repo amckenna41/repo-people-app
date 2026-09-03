@@ -2,6 +2,7 @@
 
 ![Vercel](https://therealsujitk-vercel-badge.vercel.app/?app=repo-people)
 [![PyPI version](https://badge.fury.io/py/repo-people.svg)](https://badge.fury.io/py/repo-people)
+[![pytest](https://github.com/amckenna41/repo-people-app/workflows/Building%20and%20Testing/badge.svg)](https://github.com/amckenna41/repo-people-app/actions?query=workflowBuilding%20and%20Testing)
 [![License: MIT](https://img.shields.io/badge/License-MIT-red.svg)](https://opensource.org/licenses/MIT)
 [![Issues](https://img.shields.io/github/issues/amckenna41/repo-people-app)](https://github.com/amckenna41/repo-people-app/issues)
 
