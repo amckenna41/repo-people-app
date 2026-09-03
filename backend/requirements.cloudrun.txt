@@ -8,7 +8,7 @@ aiosqlite>=0.22.1
 psycopg[binary,pool]>=3.2.0
 httpx>=0.28.1
 # Fernet encryption for OAuth session tokens at rest (see SESSION_TOKEN_KEY).
-cryptography>=43.0.0
+cryptography>=50.0.1
 # repo-people is the data engine — pinned to an exact PyPI release so Cloud Run
 # and CI build the same version as local/Vercel. Bump deliberately (Dependabot).
 repo-people==1.0.2
