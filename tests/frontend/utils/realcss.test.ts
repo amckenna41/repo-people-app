@@ -13,8 +13,10 @@ const cssFile = fs.existsSync(assets)
   ? fs.readdirSync(assets).find(f => f.endsWith('.css'))
   : undefined
 
+// skipIf skips running the tests, but the callback still runs to collect them,
+// so this has to survive there being no build to read (CI, a clean checkout).
 describe.skipIf(!cssFile)('built stylesheet', () => {
-  const css = fs.readFileSync(path.join(assets, cssFile!), 'utf8')
+  const css = cssFile ? fs.readFileSync(path.join(assets, cssFile), 'utf8') : ''
 
   it('contains oklch (i.e. the bug is reproducible from this file)', () => {
     expect(css).toContain('oklch(')
