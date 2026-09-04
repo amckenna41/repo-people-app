@@ -726,6 +726,10 @@ async def get_results(
         # token and collected nothing. Streamed during the fetch, but the SSE
         # queue is gone by the time anyone reads the results.
         "warnings": job.get("warnings") or [],
+        # How many usernames each requested role contributed. A role that came
+        # back empty without erroring produces no warning, so the counts are the
+        # only place that gap is visible after the fetch.
+        "role_counts": job.get("role_counts") or {},
         "total": total,
         "unfiltered_total": unfiltered_total,
         "page": page,

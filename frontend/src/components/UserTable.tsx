@@ -339,7 +339,7 @@ export default function UserTable({
             <Eye size={14} /> Columns
           </button>
           {showVisibilityMenu && (
-            <div className="absolute left-0 top-full mt-1 rounded-lg shadow-xl z-20 p-3 space-y-2 min-w-56" style={{
+            <div className="absolute left-0 top-full mt-1 rounded-lg shadow-xl z-20 p-3 space-y-2 w-[30rem] max-w-[calc(100vw-2rem)]" style={{
               background: 'rgba(20,16,48,0.97)',
               border: '1px solid rgba(255,255,255,0.10)',
               backdropFilter: 'blur(12px)',
@@ -376,18 +376,26 @@ export default function UserTable({
                   <Square size={12} /> Deselect All
                 </button>
               </div>
-              <div className="grid grid-cols-2 gap-1">
+              <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 max-h-72 overflow-y-auto">
                 {table.getAllLeafColumns()
                   .filter(c => c.id !== 'avatar_url' && c.id.toLowerCase().includes(visibilitySearch.toLowerCase()))
                   .map(c => (
-                  <label key={c.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                  <label
+                    key={c.id}
+                    title={c.id}
+                    className="flex items-center gap-2 text-xs cursor-pointer min-w-0 px-1 py-0.5 rounded-sm hover:bg-white/5"
+                  >
                     <input
                       type="checkbox"
                       checked={c.getIsVisible()}
                       onChange={c.getToggleVisibilityHandler()}
-                      className="accent-brand-500"
+                      className="accent-brand-500 shrink-0"
                     />
-                    {c.id}
+                    {/* Ids like `location_normalized` and `account_age_days` are
+                        longer than a narrow grid cell; without min-w-0 the flex
+                        item refuses to shrink and the text runs into its
+                        neighbour instead of truncating. */}
+                    <span className="truncate">{c.id}</span>
                   </label>
                 ))}
               </div>
@@ -607,7 +615,8 @@ export default function UserTable({
             </div>
           ) : (
             <table className="w-full text-sm">
-              <tbody style={{ display: 'block', height: totalVirtualHeight, position: 'relative' }}>
+              {/* data-pdf-rows: the PDF export may start a page at any row here. */}
+              <tbody data-pdf-rows style={{ display: 'block', height: totalVirtualHeight, position: 'relative' }}>
                 {virtualItems.map(vi => {
                   const row = allRows[vi.index]
                   return (

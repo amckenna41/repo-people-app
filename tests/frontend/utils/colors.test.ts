@@ -11,6 +11,7 @@ import {
   hasUnsupportedColor,
   replaceUnsupportedColors,
   inlineComputedColors,
+  inlineColorsWithUndo,
   buildColorVariableOverrides,
 } from '../../../frontend/src/utils/colors'
 
@@ -58,14 +59,28 @@ describe('replaceUnsupportedColors', () => {
     expect(out).toBe('0 0 14px rgb(9, 9, 9)')
   })
 
-  it('handles nested parentheses without truncating', () => {
+  it('consumes a whole color-mix, nested parentheses and all', () => {
     // The scanner must count depth; a naive match to the first ")" would cut
-    // this in half and emit invalid CSS.
+    // this in half and emit invalid CSS. color-mix is itself unsupported, so
+    // the entire function is replaced rather than only its inner oklch — the
+    // browser resolves the mix for us when the converter paints it.
     const src = 'color-mix(in oklch, oklch(0.7 0.1 200 / calc(1 * 0.5)) 50%, white)'
-    const out = replaceUnsupportedColors(src, () => 'RGB')
-    expect(out).toContain('white')
-    expect(out).not.toContain('calc')      // the whole function was consumed
-    expect(out.match(/\(/g)?.length).toBe(out.match(/\)/g)?.length)
+    expect(replaceUnsupportedColors(src, () => 'RGB')).toBe('RGB')
+  })
+
+  it('converts a Tailwind opacity modifier', () => {
+    // Every `bg-white/5`-style utility compiles to this; `color(` does not
+    // match `color-mix(`, so these used to sail through the gate untouched.
+    const src = 'color-mix(in oklab, rgb(255, 255, 255) 5%, transparent)'
+    expect(hasUnsupportedColor(src)).toBe(true)
+    expect(replaceUnsupportedColors(src, () => 'rgba(255, 255, 255, 0.05)'))
+      .toBe('rgba(255, 255, 255, 0.05)')
+  })
+
+  it('keeps a color-mix embedded in a larger value in place', () => {
+    const src = 'linear-gradient(#fff, color-mix(in oklab, red 50%, blue))'
+    expect(replaceUnsupportedColors(src, () => 'RGB'))
+      .toBe('linear-gradient(#fff, RGB)')
   })
 
   it('leaves an unbalanced value alone rather than corrupting it', () => {
@@ -135,11 +150,92 @@ describe('inlineComputedColors', () => {
     el.remove()
   })
 
+  it('patches properties the old hand-written list missed', () => {
+    // accent-color (the table checkboxes) and text-shadow were not in the
+    // enumerated list, so an oklch value on either reached html2canvas and
+    // failed the export. The scan is derived from the computed style now.
+    const el = document.createElement('input')
+    el.style.setProperty('accent-color', 'oklch(0.5 0.2 300)')
+    el.style.setProperty('text-shadow', '0 1px 2px oklch(0.2 0.1 20)')
+    document.body.appendChild(el)
+
+    inlineComputedColors(el, () => 'rgb(9, 9, 9)')
+
+    expect(el.style.getPropertyValue('accent-color')).toBe('rgb(9, 9, 9)')
+    expect(el.style.getPropertyValue('text-shadow')).toBe('0 1px 2px rgb(9, 9, 9)')
+    el.remove()
+  })
+
   it('returns 0 for a detached element rather than throwing', () => {
     // No ownerDocument.defaultView when the node is not in a live document.
     const orphan = document.implementation.createHTMLDocument().createElement('div')
     Object.defineProperty(orphan.ownerDocument, 'defaultView', { value: null })
     expect(() => inlineComputedColors(orphan, () => 'RGB')).not.toThrow()
+  })
+})
+
+describe('inlineColorsWithUndo', () => {
+  it('freezes animations only inside the captured subtree', () => {
+    // A blanket `*` freeze also stopped the export button's own spinner — the
+    // only thing telling the user the export was running.
+    const report = document.createElement('div')
+    const outside = document.createElement('div')
+    outside.className = 'animate-spin'
+    document.body.append(report, outside)
+
+    const undo = inlineColorsWithUndo(report, () => 'rgb(9, 9, 9)')
+    const css = [...document.querySelectorAll('style[data-h2c-freeze]')].map(s => s.textContent).join('')
+    expect(css).toContain('animation:none')
+    expect(css).not.toMatch(/^\*,/)                 // not a blanket selector
+    expect(report.hasAttribute('data-rp-freeze')).toBe(true)
+    expect(outside.hasAttribute('data-rp-freeze')).toBe(false)
+
+    undo()
+    expect(document.querySelector('style[data-h2c-freeze]')).toBeNull()
+    expect(report.hasAttribute('data-rp-freeze')).toBe(false)
+    report.remove(); outside.remove()
+  })
+
+  it('restores the inline styles it overwrote', () => {
+    const el = document.createElement('div')
+    el.style.setProperty('color', 'oklch(0.5 0.2 300)')
+    el.style.setProperty('background-color', 'rgb(1, 2, 3)')
+    document.body.appendChild(el)
+
+    const undo = inlineColorsWithUndo(el, () => 'rgb(9, 9, 9)')
+    expect(el.style.getPropertyValue('color')).toBe('rgb(9, 9, 9)')
+
+    undo()
+    expect(el.style.getPropertyValue('color')).toBe('oklch(0.5 0.2 300)')
+    expect(el.style.getPropertyValue('background-color')).toBe('rgb(1, 2, 3)')
+    el.remove()
+  })
+
+  it('removes a property that had no inline value to begin with', () => {
+    // The patch must not leave a declaration behind on the live page.
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    el.style.setProperty('color', 'oklch(0.5 0.2 300)')
+    const before = el.getAttribute('style')
+
+    inlineColorsWithUndo(el, () => 'rgb(9, 9, 9)')()
+
+    expect(el.getAttribute('style')).toBe(before)
+    el.remove()
+  })
+
+  it('converts the oklab a Tailwind opacity utility resolves to', () => {
+    // --color-white is #fff, not oklch, so the palette override never touches
+    // it — yet `bg-white/10` computes to oklab(). This is the value that broke
+    // the export after the variable overrides were already in place.
+    const el = document.createElement('div')
+    el.style.setProperty('background-color', 'oklab(1 0 0 / 0.1)')
+    document.body.appendChild(el)
+
+    inlineColorsWithUndo(el, () => 'rgba(255, 255, 255, 0.1)')
+
+    expect(el.style.getPropertyValue('background-color')).toBe('rgba(255, 255, 255, 0.1)')
+    el.remove()
   })
 })
 

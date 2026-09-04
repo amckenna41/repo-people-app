@@ -1,13 +1,13 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
-import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, ShieldCheck, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Loader2, X, ExternalLink, Key, ShieldAlert, ShieldCheck, Upload, FileJson, Plus, Trash2, CopyCheck, Info, StopCircle, RotateCcw, History, RefreshCw, Star } from 'lucide-react'
 import { Github } from '../components/GithubIcon'
-import { postFetch, postImport, cancelJob, openAuthPopup, openJobStream, beaconCancelJob, validateGitHubToken, type TokenValidation } from '../utils/api'
+import { postFetch, postImport, cancelJob, openAuthPopup, openJobStream, beaconCancelJob, validateGitHubToken, fetchRepoStars, type TokenValidation } from '../utils/api'
 import { friendlyFetchError } from '../utils/errors'
 import type { JobInfo, AuthUser } from '../types'
 import { ALL_ROLES, ROLE_COLORS } from '../types'
 import { useNotification } from '../hooks/useNotification'
 import { useModalEscape } from '../hooks/useModalEscape'
-import { estimateFetch, humaniseDuration } from '../utils/estimate'
+import { estimateFetch, humaniseDuration, predictUsersFromStars, isLargeRun } from '../utils/estimate'
 
 interface Props {
   jobs: JobInfo[]
@@ -56,6 +56,13 @@ function saveHistory(entry: HistoryEntry, prev: HistoryEntry[]): HistoryEntry[] 
 /** How old a completed job can be before we stop warning about re-fetching (ms). */
 const RECENT_FETCH_THRESHOLD_MS = 10 * 60 * 1000 // 10 minutes
 
+/** A repo big enough that the run is worth confirming, with the numbers shown. */
+interface LargeRepo {
+  label: string
+  stars: number
+  predictedUsers: number
+}
+
 interface RecentMatch {
   owner: string
   repo: string
@@ -97,6 +104,8 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
   const [showTokenModal, setShowTokenModal] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([])
+  const [largeRepos, setLargeRepos] = useState<LargeRepo[]>([])
+  const [checkingSize, setCheckingSize] = useState(false)
   const [pendingToken, setPendingToken] = useState<string>('')
   const [tokenCheck, setTokenCheck] = useState<TokenValidation | null>(null)
   const [checkingToken, setCheckingToken] = useState(false)
@@ -127,7 +136,12 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
     repoCount: repos.filter(r => r.owner.trim() && r.repo.trim()).length || 1,
   }), [roles.size, limit, FETCH_LIMIT, workers, repos])
 
+  // Nothing to fetch with zero roles — drives both the disabled styling and the
+  // tooltip that explains why the button will not start a run.
+  const noRoles = roles.size === 0
+
   useModalEscape(recentMatches.length > 0 ? cancelRefetch : null)
+  useModalEscape(largeRepos.length > 0 ? cancelLargeRun : null)
   useModalEscape(showTokenModal ? () => setShowTokenModal(false) : null)
 
   // Cancel the active job if the user refreshes or closes the tab
@@ -446,6 +460,10 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
       setError('Please enter at least one repository owner and repository name.')
       return
     }
+    if (roles.size === 0) {
+      setError('Please select at least one role to fetch.')
+      return
+    }
     // When logged in via OAuth, the backend uses the session token automatically.
     if (!token && !authUser) {
       setShowTokenModal(true)
@@ -480,18 +498,72 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
       return
     }
 
+    await maybeConfirmSize(valid, resolvedToken)
+  }
+
+  /** Ask GitHub how big each repo is, and confirm before an expensive run.
+   *
+   *  One cheap call per repo. Any repo we cannot size (private, rate-limited,
+   *  offline) simply does not raise the dialog — the fetch the user asked for
+   *  always wins over our ability to preview its cost.
+   */
+  async function maybeConfirmSize(
+    valid: { owner: string; repo: string }[],
+    resolvedToken: string,
+  ) {
+    setCheckingSize(true)
+    let big: LargeRepo[]
+    try {
+      const sized = await Promise.all(
+        valid.map(async ({ owner, repo }) => {
+          const stars = await fetchRepoStars(owner.trim(), repo.trim(), resolvedToken)
+          if (stars === null) return null
+          return {
+            label: `${owner.trim()}/${repo.trim()}`,
+            stars,
+            predictedUsers: predictUsersFromStars(stars, {
+              roleCount: roles.size,
+              perRoleLimit: limit ? Number(limit) : null,
+              serverCap: FETCH_LIMIT,
+            }),
+          }
+        }),
+      )
+      big = sized.filter((r): r is LargeRepo => r !== null && isLargeRun(r.stars, r.predictedUsers))
+    } finally {
+      setCheckingSize(false)
+    }
+
+    if (big.length > 0) {
+      setLargeRepos(big)
+      setPendingToken(resolvedToken)
+      return
+    }
     await runAllFetches(resolvedToken)
   }
 
   function confirmRefetch() {
     const t = pendingToken
     setRecentMatches([])
-    setPendingToken('')
-    runAllFetches(t)
+    // Keep pendingToken: the size check runs next and needs it.
+    const valid = repos.filter(r => r.owner.trim() && r.repo.trim())
+    void maybeConfirmSize(valid, t)
   }
 
   function cancelRefetch() {
     setRecentMatches([])
+    setPendingToken('')
+  }
+
+  function confirmLargeRun() {
+    const t = pendingToken
+    setLargeRepos([])
+    setPendingToken('')
+    runAllFetches(t)
+  }
+
+  function cancelLargeRun() {
+    setLargeRepos([])
     setPendingToken('')
   }
 
@@ -513,7 +585,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
     setStoppedByUser(false)
     doneRef.current = false
     startTimeRef.current = null
-    runAllFetches('')
+    void maybeConfirmSize(repos.filter(r => r.owner.trim() && r.repo.trim()), '')
   }
 
   const progressPct = progress && progress.total > 0
@@ -708,11 +780,13 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                   >
                     <p className="font-semibold text-white mb-1.5 flex items-center gap-1"><Key size={11} /> How to get a token</p>
                     <ol className="space-y-1 text-gray-400">
-                      <li><span className="text-purple-400 font-bold">1.</span> Go to <span className="text-blue-400">github.com/settings/tokens/new</span></li>
+                      <li><span className="text-purple-400 font-bold">1.</span> Go to <span className="text-blue-400">github.com/settings/tokens/new</span> → <strong className="text-white">Tokens (classic)</strong></li>
                       <li><span className="text-purple-400 font-bold">2.</span> Give it a name &amp; set an expiry</li>
-                      <li><span className="text-purple-400 font-bold">3.</span> Select the <code className="bg-white/10 px-1 rounded-sm">public_repo</code> scope</li>
+                      <li><span className="text-purple-400 font-bold">3.</span> Tick <code className="bg-white/10 px-1 rounded-sm text-amber-300">public_repo</code> — the sub-box under <code className="bg-white/10 px-1 rounded-sm">repo</code>, not <code className="bg-white/10 px-1 rounded-sm">repo</code> itself</li>
                       <li><span className="text-purple-400 font-bold">4.</span> Click <strong className="text-white">Generate token</strong> and paste it here</li>
                     </ol>
+                    <p className="mt-1.5 text-amber-300/90">Without <code className="bg-white/10 px-1 rounded-sm">public_repo</code>, GitHub returns 403 for Stargazers, Watchers and Maintainers — those roles come back empty.</p>
+                    <p className="mt-1 text-gray-500">Fine-grained token? It needs <code className="bg-white/10 px-1 rounded-sm">Metadata: Read-only</code> <em>and</em> this repo in its Repository access list.</p>
                     <p className="mt-1.5 text-gray-500">A token raises the rate limit from 60 to 5,000 req/hr.</p>
                   </div>
                 </div>
@@ -769,7 +843,7 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                         )}
                         {tokenCheck.fineGrained && (
                           <span className="block mt-0.5 text-gray-400">
-                            Fine-grained token — scopes can&apos;t be checked here. Ensure it grants read access to public repositories.
+                            Fine-grained token — scopes can&apos;t be checked here. It needs <code className="bg-white/10 px-1 rounded-sm">Metadata: Read-only</code> <em>and</em> the target repo in its Repository access list, or Stargazers, Watchers and Maintainers will return 403 and come back empty.
                           </span>
                         )}
                       </>
@@ -834,11 +908,12 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                 <span className="ml-1.5 text-xs text-amber-400">(max {FETCH_LIMIT} on hosted app)</span>
               )}
             </label>
-            {/* Pre-flight cost. An uncapped self-hosted install has no ceiling
-                at all, so say so before the run rather than after. */}
-            <p className={`text-xs mb-2 ${estimate.unbounded ? 'text-amber-400' : 'text-gray-500'}`}>
+            {/* Pre-flight cost. With no cap there is no number to show yet — the
+                real size check happens against GitHub on submit, which is where
+                an expensive run gets confirmed. */}
+            <p className="text-xs mb-2 text-gray-500">
               {estimate.unbounded
-                ? '⚠ No limit set — this will fetch every user in every selected role, which can take hours and exhaust your API quota.'
+                ? 'No limit — fetches every user in every selected role.'
                 : `≈ up to ${estimate.users!.toLocaleString()} profiles · ${humaniseDuration(estimate.seconds!)} · ~${estimate.apiCalls!.toLocaleString()} API calls`}
             </p>
             {/* Quick-select presets */}
@@ -986,14 +1061,39 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
         )}
 
         <div className="flex gap-3">
-          <button type="submit" className="btn-primary flex-1" disabled={running}>
-            {running ? (
-              <span className="flex items-center justify-center gap-2">
-                <Loader2 size={16} className="animate-spin" />
-                Fetching…
-              </span>
-            ) : 'Start Fetch'}
-          </button>
+          {/* Wrapped so the no-roles tooltip has a hover target. A `disabled`
+              button fires no mouse events, so a plain `title` on it never shows
+              — hence aria-disabled plus the guard in handleSubmit, which keeps
+              the button focusable for keyboard users. */}
+          <div className="relative group flex-1">
+            <button
+              type="submit"
+              className={`btn-primary w-full ${noRoles ? 'opacity-40 cursor-not-allowed' : ''}`}
+              disabled={running || checkingSize}
+              aria-disabled={noRoles}
+            >
+              {running || checkingSize ? (
+                <span className="flex items-center justify-center gap-2">
+                  <Loader2 size={16} className="animate-spin" />
+                  {checkingSize ? 'Checking size…' : 'Fetching…'}
+                </span>
+              ) : 'Start Fetch'}
+            </button>
+            {noRoles && (
+              <div
+                role="tooltip"
+                className="pointer-events-none absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 rounded-xl p-3 text-xs text-gray-300 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
+                style={{
+                  background: 'rgba(15,12,35,0.97)',
+                  border: '1px solid rgba(139,92,246,0.3)',
+                  boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                }}
+              >
+                Select at least one user role to fetch — no roles are selected, so
+                there is nothing to fetch.
+              </div>
+            )}
+          </div>
           {!running && (repos[0]?.owner || repos[0]?.repo || token || log.length > 0 || done) && (
             <button
               type="button"
@@ -1147,6 +1247,85 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
           </div>
         )}
       </div>
+
+      {/* Large-run confirmation modal */}
+      {largeRepos.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }}
+          onClick={cancelLargeRun}
+        >
+          <div
+            className="relative w-full max-w-md rounded-2xl p-6 space-y-4"
+            style={{
+              background: 'rgba(14,10,32,0.97)',
+              border: '1px solid rgba(251,191,36,0.35)',
+              boxShadow: '0 0 40px rgba(251,191,36,0.15), 0 24px 48px rgba(0,0,0,0.6)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div
+                className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center mt-0.5"
+                style={{ background: 'rgba(251,191,36,0.12)', border: '1px solid rgba(251,191,36,0.25)' }}
+              >
+                <Star size={18} style={{ color: '#fbbf24' }} />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">This could take a while</h3>
+                <p className="text-sm text-gray-400 mt-0.5">
+                  {largeRepos.length === 1
+                    ? 'This repository is large enough that the run may be slow and use a lot of API quota.'
+                    : `${largeRepos.length} of these repositories are large enough that the run may be slow and use a lot of API quota.`}
+                </p>
+              </div>
+              <button
+                onClick={cancelLargeRun}
+                className="ml-auto shrink-0 p-1.5 rounded-lg text-gray-500 hover:text-white transition-colors"
+                style={{ background: 'rgba(255,255,255,0.06)' }}
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {largeRepos.map(r => (
+                <div
+                  key={r.label}
+                  className="flex items-center justify-between rounded-lg px-3 py-2 text-sm"
+                  style={{ background: 'rgba(251,191,36,0.07)', border: '1px solid rgba(251,191,36,0.15)' }}
+                >
+                  <span className="font-mono text-gray-200">{r.label}</span>
+                  <span className="text-xs text-gray-500 shrink-0 ml-3">
+                    {r.stars.toLocaleString()} stars · ~{r.predictedUsers.toLocaleString()} users
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <p className="text-xs text-gray-500">
+              This estimate is based on the repository&rsquo;s star count, so the real
+              total will differ. Set a &ldquo;limit per role&rdquo; to cap the run.
+            </p>
+
+            <div className="flex gap-3 pt-1">
+              <button onClick={cancelLargeRun} className="btn-secondary flex-1">
+                Cancel
+              </button>
+              <button
+                onClick={confirmLargeRun}
+                className="flex-1 flex items-center justify-center gap-2 rounded-xl py-2.5 px-4 text-sm font-semibold text-white transition-all"
+                style={{
+                  background: 'linear-gradient(135deg, rgba(251,191,36,0.25), rgba(251,191,36,0.15))',
+                  border: '1px solid rgba(251,191,36,0.4)',
+                }}
+              >
+                Fetch anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Recent-fetch confirmation modal */}
       {recentMatches.length > 0 && (
@@ -1305,13 +1484,24 @@ export default function FetchView({ jobs, onJobCreated, onJobUpdate, onViewResul
                   </li>
                   <li className="flex gap-2">
                     <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>3</span>
-                    <span>Select the <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>public_repo</code> scope (read-only access to public repos is all that's needed).</span>
+                    <span>
+                      Under <strong className="text-white">Tokens (classic)</strong>, tick <code className="text-xs px-1 py-0.5 rounded-sm text-amber-300" style={{ background: 'rgba(255,255,255,0.08)' }}>public_repo</code> — the sub-box under <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>repo</code>, not <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>repo</code> itself. Optionally add <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>read:user</code> and <code className="text-xs px-1 py-0.5 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>user:email</code> for richer profile fields. Leave everything else unticked.
+                    </span>
                   </li>
                   <li className="flex gap-2">
                     <span className="shrink-0 w-5 h-5 rounded-full text-xs flex items-center justify-center font-bold text-white" style={{ background: 'linear-gradient(135deg,#7c3aed,#2563eb)' }}>4</span>
                     <span>Click <strong className="text-white">Generate token</strong>, then copy it and paste it into the token field.</span>
                   </li>
                 </ol>
+                <div className="rounded-lg p-3 text-xs space-y-1.5" style={{ background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.22)' }}>
+                  <p className="text-amber-300 font-medium flex items-center gap-1.5"><ShieldAlert size={12} /> Scopes are not just about rate limits</p>
+                  <p className="text-gray-400">
+                    GitHub rejects <code className="px-1 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>/stargazers</code>, <code className="px-1 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>/subscribers</code> and <code className="px-1 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>/collaborators</code> without authorisation, so a token missing <code className="px-1 rounded-sm text-amber-300" style={{ background: 'rgba(255,255,255,0.08)' }}>public_repo</code> silently drops the <strong className="text-gray-300">Stargazers</strong>, <strong className="text-gray-300">Watchers</strong> and <strong className="text-gray-300">Maintainers</strong> roles — often most of the users in a repo.
+                  </p>
+                  <p className="text-gray-400">
+                    <strong className="text-gray-300">Fine-grained tokens:</strong> these authenticate fine and then return 403 on those same three roles. Set <em>Repository access</em> to <strong className="text-gray-300">All repositories</strong> (or add the repo explicitly) and confirm <code className="px-1 rounded-sm" style={{ background: 'rgba(255,255,255,0.08)' }}>Metadata: Read-only</code> is granted. A classic token is the simpler path.
+                  </p>
+                </div>
                 <p className="text-xs text-gray-500 pt-1">
                   With a token, the rate limit increases to <span className="text-emerald-400 font-medium">5,000 requests/hour</span>. Your token is only sent to your local backend and never stored.
                 </p>

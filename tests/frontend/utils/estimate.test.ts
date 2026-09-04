@@ -7,7 +7,13 @@
  * the boundaries, not the constants.
  */
 import { describe, expect, it } from 'vitest'
-import { estimateFetch, humaniseDuration } from '../../../frontend/src/utils/estimate'
+import {
+  estimateFetch,
+  humaniseDuration,
+  predictUsersFromStars,
+  isLargeRun,
+  LARGE_RUN_THRESHOLD,
+} from '../../../frontend/src/utils/estimate'
 
 const base = { roleCount: 3, perRoleLimit: 100, serverCap: 0, workers: 5, repoCount: 1 }
 
@@ -81,5 +87,48 @@ describe('humaniseDuration', () => {
 
   it('uses the singular for one minute', () => {
     expect(humaniseDuration(60)).not.toContain('minutes')
+  })
+})
+
+describe('predictUsersFromStars', () => {
+  const opts = { roleCount: 3, perRoleLimit: null, serverCap: 0 }
+
+  it('uses the star count as the prediction when nothing caps the run', () => {
+    expect(predictUsersFromStars(1200, opts)).toBe(1200)
+  })
+
+  it('caps at limit x roles when a per-role limit is set', () => {
+    expect(predictUsersFromStars(10_000, { ...opts, perRoleLimit: 100 })).toBe(300)
+  })
+
+  it('does not inflate a small repo up to the per-role cap', () => {
+    expect(predictUsersFromStars(12, { ...opts, perRoleLimit: 100 })).toBe(12)
+  })
+
+  it('respects the server cap', () => {
+    expect(predictUsersFromStars(10_000, { ...opts, serverCap: 500 })).toBe(500)
+  })
+
+  it('treats a zero-star repo as zero users', () => {
+    expect(predictUsersFromStars(0, opts)).toBe(0)
+  })
+})
+
+describe('isLargeRun', () => {
+  it('flags a repo at the star threshold', () => {
+    expect(isLargeRun(LARGE_RUN_THRESHOLD, 10)).toBe(true)
+  })
+
+  it('flags a run whose predicted users cross the threshold', () => {
+    // Few stars can still mean a big run once every role is summed.
+    expect(isLargeRun(10, LARGE_RUN_THRESHOLD)).toBe(true)
+  })
+
+  it('leaves a small repo alone', () => {
+    expect(isLargeRun(3, 3)).toBe(false)
+  })
+
+  it('does not flag just below the threshold', () => {
+    expect(isLargeRun(LARGE_RUN_THRESHOLD - 1, LARGE_RUN_THRESHOLD - 1)).toBe(false)
   })
 })

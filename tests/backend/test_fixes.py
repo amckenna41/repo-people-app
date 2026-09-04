@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,8 +83,13 @@ class TestCancellation:
 # Fetch limits — the cost cap that used to be silently ignored
 # ---------------------------------------------------------------------------
 
+@contextmanager
 def _mock_github_env(users_per_role: int):
-    """Patch worker's GitHub surface so run_fetch_job does no network I/O."""
+    """Patch worker's GitHub surface so run_fetch_job does no network I/O.
+
+    Yields the patched mocks so a test can assert on which exports were called,
+    not just on the row count they produced.
+    """
     logins = [f"user{i:03d}" for i in range(users_per_role)]
 
     export = MagicMock()
@@ -99,12 +105,13 @@ def _mock_github_env(users_per_role: int):
         info.to_dict.return_value = {"login": username, "is_bot": False}
         return info
 
-    return patch.multiple(
+    with patch.multiple(
         worker,
         rp_export=export,
         GitHubUserInfo=_user_info,
         Github=MagicMock(),
-    )
+    ):
+        yield {"rp_export": export}
 
 
 async def _run(job_id: str, **kwargs):
@@ -146,6 +153,40 @@ class TestFetchLimits:
         assert job["total_fetched"] == 15
 
     @pytest.mark.asyncio
+    async def test_role_counts_persisted_per_role(self):
+        # The per-role yield was only ever streamed to the SSE log, so a role
+        # that came back empty left no trace on the finished job.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(6):
+            await _run(job_id, roles=["contributors", "stargazers"], limit=None,
+                       max_total=None)
+        job = await store.get_job_async(job_id)
+        assert job["role_counts"] == {"contributors": 6, "stargazers": 6}
+
+    @pytest.mark.asyncio
+    async def test_role_counts_record_an_empty_role(self):
+        # A role GitHub answers with an empty list raises nothing, so it emits
+        # no warning — the count is the only place the gap shows up.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(4) as mocks:
+            mocks["rp_export"].export_stargazers.return_value = []
+            await _run(job_id, roles=["contributors", "stargazers"], limit=None,
+                       max_total=None)
+        job = await store.get_job_async(job_id)
+        assert job["role_counts"]["stargazers"] == 0
+        assert job["role_counts"]["contributors"] == 4
+
+    @pytest.mark.asyncio
+    async def test_role_counts_respect_the_per_role_limit(self):
+        # The count must describe what was actually collected, not what GitHub
+        # offered, or it contradicts the result set beside it.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(20):
+            await _run(job_id, roles=["contributors"], limit=5, max_total=None)
+        job = await store.get_job_async(job_id)
+        assert job["role_counts"] == {"contributors": 5}
+
+    @pytest.mark.asyncio
     async def test_capped_run_keeps_roles_consistent(self):
         job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
         with _mock_github_env(40):
@@ -153,6 +194,130 @@ class TestFetchLimits:
         job = await store.get_job_async(job_id)
         # Every retained user still carries its role membership.
         assert all(u["roles"] for u in job["result"].values())
+
+
+# ---------------------------------------------------------------------------
+# Role selection — an empty list used to be falsy and fell back to every role
+# ---------------------------------------------------------------------------
+
+class TestRoleSelection:
+    @pytest.mark.asyncio
+    async def test_no_roles_selected_fetches_nothing(self):
+        """`roles=[]` means "none", not "all" — the old `roles or ALL` read it as all."""
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(25):
+            await _run(job_id, roles=[])
+        job = await store.get_job_async(job_id)
+        assert job["total_fetched"] == 0
+        assert job["result"] == {}
+
+    @pytest.mark.asyncio
+    async def test_no_roles_selected_calls_no_export_function(self):
+        # The count alone would still pass if we fetched every role and then
+        # discarded the rows, so assert the network work never happened.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(25) as mocks:
+            await _run(job_id, roles=[])
+        export = mocks["rp_export"]
+        for name in (
+            "export_contributors", "export_maintainers", "export_stargazers",
+            "export_watchers", "export_issue_authors", "export_pr_authors",
+            "export_fork_owners", "export_commit_authors", "export_dependents",
+        ):
+            assert getattr(export, name).call_count == 0, f"{name} was called"
+
+    @pytest.mark.asyncio
+    async def test_roles_none_still_means_every_role(self):
+        # The documented default for an API caller that omits the field.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(4) as mocks:
+            await _run(job_id, roles=None)
+        assert mocks["rp_export"].export_stargazers.call_count == 1
+        job = await store.get_job_async(job_id)
+        assert job["total_fetched"] == 4
+
+    @pytest.mark.asyncio
+    async def test_unknown_roles_only_fetches_nothing(self):
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with _mock_github_env(25):
+            await _run(job_id, roles=["not_a_role"])
+        job = await store.get_job_async(job_id)
+        assert job["total_fetched"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Silently-empty auth roles — GitHub 401s them anonymously, but the export
+# helpers swallow it and return [], so the run just lost its stargazers.
+# ---------------------------------------------------------------------------
+
+class TestAuthRequiredRolesReturningEmpty:
+    @staticmethod
+    def _env(empty_roles: set[str], users_per_role: int = 5):
+        """Like _mock_github_env, but some roles return [] instead of raising."""
+        logins = [f"user{i:03d}" for i in range(users_per_role)]
+        export = MagicMock()
+        for name in (
+            "export_contributors", "export_maintainers", "export_stargazers",
+            "export_watchers", "export_issue_authors", "export_pr_authors",
+            "export_fork_owners", "export_commit_authors", "export_dependents",
+        ):
+            role = name.removeprefix("export_")
+            getattr(export, name).return_value = [] if role in empty_roles else list(logins)
+
+        def _user_info(gh, username):
+            info = MagicMock()
+            info.to_dict.return_value = {"login": username, "is_bot": False}
+            return info
+
+        return patch.multiple(
+            worker, rp_export=export, GitHubUserInfo=_user_info, Github=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_auth_role_without_a_token_warns(self):
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with self._env({"stargazers"}):
+            await _run(job_id, token="", roles=["stargazers", "contributors"])
+        job = await store.get_job_async(job_id)
+        warnings = job["warnings"]
+        assert any("stargazers" in w and "requires a token" in w for w in warnings), warnings
+
+    @pytest.mark.asyncio
+    async def test_the_other_roles_still_return_their_users(self):
+        # The warning must not cost us the roles that did work.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with self._env({"stargazers"}):
+            await _run(job_id, token="", roles=["stargazers", "contributors"])
+        job = await store.get_job_async(job_id)
+        assert job["total_fetched"] == 5
+
+    @pytest.mark.asyncio
+    async def test_empty_auth_role_with_a_token_is_not_warned_about(self):
+        # With a token an empty role is genuinely empty — do not cry wolf.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with self._env({"stargazers"}):
+            await _run(job_id, token="ghp_real", roles=["stargazers", "contributors"])
+        job = await store.get_job_async(job_id)
+        assert not any("stargazers" in w for w in job["warnings"]), job["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_empty_public_role_is_not_warned_about(self):
+        # contributors is served anonymously, so empty means empty.
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        with self._env({"contributors"}):
+            await _run(job_id, token="", roles=["contributors", "stargazers"])
+        job = await store.get_job_async(job_id)
+        assert not any("contributors" in w for w in job["warnings"]), job["warnings"]
+
+    @pytest.mark.asyncio
+    async def test_every_auth_role_is_covered(self):
+        job_id = await store.create_job_async(owner_key=TEST_OWNER_KEY)
+        auth_roles = sorted(worker._AUTH_REQUIRED_ROLES)
+        with self._env(set(auth_roles)):
+            await _run(job_id, token="", roles=auth_roles)
+        job = await store.get_job_async(job_id)
+        for role in auth_roles:
+            assert any(role in w for w in job["warnings"]), (role, job["warnings"])
 
 
 # ---------------------------------------------------------------------------

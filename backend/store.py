@@ -237,6 +237,11 @@ async def _init_schema(c: _Conn) -> None:
         # simply looked at the results later — had no way to learn why the set
         # came back smaller than expected.
         ("warnings_json", "ALTER TABLE jobs ADD COLUMN warnings_json TEXT"),
+        # How many usernames each role actually contributed. Emitted only to the
+        # SSE log before, so a role that returned zero without raising — the
+        # signature of a token that lacks the scope for it — left no trace once
+        # the fetch tab was closed.
+        ("role_counts_json", "ALTER TABLE jobs ADD COLUMN role_counts_json TEXT"),
     ):
         if IS_POSTGRES:
             # Postgres aborts the surrounding transaction on a duplicate-column
@@ -412,7 +417,8 @@ async def get_job_async(job_id: str, include_result: bool = True) -> dict[str, A
 # costs tens of MB to fetch and parse on a large job.
 _JOB_META_COLUMNS = (
     "job_id, status, message, total_fetched, label, summary_json, created_at, "
-    "tags, owner_key, params_json, repo_owner, repo_name, logins_json, warnings_json"
+    "tags, owner_key, params_json, repo_owner, repo_name, logins_json, warnings_json, "
+    "role_counts_json"
 )
 
 
@@ -444,6 +450,7 @@ def _row_to_job(row: dict, rt: dict[str, Any]) -> dict[str, Any]:
         "result": result,
         "summary": summary,
         "warnings": json.loads(row["warnings_json"]) if row.get("warnings_json") else [],
+        "role_counts": json.loads(row["role_counts_json"]) if row.get("role_counts_json") else {},
         "owner_key": row.get("owner_key"),
         "params": params,
         "repo_owner": row.get("repo_owner"),
@@ -503,12 +510,13 @@ class _JobProxy(dict):
             task.add_done_callback(_log_task_error)
 
 
-_DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary", "warnings"}
+_DB_FIELDS = {"status", "message", "total_fetched", "label", "result", "summary", "warnings",
+              "role_counts"}
 
 _COL_MAP = {
     "status": "status", "message": "message", "total_fetched": "total_fetched",
     "label": "label", "result": "result_json", "summary": "summary_json",
-    "warnings": "warnings_json",
+    "warnings": "warnings_json", "role_counts": "role_counts_json",
 }
 
 

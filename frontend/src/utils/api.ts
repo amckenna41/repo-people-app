@@ -176,6 +176,9 @@ export async function fetchResultsPage(
   /** Why the set may be short — e.g. a role that needed a token. Persisted with
    *  the job, so it survives the fetch's SSE stream. */
   warnings?: string[]
+  /** Usernames contributed per role. A role sitting at 0 returned nothing
+   *  without erroring — usually a token that lacks the scope for it. */
+  role_counts?: Record<string, number>
   total: number
   unfiltered_total: number
   page: number
@@ -585,4 +588,38 @@ export async function fetchAuthMe(): Promise<AuthUser | null> {
 /** Log out the current session. */
 export async function logoutAuth(): Promise<void> {
   await req(`${BASE}/auth/logout`, { method: 'POST', credentials: 'include' })
+}
+
+/** Star count for a repo, or null when GitHub could not tell us.
+ *
+ *  Same reasoning as validateGitHubToken: straight to api.github.com, no
+ *  credentials, no CSRF header. The token is optional — this endpoint is public,
+ *  so an OAuth user (whose token lives on the backend, not in the browser) still
+ *  gets an answer, just against the unauthenticated rate limit.
+ *
+ *  Returns null rather than throwing on any failure: this only decides whether
+ *  to show a confirmation dialog, and a rate-limited or private repo must not
+ *  block the fetch the user actually asked for.
+ */
+export async function fetchRepoStars(
+  owner: string,
+  repo: string,
+  token?: string,
+): Promise<number | null> {
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' }
+  const trimmed = token?.trim()
+  if (trimmed) headers.Authorization = `Bearer ${trimmed}`
+
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      { headers },
+    )
+    if (!res.ok) return null
+    const data = await res.json()
+    const stars = data?.stargazers_count
+    return typeof stars === 'number' && Number.isFinite(stars) ? stars : null
+  } catch {
+    return null
+  }
 }

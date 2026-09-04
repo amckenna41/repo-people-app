@@ -346,6 +346,51 @@ const ALPHA2_TO_NUM: Record<string, number> = Object.fromEntries(
   Object.entries(COUNTRY_NUM_TO_ALPHA2).map(([num, a2]) => [a2, Number(num)])
 )
 
+// Sub-national codes (lowercase) → ISO numeric country code.
+//
+// "Newcastle, NSW" resolved to the UK, because NSW matched nothing and the
+// fallback city lookup found the English Newcastle. A state/province code is
+// the strongest country signal in a location string — stronger than a bare city
+// name, which is frequently duplicated across countries — so it is checked
+// first once the country name itself has been ruled out.
+const SUBDIVISION_TO_NUM: Record<string, number> = {
+  // ── Australia ──────────────────────────────────────────────────────────────
+  'nsw': 36, 'new south wales': 36,
+  'vic': 36, 'victoria': 36,
+  'qld': 36, 'queensland': 36,
+  'wa': 36, 'western australia': 36,
+  'sa': 36, 'south australia': 36,
+  'tas': 36, 'tasmania': 36,
+  'nt': 36, 'northern territory': 36,
+  'act': 36, 'australian capital territory': 36,
+  // ── Canada ─────────────────────────────────────────────────────────────────
+  'on': 124, 'ontario': 124,
+  'qc': 124, 'quebec': 124,
+  'bc': 124, 'british columbia': 124,
+  'ab': 124, 'alberta': 124,
+  'mb': 124, 'manitoba': 124,
+  'sk': 124, 'saskatchewan': 124,
+  'ns': 124, 'nova scotia': 124,
+  'nb': 124, 'new brunswick': 124,
+  'nl': 124, 'newfoundland': 124,
+  'pe': 124, 'prince edward island': 124,
+  // ── United States ──────────────────────────────────────────────────────────
+  'ak': 840, 'al': 840, 'ar': 840, 'az': 840, 'ca': 840, 'co': 840, 'ct': 840,
+  'dc': 840, 'de': 840, 'fl': 840, 'ga': 840, 'hi': 840, 'ia': 840, 'id': 840,
+  'il': 840, 'in': 840, 'ks': 840, 'ky': 840, 'la': 840, 'ma': 840, 'md': 840,
+  'me': 840, 'mi': 840, 'mn': 840, 'mo': 840, 'ms': 840, 'mt': 840, 'nc': 840,
+  'nd': 840, 'ne': 840, 'nh': 840, 'nj': 840, 'nm': 840, 'nv': 840, 'ny': 840,
+  'oh': 840, 'ok': 840, 'or': 840, 'pa': 840, 'ri': 840, 'sc': 840, 'sd': 840,
+  'tn': 840, 'tx': 840, 'ut': 840, 'va': 840, 'vt': 840, 'wi': 840, 'wv': 840,
+  'wy': 840,
+  'california': 840, 'texas': 840, 'florida': 840, 'illinois': 840,
+  'massachusetts': 840, 'washington state': 840, 'new jersey': 840,
+  'pennsylvania': 840, 'north carolina': 840, 'ohio': 840, 'michigan': 840,
+  'colorado': 840, 'arizona': 840, 'oregon': 840, 'utah': 840, 'nevada': 840,
+  'minnesota': 840, 'wisconsin': 840, 'tennessee': 840, 'missouri': 840,
+  'maryland': 840, 'virginia': 840, 'indiana': 840, 'connecticut': 840,
+}
+
 // Country entries pre-sorted longest-first so specific names beat short ones in substring
 // search (prevents "niger" matching inside "nigeria", "mali" inside "somalia", etc.).
 const SORTED_COUNTRY_ENTRIES = Object.entries(COUNTRY_NAME_TO_NUM)
@@ -572,7 +617,7 @@ function numericToAlpha3(num: number): string {
   return String(num)
 }
 
-function getCountryNum(location: string): number | null {
+export function getCountryNum(location: string): number | null {
   const lower = location.toLowerCase().trim()
 
   // 1. Direct full-string match against country names / known capitals
@@ -594,11 +639,21 @@ function getCountryNum(location: string): number | null {
     for (let i = parts.length - 1; i >= 0; i--) {
       const part = parts[i]
       if (COUNTRY_NAME_TO_NUM[part] !== undefined) return COUNTRY_NAME_TO_NUM[part]
-      if (CITY_TO_NUM[part] !== undefined) return CITY_TO_NUM[part]
-      if (part.length === 2) {
-        const n = ALPHA2_TO_NUM[part.toUpperCase()]
-        if (n !== undefined) return n
+
+      const sub = SUBDIVISION_TO_NUM[part]
+      const alpha = part.length === 2 ? ALPHA2_TO_NUM[part.toUpperCase()] : undefined
+
+      // Plenty of two-letter codes are both a country and a state: "Toronto, CA"
+      // is Canada, "Chicago, IL" is Illinois not Israel. Neither reading wins on
+      // its own, so let a sibling city segment cast the deciding vote.
+      if (sub !== undefined && alpha !== undefined && sub !== alpha) {
+        const cityNum = parts.map(p => CITY_TO_NUM[p]).find(n => n !== undefined)
+        if (cityNum === sub || cityNum === alpha) return cityNum
+        return alpha  // no corroboration — a bare country code is the safer read
       }
+      if (sub !== undefined) return sub
+      if (alpha !== undefined) return alpha
+      if (CITY_TO_NUM[part] !== undefined) return CITY_TO_NUM[part]
     }
   }
 
@@ -617,6 +672,28 @@ function getCountryNum(location: string): number | null {
   }
 
   return null
+}
+
+/** The part of a location string that is *not* the country.
+ *
+ *  "Beijing, China" → "Beijing"; "San Francisco, CA, USA" → "San Francisco, CA";
+ *  a bare "Berlin" → "Berlin"; a bare "Germany" → null (country-level only).
+ *
+ *  Trailing segments are popped only while they resolve to *this* country, so a
+ *  city that happens to share a name with somewhere else is left alone. Original
+ *  casing is preserved — only the comparison is lowercased.
+ */
+export function getSubRegion(location: string, num: number): string | null {
+  const parts = location.split(',').map(p => p.trim()).filter(Boolean)
+  while (parts.length > 0) {
+    const last = parts[parts.length - 1].toLowerCase()
+    const isThisCountry =
+      COUNTRY_NAME_TO_NUM[last] === num ||
+      (last.length === 2 && ALPHA2_TO_NUM[last.toUpperCase()] === num)
+    if (!isThisCountry) break
+    parts.pop()
+  }
+  return parts.length > 0 ? parts.join(', ') : null
 }
 
 // Interpolate between two hex colours
@@ -638,14 +715,66 @@ interface Props {
   users: UserRecord[]
 }
 
+/** A user together with the area *within* their country, if they gave one. */
+interface Placed {
+  user: UserRecord
+  area: string | null
+}
+
+/** One user row, shared by the country panel and the unmapped panel. `area` is
+ *  whatever locality applies — the part of the country for a mapped user, the
+ *  raw unparseable string for an unmapped one. */
+function UserRow({ user: u, area, emptyLabel }: Placed & { emptyLabel: string }) {
+  return (
+    <a
+      href={u.html_url ?? `https://github.com/${u.login}`}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-all group"
+    >
+      {u.avatar_url
+        ? <img src={u.avatar_url} alt={u.login} className="w-8 h-8 rounded-full shrink-0 opacity-90 group-hover:opacity-100" />
+        : <div className="w-8 h-8 rounded-full shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{(u.login?.[0] ?? '?').toUpperCase()}</div>
+      }
+      <div className="flex-1 min-w-0">
+        <div className="text-sm text-white font-medium truncate group-hover:text-purple-300 transition-colors">
+          {u.name || u.login}
+        </div>
+        <div className="text-xs text-gray-500 truncate">
+          <span className="capitalize" style={{ color: area ? '#fcd34d' : '#6b7280' }}>
+            {area ?? emptyLabel}
+          </span>
+          {' · '}@{u.login}{u.company_normalized ? ` · ${u.company_normalized}` : ''}
+        </div>
+      </div>
+      <div className="flex flex-col items-end gap-1 shrink-0">
+        {u.followers != null && (
+          <span className="text-xs text-gray-500">{u.followers.toLocaleString()} followers</span>
+        )}
+        {u.roles && u.roles.length > 0 && (
+          <div className="flex gap-1 flex-wrap justify-end">
+            {u.roles.slice(0, 2).map(r => (
+              <span key={r} className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-900/50 text-purple-300">{r}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    </a>
+  )
+}
+
 const MIN_ZOOM = 1
 const MAX_ZOOM = 8
 
 export default function WorldMap({ users }: Props) {
   const [tooltip, setTooltip] = useState<{ country: string; count: number } | null>(null)
   const [zoom, setZoom] = useState(1)
-  const [selected, setSelected] = useState<{ label: string; users: UserRecord[] } | null>(null)
+  const [selected, setSelected] = useState<number | null>(null)
   const [highlightedNum, setHighlightedNum] = useState<number | null>(null)
+  // Which area within the open country is being isolated, if any.
+  const [areaFilter, setAreaFilter] = useState<string | null>(null)
+  // Which bucket of unmapped users the footer has opened, if any.
+  const [unmapped, setUnmapped] = useState<'unrecognised' | 'blank' | null>(null)
 
   function zoomIn() { setZoom(z => Math.min(z * 1.5, MAX_ZOOM)) }
   function zoomOut() { setZoom(z => Math.max(z / 1.5, MIN_ZOOM)) }
@@ -658,25 +787,97 @@ export default function WorldMap({ users }: Props) {
   // getCountryNum() — which, for any free-text location, falls back to a
   // whole-word regex scan across ~250 countries and ~400 cities. That is the
   // expensive part, and it was being paid three times per render.
-  const { countryCounts, countryUsers, countryLabel } = useMemo(() => {
+  //
+  // Each user also keeps the area *within* the country. The label used to be the
+  // first-seen raw location string for the whole country, so a country whose
+  // users came from four different cities was titled after whichever one landed
+  // first — and the list gave no hint the others existed.
+  const { countryCounts, countryUsers, mapped, unrecognised, noLocation } = useMemo(() => {
     const counts: Record<number, number> = {}
-    const byCountry: Record<number, UserRecord[]> = {}
-    const labels: Record<number, string> = {}
+    const byCountry: Record<number, Placed[]> = {}
+    // Users the map cannot show, kept as records rather than tallies so the
+    // footer can open the actual list — a count alone tells you something is
+    // missing but not who, which is the part worth acting on.
+    const unmatched: Placed[] = []
+    const blank: Placed[] = []
+    let placedCount = 0
 
     for (const u of users) {
       const loc = u.location_normalized ?? u.location
-      if (!loc) continue
+      if (!loc) { blank.push({ user: u, area: null }); continue }
       const num = getCountryNum(loc)
-      if (num === null) continue
+      if (num === null) {
+        unmatched.push({ user: u, area: loc })
+        continue
+      }
+      placedCount++
       counts[num] = (counts[num] ?? 0) + 1
-      ;(byCountry[num] ??= []).push(u)
-      labels[num] ??= loc
+      ;(byCountry[num] ??= []).push({ user: u, area: getSubRegion(loc, num) })
     }
-    return { countryCounts: counts, countryUsers: byCountry, countryLabel: labels }
+    return {
+      countryCounts: counts,
+      countryUsers: byCountry,
+      mapped: placedCount,
+      unrecognised: unmatched,
+      noLocation: blank,
+    }
   }, [users])
 
+  // The distinct strings that failed, most frequent first — the same string
+  // from ten users is one gap to fix in the lookup tables, not ten.
+  const unrecognisedStrings = useMemo(() => {
+    const counted = new Map<string, number>()
+    for (const p of unrecognised) counted.set(p.area!, (counted.get(p.area!) ?? 0) + 1)
+    return [...counted.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([loc, count]) => ({ loc, count }))
+  }, [unrecognised])
+
+  /** Display name for a country code. */
+  const nameOf = (num: number) => COUNTRY_NUM_TO_NAME[num] ?? String(num)
+
+  // Areas within the open country, most-populated first. Users who only gave a
+  // country sort last under a single bucket rather than vanishing.
+  const openCountry = useMemo(() => {
+    if (selected === null) return null
+    const placed = countryUsers[selected] ?? []
+    const byArea = new Map<string, { label: string; users: Placed[] }>()
+    for (const p of placed) {
+      const key = (p.area ?? '').toLowerCase()
+      const existing = byArea.get(key)
+      if (existing) existing.users.push(p)
+      else byArea.set(key, { label: p.area ?? `${nameOf(selected)} — no city given`, users: [p] })
+    }
+    const areas = [...byArea.entries()]
+      .map(([key, v]) => ({ key, label: v.label, count: v.users.length }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+    const visible = areaFilter === null
+      ? placed
+      : placed.filter(p => (p.area ?? '').toLowerCase() === areaFilter)
+    return { num: selected, name: nameOf(selected), placed, areas, visible }
+  }, [selected, countryUsers, areaFilter])
+
   // The map itself scrolls behind the modal, so background scroll stays free.
-  useModalEscape(selected ? () => setSelected(null) : null, { lockScroll: false })
+  useModalEscape(selected !== null ? () => setSelected(null) : null, { lockScroll: false })
+  useModalEscape(unmapped !== null ? () => setUnmapped(null) : null, { lockScroll: false })
+
+  const unmappedPanel = useMemo(() => {
+    if (unmapped === 'unrecognised') {
+      return {
+        title: 'Unrecognised locations',
+        subtitle: `${unrecognised.length} user${unrecognised.length === 1 ? '' : 's'} whose location could not be placed on the map`,
+        users: unrecognised,
+      }
+    }
+    if (unmapped === 'blank') {
+      return {
+        title: 'No location set',
+        subtitle: `${noLocation.length} user${noLocation.length === 1 ? '' : 's'} with no location on their GitHub profile`,
+        users: noLocation,
+      }
+    }
+    return null
+  }, [unmapped, unrecognised, noLocation])
 
   const maxCount = useMemo(() => Math.max(1, ...Object.values(countryCounts)), [countryCounts])
 
@@ -798,13 +999,14 @@ export default function WorldMap({ users }: Props) {
                         pressed: { outline: 'none' },
                       }}
                       onMouseEnter={() => {
-                        if (count > 0) setTooltip({ country: countryLabel[num] ?? String(num), count })
+                        if (count > 0) setTooltip({ country: nameOf(num), count })
                       }}
                       onMouseLeave={() => setTooltip(null)}
                       onClick={() => {
                         if (count > 0) {
                           setHighlightedNum(isHighlighted ? null : num)
-                          setSelected({ label: countryLabel[num] ?? String(num), users: countryUsers[num] ?? [] })
+                          setAreaFilter(null)  // a new country starts unfiltered
+                          setSelected(num)
                         }
                       }}
                     />
@@ -816,8 +1018,100 @@ export default function WorldMap({ users }: Props) {
         </ComposableMap>
       </div>
 
+      {/* Coverage. The map cannot show a user it could not place, and an
+          incomplete map looks exactly like a complete one — so state the
+          denominator, and name the strings that failed so they can be added to
+          the lookup tables. */}
+      <div className="flex items-center gap-2 flex-wrap mt-2 text-xs text-gray-500">
+        <span>
+          <span className="text-gray-300 font-medium">{mapped.toLocaleString()}</span> of{' '}
+          {users.length.toLocaleString()} users mapped
+        </span>
+        {unrecognised.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setUnmapped('unrecognised')}
+            className="underline decoration-dotted hover:decoration-solid transition-all"
+            style={{ color: '#fcd34d' }}
+            title="Show the users whose location could not be placed"
+          >
+            · {unrecognised.length.toLocaleString()} unrecognised
+          </button>
+        )}
+        {noLocation.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setUnmapped('blank')}
+            className="underline decoration-dotted hover:decoration-solid hover:text-gray-300 transition-all"
+            title="Show the users with no location on their profile"
+          >
+            · {noLocation.length.toLocaleString()} with no location set
+          </button>
+        )}
+      </div>
+
+      {/* Unmapped users. The footer counts say something is missing; this says
+          who, which is the part anyone can act on — either by fixing the lookup
+          tables or by knowing the gap is simply blank profiles. */}
+      {unmappedPanel && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
+          onClick={() => setUnmapped(null)}
+        >
+          <div
+            className="relative w-full max-w-lg max-h-[80vh] flex flex-col rounded-2xl overflow-hidden"
+            style={{ background: '#0f0a1e', border: '1px solid rgba(139,92,246,0.25)' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
+              <div>
+                <h2 className="text-sm font-semibold text-white">{unmappedPanel.title}</h2>
+                <p className="text-xs text-gray-500 mt-0.5">{unmappedPanel.subtitle}</p>
+              </div>
+              <button
+                onClick={() => setUnmapped(null)}
+                className="p-1.5 rounded-lg text-gray-500 hover:text-white hover:bg-white/10 transition-all"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* The distinct strings that failed, so the fix is one lookup-table
+                entry per chip rather than one per user. */}
+            {unmapped === 'unrecognised' && unrecognisedStrings.length > 0 && (
+              <div className="px-5 py-3 border-b border-white/5">
+                <p className="text-[10px] uppercase tracking-wide text-gray-600 mb-2">
+                  Unrecognised location strings ({unrecognisedStrings.length})
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {unrecognisedStrings.map(u => (
+                    <span
+                      key={u.loc}
+                      className="text-xs px-2 py-1 rounded-full capitalize"
+                      style={{ background: 'rgba(245,158,11,0.16)', color: '#fde68a', border: '1px solid rgba(245,158,11,0.35)' }}
+                    >
+                      {u.loc}{u.count > 1 && <span className="text-gray-500"> (×{u.count})</span>}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <VirtualList
+              items={unmappedPanel.users}
+              rowHeight={60}
+              maxHeight="100%"
+              className="flex-1 px-3 py-3"
+              keyOf={p => p.user.login}
+              renderRow={p => <UserRow {...p} emptyLabel="no location set" />}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Country users modal */}
-      {selected && (
+      {openCountry && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
           style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
@@ -831,8 +1125,14 @@ export default function WorldMap({ users }: Props) {
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
               <div>
-                <h2 className="text-sm font-semibold text-white capitalize">{selected.label}</h2>
-                <p className="text-xs text-gray-500 mt-0.5">{selected.users.length} user{selected.users.length !== 1 ? 's' : ''}</p>
+                <h2 className="text-sm font-semibold text-white">
+                  {COUNTRY_NUM_TO_ALPHA2[openCountry.num] ? getFlagEmoji(COUNTRY_NUM_TO_ALPHA2[openCountry.num]) + ' ' : ''}
+                  {openCountry.name}
+                </h2>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {openCountry.placed.length} user{openCountry.placed.length !== 1 ? 's' : ''}
+                  {openCountry.areas.length > 1 && <> across {openCountry.areas.length} areas</>}
+                </p>
               </div>
               <button
                 onClick={() => setSelected(null)}
@@ -842,46 +1142,52 @@ export default function WorldMap({ users }: Props) {
               </button>
             </div>
 
+            {/* Areas within the country. Only worth showing when the users are
+                actually spread across more than one — a single-area country
+                would just be the header repeated. */}
+            {openCountry.areas.length > 1 && (
+              <div className="px-5 py-3 border-b border-white/5">
+                <p className="text-[10px] uppercase tracking-wide text-gray-600 mb-2">Where in {openCountry.name}</p>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    onClick={() => setAreaFilter(null)}
+                    className="text-xs px-2 py-1 rounded-full transition-all"
+                    style={areaFilter === null
+                      ? { background: 'rgba(168,85,247,0.28)', color: '#e9d5ff', border: '1px solid rgba(168,85,247,0.55)' }
+                      : { background: 'rgba(255,255,255,0.05)', color: '#9ca3af', border: '1px solid rgba(255,255,255,0.10)' }}
+                  >
+                    All ({openCountry.placed.length})
+                  </button>
+                  {openCountry.areas.map(a => {
+                    const active = areaFilter === a.key
+                    return (
+                      <button
+                        key={a.key}
+                        onClick={() => setAreaFilter(active ? null : a.key)}
+                        className="text-xs px-2 py-1 rounded-full transition-all capitalize"
+                        style={active
+                          ? { background: 'rgba(245,158,11,0.28)', color: '#fde68a', border: '1px solid rgba(245,158,11,0.6)' }
+                          : { background: 'rgba(255,255,255,0.05)', color: '#9ca3af', border: '1px solid rgba(255,255,255,0.10)' }}
+                        title={`Show only users from ${a.label}`}
+                      >
+                        {a.label} <span className="text-gray-500">({a.count})</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             {/* User list */}
             {/* Virtualized: a populous country can hold thousands of users,
                 and every one of them used to mount at once on click. */}
             <VirtualList
-              items={selected.users}
+              items={openCountry.visible}
               rowHeight={60}
               maxHeight="100%"
               className="flex-1 px-3 py-3"
-              keyOf={u => u.login}
-              renderRow={u => (
-                <a
-                  href={u.html_url ?? `https://github.com/${u.login}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-all group"
-                >
-                  {u.avatar_url
-                    ? <img src={u.avatar_url} alt={u.login} className="w-8 h-8 rounded-full shrink-0 opacity-90 group-hover:opacity-100" />
-                    : <div className="w-8 h-8 rounded-full shrink-0 bg-purple-900/50 flex items-center justify-center text-xs text-purple-300">{(u.login?.[0] ?? '?').toUpperCase()}</div>
-                  }
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm text-white font-medium truncate group-hover:text-purple-300 transition-colors">
-                      {u.name || u.login}
-                    </div>
-                    <div className="text-xs text-gray-500 truncate">@{u.login}{u.company_normalized ? ` · ${u.company_normalized}` : ''}</div>
-                  </div>
-                  <div className="flex flex-col items-end gap-1 shrink-0">
-                    {u.followers != null && (
-                      <span className="text-xs text-gray-500">{u.followers.toLocaleString()} followers</span>
-                    )}
-                    {u.roles && u.roles.length > 0 && (
-                      <div className="flex gap-1 flex-wrap justify-end">
-                        {u.roles.slice(0, 2).map(r => (
-                          <span key={r} className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-900/50 text-purple-300">{r}</span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </a>
-              )}
+              keyOf={p => p.user.login}
+              renderRow={p => <UserRow {...p} emptyLabel="no city given" />}
             />
           </div>
         </div>

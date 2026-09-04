@@ -28,6 +28,12 @@ from store import emit_event, get_job, persist_job
 _AUTH_REQUIRED_ROLES = frozenset({"stargazers", "watchers", "maintainers"})
 
 
+def _auth_required_message(role: str) -> str:
+    """Warning for a role GitHub will not serve without a token."""
+    return (f"⚠️ {role}: GitHub requires a token for this role — "
+            f"0 users collected. Add a PAT or sign in, then re-run.")
+
+
 def _classify_role_error(exc: Exception, role: str, has_token: bool = True) -> str:
     """Return a user-friendly warning message for a per-role fetch failure."""
     if isinstance(exc, GithubException):
@@ -36,15 +42,13 @@ def _classify_role_error(exc: Exception, role: str, has_token: bool = True) -> s
             if not has_token:
                 # Saying "invalid or expired" when none was supplied sends people
                 # off to regenerate a token they never had.
-                return (f"⚠️ {role}: GitHub requires a token for this role — "
-                        f"0 users collected. Add a PAT or sign in, then re-run.")
+                return _auth_required_message(role)
             return f"⚠️ {role}: Authentication failed — token is invalid or expired."
         if exc.status == 403:
             if 'rate limit' in data_str or 'x-ratelimit' in data_str:
                 return f"⚠️ {role}: Rate limit exceeded — add a PAT or wait for reset."
             if not has_token and role in _AUTH_REQUIRED_ROLES:
-                return (f"⚠️ {role}: GitHub requires a token for this role — "
-                        f"0 users collected. Add a PAT or sign in, then re-run.")
+                return _auth_required_message(role)
             return f"⚠️ {role}: Access denied — repository may be private or token lacks scope."
         if exc.status == 404:
             return f"⚠️ {role}: Repository not found — check owner/repo name."
@@ -147,6 +151,11 @@ async def _run_fetch_job_inner(
     loop = asyncio.get_event_loop()
     # Declare results before try so the except clause can access partial data
     results: dict[str, Any] = {}
+    # How many usernames each active role contributed. A role that returns zero
+    # without raising looks identical to one that was never requested — which is
+    # exactly what a token missing the scope for it produces — so the counts are
+    # persisted with the job rather than only streamed to the log.
+    role_counts: dict[str, int] = {}
 
     try:
         # Build the authenticated Github client directly — avoids the 2 extra
@@ -174,7 +183,16 @@ async def _run_fetch_job_inner(
             "commit_authors": lambda: rp_export.export_commit_authors(owner, repo, _token, _tmp, return_data=True),
             "dependents":     lambda: rp_export.export_dependents(owner, repo, _tmp, return_data=True),
         }
-        active_roles = [r for r in (roles or list(role_funcs)) if r in role_funcs]
+        # `roles=None` means the caller never chose, which defaults to everything.
+        # `roles=[]` means they explicitly chose nothing, and must fetch nothing.
+        # Truthiness conflates the two — an empty list is falsy — so test for None.
+        selected = list(role_funcs) if roles is None else roles
+        active_roles = [r for r in selected if r in role_funcs]
+        if not active_roles:
+            await emit("warning", {"message": "No roles selected — nothing to fetch."})
+        # Seed every requested role at zero so one that never reports back is
+        # still visible in the results as "asked for, got nothing".
+        role_counts.update({r: 0 for r in active_roles})
 
         # Fetch all roles in parallel, emitting a status message as each one finishes
         async def _fetch_role(role: str):
@@ -184,6 +202,18 @@ async def _run_fetch_job_inner(
                 data = await loop.run_in_executor(_fetch_executor, role_funcs[role])
                 elapsed_role = time.monotonic() - t_role
                 await emit("status", {"message": f"  ✓ {role}: {len(data)} users ({elapsed_role:.1f}s)"})
+                # GitHub 401s these roles for anonymous callers, but the export
+                # helpers swallow that and hand back an empty list — so a denied
+                # role is indistinguishable from a genuinely empty one and the
+                # result set quietly loses its stargazers. Without a token these
+                # roles cannot return anything, so an empty one is a warning.
+                if not data and not token and role in _AUTH_REQUIRED_ROLES:
+                    _logger.warning(
+                        "Role %s returned 0 users for %s/%s with no token — "
+                        "GitHub requires authentication for this role",
+                        role, owner, repo,
+                    )
+                    await emit("warning", {"message": _auth_required_message(role)})
                 return role, data
             except Exception as role_exc:
                 elapsed_role = time.monotonic() - t_role
@@ -205,6 +235,7 @@ async def _run_fetch_job_inner(
                 # accepted and silently ignored, so neither the user's choice
                 # nor the hosted FETCH_LIMIT had any effect.
                 username_map[role] = data[:limit] if limit and limit > 0 else data
+                role_counts[role] = len(username_map[role])
 
         unique_logins_set: set[str] = set()
         for logins in username_map.values():
@@ -325,7 +356,8 @@ async def _run_fetch_job_inner(
         # B3: persist the terminal state in one awaited write so result/status/total
         # can't land out of order via fire-and-forget _JobProxy writes.
         await persist_job(job_id, result=results, status="done",
-                          total_fetched=len(results), warnings=warnings)
+                          total_fetched=len(results), warnings=warnings,
+                          role_counts=role_counts)
 
         if job.get("cancelled"):
             await emit("status", {"message": f"Fetch stopped by user. {len(results)} users saved."})
@@ -347,7 +379,8 @@ async def _run_fetch_job_inner(
         if save_each_user:
             if results:
                 await persist_job(job_id, result=results, status="done",
-                                  total_fetched=len(results), warnings=warnings)
+                                  total_fetched=len(results), warnings=warnings,
+                                  role_counts=role_counts)
                 await emit("status", {"message": f"Fetch interrupted. Using {len(results)} users fetched so far."})
                 await emit("done", {"total": len(results)})
                 return
@@ -356,12 +389,14 @@ async def _run_fetch_job_inner(
                     with open(partial_path) as pf:
                         partial_results = json.load(pf)
                     await persist_job(job_id, result=partial_results, status="done",
-                                      total_fetched=len(partial_results), warnings=warnings)
+                                      total_fetched=len(partial_results), warnings=warnings,
+                                      role_counts=role_counts)
                     await emit("status", {"message": f"Fetch failed. Restored {len(partial_results)} users from last saved checkpoint."})
                     await emit("done", {"total": len(partial_results)})
                     return
                 except Exception:
                     pass
-        await persist_job(job_id, status="error", message=sanitised_message, warnings=warnings)
+        await persist_job(job_id, status="error", message=sanitised_message, warnings=warnings,
+                          role_counts=role_counts)
         await emit("error", {"message": sanitised_message})
         await emit("done", {})

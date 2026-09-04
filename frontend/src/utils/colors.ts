@@ -10,28 +10,54 @@
 // there is no colour-space maths here to get wrong, and it works for any
 // function the browser understands, not just the ones enumerated below.
 
-/** Colour functions html2canvas cannot parse. `color()` covers `color(display-p3 …)`. */
-const UNSUPPORTED_FN = /\b(?:oklch|oklab|lch|lab|color)\(/i
+/** Colour functions html2canvas cannot parse.
+ *
+ *  `color()` covers `color(display-p3 …)`, which is how some engines serialise a
+ *  wide-gamut computed value. `color-mix()` is listed ahead of it because
+ *  Tailwind v4 compiles every opacity modifier (`bg-white/5`, `hover:bg-white/10`
+ *  — used all over this app) to `color-mix(in oklab, …)`, and `color\(` does not
+ *  match `color-mix(`. */
+const UNSUPPORTED_FN_SOURCE = '\\b(?:color-mix|oklch|oklab|lch|lab|color)\\('
+const UNSUPPORTED_FN = new RegExp(UNSUPPORTED_FN_SOURCE, 'i')
 
-/** Properties html2canvas reads that can carry a colour.
- *  `-webkit-text-fill-color` matters here: the header wordmark uses it. */
-const COLOR_PROPS = [
-  'color',
-  'background-color',
-  'background-image',
-  'border-top-color',
-  'border-right-color',
-  'border-bottom-color',
-  'border-left-color',
-  'outline-color',
-  'box-shadow',
-  'text-decoration-color',
-  '-webkit-text-fill-color',
-  'caret-color',
-  'column-rule-color',
-  'fill',
-  'stroke',
-] as const
+/** Whether a computed-style property name can plausibly carry a colour.
+ *
+ *  This used to be a hand-written list, which is a guessing game: it missed
+ *  `accent-color`, `text-shadow`, `border-image-source` and every logical
+ *  border longhand, and each miss is an oklch value reaching html2canvas and
+ *  killing the export with no clue which property was at fault. Matching on the
+ *  name instead is self-maintaining — a property added by a future Tailwind
+ *  release is covered without touching this file. */
+const COLORISH_PROP = /color|shadow|fill|stroke|background|border|outline|gradient|image|caret|accent|emphasis|decoration|column-rule/
+
+/** Memo for the name test. A document enumerates the same ~340 property names
+ *  on every element, so the regex runs a few hundred times in total rather than
+ *  a few hundred times per element. */
+const _colorish = new Map<string, boolean>()
+
+function isColorish(name: string): boolean {
+  let hit = _colorish.get(name)
+  if (hit === undefined) {
+    hit = COLORISH_PROP.test(name)
+    _colorish.set(name, hit)
+  }
+  return hit
+}
+
+/** The colour-carrying property names an element's computed style enumerates.
+ *
+ *  Derived per element rather than once for the document: a real browser
+ *  enumerates every longhand on every element, but jsdom enumerates only what
+ *  was actually declared, so sampling one element there would miss properties
+ *  set on its siblings. `isColorish` keeps the extra passes cheap. */
+function colorishProps(computed: CSSStyleDeclaration): string[] {
+  const props: string[] = []
+  for (let i = 0; i < computed.length; i++) {
+    const name = computed[i]
+    if (isColorish(name)) props.push(name)
+  }
+  return props
+}
 
 export function hasUnsupportedColor(value: string): boolean {
   return !!value && UNSUPPORTED_FN.test(value)
@@ -50,7 +76,9 @@ export function replaceUnsupportedColors(
 ): string {
   if (!hasUnsupportedColor(value)) return value
 
-  const finder = /\b(?:oklch|oklab|lch|lab|color)\(/gi
+  // Same pattern as the gate above — the two drifting apart is how a function
+  // passes `hasUnsupportedColor` and is then never rewritten.
+  const finder = new RegExp(UNSUPPORTED_FN_SOURCE, 'gi')
   let out = ''
   let cursor = 0
 
@@ -179,21 +207,95 @@ export function buildColorVariableOverrides(
   return `:root{${body}}`
 }
 
+/** Inline sRGB equivalents for every unsupported colour under `root`, returning
+ *  a function that puts the inline styles back exactly as they were.
+ *
+ *  Intended to wrap the html2canvas call on the **live** document. The earlier
+ *  approach patched html2canvas's clone instead, which is only correct if the
+ *  clone's stylesheets have parsed by the time `onclone` fires — inside the
+ *  cloner's iframe a production build's <link> often has not, so every computed
+ *  value read there is a browser default, nothing matches, and the scan is a
+ *  silent no-op. The live document is always styled.
+ *
+ *  Patching the real page is safe here because the substitution is exact: the
+ *  replacement is the same colour sampled through a canvas, so nothing changes
+ *  on screen. The undo runs in a `finally`, so a failed export still restores.
+ */
+/** Suspends every transition and animation in a document.
+ *
+ *  Load-bearing, not a nicety. Patching a colour is itself a style change, and
+ *  anything under `transition: all` — `.btn-primary`, `.btn-secondary` and every
+ *  `transition-all` in this app — responds by *animating* from the old colour to
+ *  the new one. A colour mid-transition is interpolated in oklab, and that is
+ *  what `getComputedStyle` reports, so the element reads back as
+ *  `oklab(0.928 …)` however correct the value we just wrote. html2canvas then
+ *  parses the interpolating value and throws. Freezing first makes the patch
+ *  take effect instantly.
+ *
+ *  It also stops `animate-spin`/`animate-pulse` being captured mid-frame.
+ */
+const FREEZE_ATTR = 'data-rp-freeze'
+
+function freezeAnimations(root: HTMLElement): () => void {
+  const doc = root.ownerDocument
+  if (!doc) return () => {}
+  root.setAttribute(FREEZE_ATTR, '')
+  const style = doc.createElement('style')
+  style.setAttribute('data-h2c-freeze', '')
+  // Scoped to the subtree being captured, plus <html>/<body> whose colours are
+  // patched too. A blanket `*` rule also froze the export button's own spinner,
+  // so the one thing on screen telling the user the export was running sat
+  // motionless for its entire duration.
+  style.textContent =
+    `[${FREEZE_ATTR}],[${FREEZE_ATTR}] *,[${FREEZE_ATTR}] *::before,[${FREEZE_ATTR}] *::after,` +
+    'html,body,html::before,body::before,html::after,body::after' +
+    '{transition:none!important;animation:none!important}'
+  doc.head?.appendChild(style)
+  return () => {
+    style.remove()
+    root.removeAttribute(FREEZE_ATTR)
+  }
+}
+
+export function inlineColorsWithUndo(
+  root: HTMLElement,
+  convert: (color: string) => string = createCanvasColorConverter(),
+): () => void {
+  const unfreeze = freezeAnimations(root)
+  const saved = patchColors(root, convert)
+  return () => {
+    // Reverse order, so an element patched twice ends on its original value.
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const [el, prop, previous] = saved[i]
+      if (previous) el.style.setProperty(prop, previous)
+      else el.style.removeProperty(prop)
+    }
+    unfreeze()
+  }
+}
+
 /** Inline sRGB equivalents for every unsupported colour under `root`.
  *
- *  Intended for html2canvas's `onclone`, where `root` is the cloned subtree.
- *  Only writes when a computed value actually contains an unsupported function,
- *  so the clone stays close to the original. Returns the number of declarations
- *  patched (used by the tests).
+ *  The non-reverting form, for html2canvas's `onclone` where `root` is a
+ *  throwaway clone. Returns the number of declarations patched.
  */
 export function inlineComputedColors(
   root: HTMLElement,
   convert: (color: string) => string = createCanvasColorConverter(),
 ): number {
-  const view = root.ownerDocument?.defaultView
-  if (!view) return 0
+  return patchColors(root, convert).length
+}
 
-  let patched = 0
+/** The shared walk. Returns what it overwrote: `[element, property, previous
+ *  inline value]` for each declaration, which is everything an undo needs. */
+function patchColors(
+  root: HTMLElement,
+  convert: (color: string) => string,
+): Array<[HTMLElement, string, string]> {
+  const saved: Array<[HTMLElement, string, string]> = []
+  const view = root.ownerDocument?.defaultView
+  if (!view) return saved
+
   const elements: Element[] = [root, ...Array.from(root.querySelectorAll('*'))]
   const doc = root.ownerDocument
   // html2canvas reads the page background off <html> and <body> before it
@@ -206,12 +308,12 @@ export function inlineComputedColors(
     const style = (el as HTMLElement).style
     if (!style) continue                       // e.g. SVG in older engines
     const computed = view.getComputedStyle(el)
-    for (const prop of COLOR_PROPS) {
+    for (const prop of colorishProps(computed)) {
       const value = computed.getPropertyValue(prop)
       if (!hasUnsupportedColor(value)) continue
+      saved.push([el as HTMLElement, prop, style.getPropertyValue(prop)])
       style.setProperty(prop, replaceUnsupportedColors(value, convert))
-      patched++
     }
   }
-  return patched
+  return saved
 }

@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { BarChart2, GitCompare, Search, HelpCircle, X, Key, PlayCircle, BarChart, GitCompare as GitCompareIcon, Download } from 'lucide-react'
+import { useState, useEffect, type ReactNode } from 'react'
+import { BarChart2, GitCompare, Search, HelpCircle, X, Key, PlayCircle, BarChart, GitCompare as GitCompareIcon, Download, ShieldAlert } from 'lucide-react'
 import { Github } from './components/GithubIcon'
 import FetchView from './views/FetchView'
 import ResultsView from './views/ResultsView'
@@ -10,6 +10,15 @@ import { useModalEscape } from './hooks/useModalEscape'
 import type { JobInfo, UserRecord, View, AuthUser } from './types'
 import { fetchJobs, deleteJob, updateJobTags, invalidateJobCache, fetchAuthMe, logoutAuth, openAuthPopup, fetchSharedJob, openJobStream } from './utils/api'
 
+/** Inline scope/permission name. */
+function Chip({ children }: { children: ReactNode }) {
+  return (
+    <code className="text-xs px-1 py-0.5 rounded-sm text-amber-300" style={{ background: 'rgba(255,255,255,0.08)' }}>
+      {children}
+    </code>
+  )
+}
+
 function HelpModal({ onClose }: { onClose: () => void }) {
   useModalEscape(onClose)
   const steps = [
@@ -17,12 +26,29 @@ function HelpModal({ onClose }: { onClose: () => void }) {
       icon: <Key size={20} />,
       color: '#f59e0b',
       title: 'Get a GitHub Personal Access Token',
-      desc: "Without a token you're limited to 60 API requests/hour. A token raises this to 5,000/hour — essential for any real repository.",
+      // The scope list is not just about rate limits: GitHub returns 401/403 on
+      // /stargazers, /subscribers and /collaborators without one, so a token
+      // missing public_repo silently loses three of the nine roles.
+      desc: "Without a token you're limited to 60 API requests/hour, and GitHub refuses the Stargazers, Watchers and Maintainers roles outright — they come back empty. Use a classic token.",
       bullets: [
-        'Go to github.com/settings/tokens/new',
-        'Give it a name (e.g. "repo-people")',
-        'Grant the read:user and public_repo scopes (required for profile data and repository access)',
-        'Copy the token and paste it into the Token field on the Fetch page',
+        <>Go to <Chip>github.com/settings/tokens/new</Chip> and choose <strong className="text-white">Tokens (classic)</strong></>,
+        <>Give it a name (e.g. &quot;repo-people&quot;) and set an expiry</>,
+        <>Tick <Chip>public_repo</Chip> — the sub-box under <Chip>repo</Chip>, <strong className="text-white">not</strong> <Chip>repo</Chip> itself. This one scope is what unlocks Stargazers, Watchers and Maintainers</>,
+        <>Optionally tick <Chip>read:user</Chip> and <Chip>user:email</Chip> for richer profile fields</>,
+        <>Leave everything else unticked — <Chip>repo</Chip>, <Chip>admin:org</Chip> and <Chip>user</Chip> all grant write access you do not need</>,
+        <>Copy the token and paste it into the Token field on the Fetch page</>,
+      ],
+    },
+    {
+      icon: <ShieldAlert size={20} />,
+      color: '#ef4444',
+      title: 'Using a fine-grained token instead?',
+      desc: 'Fine-grained tokens fail differently: they authenticate fine, then return 403 "Resource not accessible by personal access token" on exactly the three roles that matter. A classic token with public_repo is the simpler path.',
+      bullets: [
+        <>Set <strong className="text-white">Repository access</strong> to <Chip>All repositories</Chip>, or explicitly add the repo you are fetching</>,
+        <>Confirm <Chip>Metadata: Read-only</Chip> is listed — GitHub requires it for <Chip>/stargazers</Chip> and <Chip>/subscribers</Chip></>,
+        <>A token scoped to selected repos grants metadata only for repos actually in that list, so a repo you forgot to add still returns 403</>,
+        <>Use <strong className="text-white">Check</strong> next to the token field to verify before running a fetch</>,
       ],
     },
     {

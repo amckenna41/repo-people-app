@@ -50,9 +50,9 @@ overlapped in the Compare view to see who appears in which repo
 | `@tanstack/react-table` | `components/UserTable.tsx` | Sortable/filterable table |
 | `@tanstack/react-virtual` | `components/UserTable.tsx` | Row virtualization for large tables |
 | `react-simple-maps` | `components/WorldMap.tsx` | Geographic map |
-| `xlsx` | `ResultsView.tsx:299` (dynamic `import('xlsx')`) | Excel export, lazy-loaded |
-| `jspdf` | `ResultsView.tsx:227` (dynamic import) | PDF export, lazy-loaded |
-| `html2canvas` | `ResultsView.tsx:226` (dynamic import) | Rasterizes the report DOM for the PDF |
+| `xlsx` | `ResultsView.tsx` `exportExcel()` (dynamic `import('xlsx')`) | Excel export, lazy-loaded |
+| `jspdf` | `ResultsView.tsx` `exportPdf()` (dynamic import) | PDF export, lazy-loaded; also draws the vector cover page |
+| `html2canvas` | `ResultsView.tsx` `exportPdf()` (dynamic import) | Rasterizes the report DOM for the PDF; needs the colour shim and the animation freeze |
 
 All frontend runtime deps are actually imported. The heavy three
 (`xlsx`, `jspdf`, `html2canvas`) are code-split via dynamic `import()` and
@@ -88,13 +88,16 @@ manual chunks (`vite.config.ts:10-18`), so they don't load until an export runs.
 | `frontend/src/utils/errors.ts` | `friendlyFetchError` string mapper | Turning raw HTTP errors into prose | `FetchView` |
 | `frontend/src/types/index.ts` | TS interfaces + `ALL_ROLES` constant | Shared types; the *implicit* user schema | everything frontend |
 | `frontend/src/hooks/useNotification.ts` | Browser Notification wrapper | Desktop notification on fetch done | `FetchView` |
-| `frontend/src/hooks/useModalEscape.ts` | Escape-to-close + scroll lock | Consistent modal keyboard behaviour | all six modals |
+| `frontend/src/hooks/useModalEscape.ts` | Escape-to-close + scroll lock | Consistent modal keyboard behaviour | every modal, incl. the map's country and unmapped-user panels |
 | `frontend/src/utils/localResults.ts` | Client-side filter/sort/summary | Rendering a shared link, which has no backend job | `ResultsView` |
-| `frontend/src/utils/colors.ts` | oklch → rgb shim | PDF export; html2canvas cannot parse CSS Color 4 | `ResultsView` |
+| `frontend/src/utils/colors.ts` | Colour shim + animation freeze | PDF export; html2canvas cannot parse CSS Color 4, and a transitioning colour reports as oklab | `ResultsView` |
+| `frontend/src/utils/pdfPages.ts` | Page-break planning | Cutting the report canvas between sections, not through them | `ResultsView` |
+| `frontend/src/utils/pdfTitlePage.ts` | PDF cover page | Naming the repository, dates and per-role yield on page 1 | `ResultsView` |
 | `frontend/src/utils/estimate.ts` | Pre-flight fetch cost | Warning before an unbounded crawl | `FetchView` |
 | `frontend/src/components/VirtualList.tsx` | Row virtualization | Compare columns and the map modal | `CompareView`, `WorldMap` |
 | `tests/backend/` | pytest suites | Backend API + store tests | CI |
-| `frontend/src/tests/` | vitest suites | Frontend api/component tests | CI |
+| `tests/frontend/` | vitest suites | Frontend util/component tests | CI |
+| `tests/browser/` | Playwright script | The one check needing a real browser: PDF export (jsdom cannot model `color-mix`, oklab serialisation or CSS transitions) | `npm run test:browser` |
 | `vercel.json` | Vercel build + routes | One deploy target | Vercel |
 | `Dockerfile.cloudrun`, `cloudrun-service.yaml` | Cloud Run image + service | The other (primary) deploy target | GCP |
 | `backend/Dockerfile`, `docker-compose.yml` | Local containerized dev | Local-only | developers |
@@ -129,7 +132,9 @@ hop, in order:
      requests without an `X-Requested-With` header (§5). It is registered
      *before* `CORSMiddleware` so CORS stays outermost and the 403 is readable
      rather than surfacing as an opaque CORS failure.
-   - `FETCH_LIMIT` clamps `req.limit` (`main.py:189`).
+   - `FETCH_LIMIT` is passed to the worker as `max_total` (`_start_fetch`), a
+     hard ceiling on unique profiles fetched; `req.limit` is a separate
+     per-role cap applied in the worker.
    - `create_job_async` (`store.py:111`) inserts a `pending` row **and awaits
      it** before the worker starts (comment "B4" — avoids a worker-before-insert
      race), and registers a runtime overlay entry holding an `asyncio.Queue`.
@@ -199,9 +204,13 @@ Four tables:
   fetch request, for refresh), `repo_owner`/`repo_name` TEXT (denormalised so
   history can group runs of a repo), `logins_json` TEXT (the run's member list,
   denormalised from `result_json` so `/jobs/{id}/history` never parses a full
-  result blob; legacy rows are backfilled on first read), and `warnings_json`
+  result blob; legacy rows are backfilled on first read), `warnings_json`
   TEXT (per-role failures recorded during the fetch, so the reason a result set
-  came back short survives the SSE stream and the browser tab).
+  came back short survives the SSE stream and the browser tab), and
+  `role_counts_json` TEXT (usernames contributed per requested role — a role that
+  returns an *empty list* raises nothing and so produces no warning, making it
+  indistinguishable from one that was never asked for; the counts are the only
+  place that gap is visible after the fetch).
 - **Reads are split.** `_load_job_row(job_id, include_result=False)` selects an
   explicit column list omitting `result_json`. Ownership checks, renames, tag
   edits, deletes and SSE connects use it; only the routes that serve the payload
@@ -288,7 +297,7 @@ Backend env vars (read in `backend/main.py` unless noted):
 | `BACKEND_URL` | `main.py:48` | `http://localhost:8000` | OAuth `redirect_uri` wrong; also drives cookie `Secure` (`main.py:55`) |
 | `COOKIE_SAMESITE` | `main.py:56` | `lax` | Set to `none` for cross-origin frontend+backend; forces `Secure` |
 | `CORS_ORIGINS` | `main.py:129` | `localhost:5173,127.0.0.1:5173` | Browser blocks the real frontend origin |
-| `FETCH_LIMIT` | `main.py:36` | `500` | `0` disables the per-job cap (local installs) |
+| `FETCH_LIMIT` | `main.py`, module scope | `500` | `0` disables the per-job cap (local installs) |
 | `FETCH_RATE_LIMIT` | `main.py:62` | `20` | Requests/minute per caller |
 | `REPO_PEOPLE_DB` | `store.py:22` | file next to `store.py` | DB path; Cloud Run sets it to `/tmp/...` (`Dockerfile.cloudrun`) |
 | `ALLOW_DEV_CLEAR` | `main.py:796` | unset | `POST /clear_cache` stays 403 unless `1/true/yes` |
@@ -299,7 +308,7 @@ Frontend env vars (read via `import.meta.env`, defined in
 | Var | Read at | Breaks without it |
 |---|---|---|
 | `API_BASE_URL` | `api.ts:3`, `App.tsx:331` | Empty → all API calls are relative (dev proxy). Must point at the backend in a cross-origin deploy |
-| `VITE_FETCH_LIMIT` | `FetchView.tsx:74` | UI-side cap; **must be kept in sync manually** with backend `FETCH_LIMIT` (two independent sources of the same number) |
+| `VITE_FETCH_LIMIT` | `FetchView.tsx`, `FETCH_LIMIT` memo | UI-side cap; **must be kept in sync manually** with backend `FETCH_LIMIT` (two independent sources of the same number) |
 
 **Secrets.** `backend/.env` on this machine contains a real-looking
 `GITHUB_CLIENT_SECRET`. It is **git-ignored** (`.gitignore` `.env` entry) and
@@ -361,7 +370,7 @@ gives reproducible builds and controlled upgrades. **[justified]**
 **Token in `Authorization` header, not body** (`api.ts:79`, `models.py:12`).
 Keeps the PAT out of request logs/bodies. **[justified]**
 
-**Lazy-loaded export libraries** (`ResultsView.tsx:226-299`, `vite.config.ts`).
+**Lazy-loaded export libraries** (`ResultsView.tsx` export handlers, `vite.config.ts`).
 `xlsx`/`jspdf`/`html2canvas` are large and rarely used; dynamic `import()` keeps
 them out of the initial bundle. **[justified]**
 
@@ -393,10 +402,10 @@ Things that will bite the next maintainer:
    in. If `repo-people` ever drops it, the worker breaks with no signal from
    this repo's manifests.
 
-3. **`FETCH_LIMIT` is defined twice.** Backend `FETCH_LIMIT` (`main.py:36`) and
-   frontend `VITE_FETCH_LIMIT` (`FetchView.tsx:74`, `.env.production`) are
-   independent. They can silently disagree; the backend clamp (`main.py:189`) is
-   the only real enforcement.
+3. **`FETCH_LIMIT` is defined twice.** Backend `FETCH_LIMIT` (`main.py`) and
+   frontend `VITE_FETCH_LIMIT` (`FetchView.tsx`, `.env.production`) are
+   independent. They can silently disagree; the backend's `max_total` ceiling,
+   enforced in the worker, is the only real enforcement.
 
 4. **The client↔backend URL base is applied inconsistently.**
    - `FetchView.tsx:294` opens the SSE stream as `/fetch/${id}/stream` (no

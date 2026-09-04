@@ -11,7 +11,9 @@ import UserTable from '../components/UserTable'
 import type { SortingState } from '@tanstack/react-table'
 import { type FilterState, EMPTY_FILTERS } from '../utils/segments'
 import { toCsv, xlsxCell, downloadText } from '../utils/csv'
-import { inlineComputedColors, buildColorVariableOverrides } from '../utils/colors'
+import { inlineComputedColors, inlineColorsWithUndo, buildColorVariableOverrides } from '../utils/colors'
+import { planPages } from '../utils/pdfPages'
+import { drawTitlePage } from '../utils/pdfTitlePage'
 import { filterAndSortUsers, computeSummary } from '../utils/localResults'
 import { useModalEscape } from '../hooks/useModalEscape'
 const UserDrawer = lazy(() => import('../components/UserDrawer'))
@@ -47,6 +49,12 @@ const FIRST_PAGE_SIZE = 200
 // Move the aggregates server-side if anyone actually explores six-figure result
 // sets in this UI.
 const PAGE_SIZE = 1000
+
+/** Page margin for the PDF export, in mm. The old export ran content flush to
+ *  the paper edge, which reads as a screenshot rather than a report. */
+const PDF_MARGIN_MM = 8
+/** JPEG quality for the exported page images. */
+const PDF_JPEG_QUALITY = 0.92
 
 function relativeTime(iso?: string): string {
   if (!iso) return ''
@@ -116,6 +124,9 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const [error, setError] = useState<string | null>(null)
   // Persisted per-job fetch warnings, e.g. a role that collected nothing.
   const [jobWarnings, setJobWarnings] = useState<string[]>([])
+  // Usernames each requested role contributed. A role at 0 raised no error and
+  // so produced no warning — it is only visible here.
+  const [roleCounts, setRoleCounts] = useState<Record<string, number>>({})
   const [renamingJobId, setRenamingJobId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -182,6 +193,30 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   const filteredDoneJobs = tagFilter.length === 0
     ? doneJobs
     : doneJobs.filter(j => tagFilter.some(t => (j.tags ?? []).includes(t)))
+
+  // The job picker was a native <select>. Options there can hold text and
+  // nothing else, so a per-job delete control had nowhere to live — the only
+  // way to drop a job was to select it first, then hit the bin icon beside the
+  // picker. This is the same list rendered as buttons so each row can carry its
+  // own action.
+  const [jobMenuOpen, setJobMenuOpen] = useState(false)
+  const jobMenuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!jobMenuOpen) return
+    function onPointerDown(e: PointerEvent) {
+      if (jobMenuRef.current && !jobMenuRef.current.contains(e.target as Node)) setJobMenuOpen(false)
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setJobMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [jobMenuOpen])
 
   /** Map the UI filter state onto the server's query parameters. */
   const serverFilters = useMemo<ResultFilters>(() => ({
@@ -288,6 +323,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       setUnfilteredTotal(local.length)
       setSummary(computeSummary(rows))
       setJobWarnings([])
+      setRoleCounts({})
       setLoading(false)
       return
     }
@@ -304,6 +340,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       setTotalUsers(pageData.total)
       setUnfilteredTotal(pageData.unfiltered_total ?? pageData.total)
       setJobWarnings(pageData.warnings ?? [])
+      setRoleCounts(pageData.role_counts ?? {})
       setSummary(sum)
       onUsersLoaded?.(jobId, loadedUsers)
       if (loadedUsers.length < pageData.total) {
@@ -397,9 +434,29 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
   async function exportPdf() {
     if (!reportRef.current) return
     setExporting(true)
+    let undoColors: (() => void) | null = null
     try {
+      // Let React commit and the browser paint before the blocking work starts.
+      // html2canvas and the per-page toDataURL calls hold the main thread, so
+      // without this the button never renders its spinning state at all — it
+      // jumps straight from "Export PDF" to the download.
+      await new Promise(requestAnimationFrame)
+      await new Promise(requestAnimationFrame)
       const html2canvas = (await import('html2canvas')).default
       const { jsPDF } = await import('jspdf')
+      // Convert unsupported colours on the *live* DOM before cloning.
+      //
+      // Doing it only in `onclone` is not enough: inside html2canvas's iframe a
+      // production build's stylesheet <link> has often not parsed when that
+      // callback runs, so every computed value read there is a browser default
+      // and the scan quietly patches nothing. It also cannot help with values
+      // the variable override misses — `--color-white` is `#fff`, not oklch, so
+      // `bg-white/10` still resolves to `oklab(1 0 0 / 0.1)` no matter what the
+      // palette variables say, and only an element-level patch reaches it.
+      //
+      // Nothing changes on screen: each replacement is the same colour sampled
+      // through a canvas. `undoColors` runs in the finally below.
+      undoColors = inlineColorsWithUndo(reportRef.current)
       const canvas = await html2canvas(reportRef.current, {
         scale: 2,
         useCORS: true,
@@ -413,7 +470,14 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
           //    utility reads the palette through var(), so this fixes all of
           //    them at once — including <html>/<body>, whose background
           //    html2canvas inspects before parsing this subtree.
-          const overrides = buildColorVariableOverrides(clonedDoc)
+          // Read the palette off the *live* document first. The clone's
+          // stylesheets arrive as a <link> inside html2canvas's iframe, and in a
+          // production build that link has not necessarily parsed by the time
+          // this runs — `clonedDoc.styleSheets` is then empty and every
+          // var(--color-*) stays oklch. The live document always has them, and
+          // they are the same sheets.
+          const overrides = buildColorVariableOverrides(document)
+            || buildColorVariableOverrides(clonedDoc)
           if (overrides) {
             const style = clonedDoc.createElement('style')
             style.textContent = overrides
@@ -424,25 +488,86 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
           inlineComputedColors(element)
         },
       })
-      const imgData = canvas.toDataURL('image/png')
       const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
       const pdfW = pdf.internal.pageSize.getWidth()
       const pdfH = pdf.internal.pageSize.getHeight()
-      const imgH = (canvas.height * pdfW) / canvas.width
-      let remaining = imgH
-      let offset = 0
-      while (remaining > 0) {
-        if (offset > 0) pdf.addPage()
-        pdf.addImage(imgData, 'PNG', 0, -offset, pdfW, imgH)
-        offset += pdfH
-        remaining -= pdfH
+      const usableW = pdfW - PDF_MARGIN_MM * 2
+      const usableH = pdfH - PDF_MARGIN_MM * 2
+      const pxPerMm = canvas.width / usableW   // canvas pixels per mm of paper
+
+      // Where a page may be cut, in canvas pixels from the top of the report.
+      //
+      // `reportRef` is a `space-y-6` stack, so every gap between its children is
+      // safe. Cutting at a section's *top* rather than its bottom leaves the
+      // 24px gap on the page being finished instead of carrying it to the top of
+      // the next one, which is 10pt of every page reclaimed and, more than once,
+      // the difference between a section fitting and not.
+      //
+      // Containers marked `data-pdf-rows` are stacks of independent rows — a
+      // table body, the leaderboard — where cutting between rows is normal in
+      // print. Without them a tall list is atomic, and the page before it ends
+      // wherever it happens to end: this report was 5 pages of content that fits
+      // in 3, with pages 36% and 39% full.
+      const reportBox = reportRef.current.getBoundingClientRect()
+      const cssToCanvas = canvas.height / reportBox.height
+      const toCanvasY = (clientY: number) => (clientY - reportBox.top) * cssToCanvas
+
+      const breaks: number[] = []
+      for (const section of Array.from(reportRef.current.children)) {
+        breaks.push(toCanvasY(section.getBoundingClientRect().top))
+        for (const row of Array.from(section.querySelectorAll('[data-pdf-rows] > *'))) {
+          breaks.push(toCanvasY(row.getBoundingClientRect().top))
+        }
+      }
+
+      const pages = planPages({
+        contentHeight: canvas.height,
+        pageHeight: Math.floor(usableH * pxPerMm),
+        breaks,
+      })
+
+      // Cover page. Drawn with jsPDF's own text primitives rather than captured
+      // from the DOM: it stays vector (selectable, searchable, sharp at any
+      // zoom) and costs nothing in file size.
+      drawTitlePage(pdf, {
+        job: doneJobs.find(j => j.job_id === activeJobId),
+        summary,
+        roleCounts,
+        warnings: jobWarnings,
+        totalUsers,
+        unfilteredTotal,
+      }, PDF_MARGIN_MM)
+
+      // Each page carries only its own slice. Drawing the full canvas at a
+      // negative offset — the previous approach — put the whole report on every
+      // page and relied on the crop to hide it.
+      const slice = document.createElement('canvas')
+      const sctx = slice.getContext('2d')
+      if (!sctx) throw new Error('Could not create the page canvas.')
+      for (const page of pages) {
+        pdf.addPage()   // the cover is always page 1
+        slice.width = canvas.width
+        slice.height = Math.round(page.height)
+        sctx.fillStyle = '#050510'
+        sctx.fillRect(0, 0, slice.width, slice.height)
+        sctx.drawImage(canvas, 0, Math.round(page.y), canvas.width, slice.height,
+                       0, 0, canvas.width, slice.height)
+        // JPEG, not PNG. The report is a dark, gradient-heavy screenshot, which
+        // PNG cannot compress — the same pages measured 68MB as PNG and 1.1MB as
+        // JPEG at identical resolution.
+        pdf.addImage(slice.toDataURL('image/jpeg', PDF_JPEG_QUALITY), 'JPEG',
+                     PDF_MARGIN_MM, PDF_MARGIN_MM, usableW, slice.height / pxPerMm)
       }
       const label = doneJobs.find(j => j.job_id === activeJobId)?.label ?? activeJobId ?? 'report'
       pdf.save(`repo-people_${label.replace(/\//g, '_')}_report.pdf`)
+      // save() builds the blob and clicks the link synchronously; yield once so
+      // the browser has handed the file off before the spinner is cleared.
+      await new Promise(requestAnimationFrame)
     } catch (e) {
       console.error('PDF export failed:', e)
       alert(`PDF export failed: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
+      undoColors?.()
       setExporting(false)
     }
   }
@@ -606,8 +731,11 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
     )
   }
 
+  // `role` stays the raw key — ROLE_COLORS, the Top Role card and the overlap
+  // pairs all index on it. `label` is only for display on the axis.
   const roleDistData = summary
-    ? Object.entries(summary.role_distribution).map(([role, count]) => ({ role, count }))
+    ? Object.entries(summary.role_distribution)
+        .map(([role, count]) => ({ role, count, label: role.replace(/_/g, ' ') }))
     : []
 
   const ageDistData = summary
@@ -862,17 +990,81 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
       {/* Job selector */}
       <div className="flex items-center gap-3 flex-wrap">
         <label className="text-sm text-gray-400">Job:</label>
-        <select
-          className="input max-w-xs"
-          value={activeJobId ?? ''}
-          onChange={e => setActiveJobId(e.target.value)}
-        >
-          {filteredDoneJobs.map(j => (
-            <option key={j.job_id} value={j.job_id}>
-              {j.label ?? j.job_id} ({j.total_fetched} users)
-            </option>
-          ))}
-        </select>
+        <div ref={jobMenuRef} className="relative">
+          <button
+            type="button"
+            className="input max-w-xs flex items-center justify-between gap-2 text-left"
+            aria-haspopup="listbox"
+            aria-expanded={jobMenuOpen}
+            onClick={() => setJobMenuOpen(o => !o)}
+          >
+            <span className="truncate">
+              {(() => {
+                const active = filteredDoneJobs.find(j => j.job_id === activeJobId)
+                return active
+                  ? `${active.label ?? active.job_id} (${active.total_fetched} users)`
+                  : 'Select a job'
+              })()}
+            </span>
+            <ChevronDown size={13} className="shrink-0 text-gray-500" />
+          </button>
+
+          {jobMenuOpen && (
+            <div
+              role="listbox"
+              className="absolute left-0 top-full mt-1 z-30 w-80 max-w-[calc(100vw-2rem)] max-h-72 overflow-y-auto rounded-lg shadow-xl p-1"
+              style={{
+                background: 'rgba(20,16,48,0.97)',
+                border: '1px solid rgba(255,255,255,0.10)',
+                backdropFilter: 'blur(12px)',
+              }}
+            >
+              {filteredDoneJobs.length === 0 && (
+                <p className="text-xs text-gray-500 px-3 py-2">No jobs match the current tag filter.</p>
+              )}
+              {filteredDoneJobs.map(j => {
+                const isActive = j.job_id === activeJobId
+                return (
+                  <div
+                    key={j.job_id}
+                    className="group flex items-center gap-1 rounded-md hover:bg-white/5"
+                    style={isActive ? { background: 'rgba(139,92,246,0.16)' } : undefined}
+                  >
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={isActive}
+                      onClick={() => { setActiveJobId(j.job_id); setJobMenuOpen(false) }}
+                      className="flex-1 min-w-0 text-left px-2.5 py-2 text-xs"
+                      style={{ color: isActive ? '#e9d5ff' : '#d1d5db' }}
+                    >
+                      <span className="block truncate">{j.label ?? j.job_id}</span>
+                      <span className="block text-[11px] text-gray-500">{j.total_fetched} users</span>
+                    </button>
+                    {!isReadOnly && onJobDelete && (
+                      <button
+                        type="button"
+                        title={`Delete ${j.label ?? j.job_id}`}
+                        aria-label={`Delete ${j.label ?? j.job_id}`}
+                        onClick={e => {
+                          // Without this the row button underneath also fires and
+                          // selects the job we are about to delete.
+                          e.stopPropagation()
+                          if (confirm(`Delete "${j.label ?? j.job_id}" and all its data? This cannot be undone.`)) {
+                            onJobDelete(j.job_id)
+                          }
+                        }}
+                        className="shrink-0 mr-1 p-1.5 rounded-md text-gray-600 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                      >
+                        <XIcon size={13} />
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
         {isReadOnly && (
           <span
             className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-md"
@@ -1194,6 +1386,33 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
             </div>
           )}
 
+          {/* Per-role yield. The counts were streamed to the fetch log and
+              nowhere else, so by the time anyone read the results the fact that
+              a role contributed nothing was gone. A zero here is the quiet
+              failure the warnings banner above cannot catch: the role was
+              requested, GitHub answered, and the answer was empty. */}
+          {Object.keys(roleCounts).length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <span className="text-gray-500">Collected per role:</span>
+              {Object.entries(roleCounts)
+                .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+                .map(([role, n]) => (
+                  <span
+                    key={role}
+                    className="px-2 py-0.5 rounded-full"
+                    title={n === 0
+                      ? `${role} returned no users — usually a token without the scope for this role`
+                      : `${role} contributed ${n} username${n === 1 ? '' : 's'} before de-duplication`}
+                    style={n === 0
+                      ? { background: 'rgba(217,119,6,0.12)', border: '1px solid rgba(217,119,6,0.35)', color: '#fcd34d' }
+                      : { background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)', color: '#d1d5db' }}
+                  >
+                    {role} <span className={n === 0 ? 'font-semibold' : 'text-gray-500'}>{n}</span>
+                  </span>
+                ))}
+            </div>
+          )}
+
           {/* Everything below aggregates `users`, so say plainly when that is
               not yet (or cannot be) the whole result set. */}
           {(!coverageComplete || truncated) && (
@@ -1224,10 +1443,20 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 Role Distribution
                 <ChartInfo text="Shows how many users fall into each fetched role (e.g. stargazers, contributors, maintainers)." />
               </h3>
-              <ResponsiveContainer width="100%" height={220}>
+              {/* Height scales with the row count and the axis forces every
+                  tick. At a fixed 220px Recharts silently dropped the category
+                  labels it could not fit, so a nine-role fetch rendered nine
+                  bars against five names. */}
+              <ResponsiveContainer width="100%" height={Math.max(220, roleDistData.length * 28 + 30)}>
                 <BarChart data={roleDistData} layout="vertical" margin={{ left: 10, right: 16 }}>
-                  <XAxis type="number" tick={{ fill: '#9ca3af', fontSize: 11 }} />
-                  <YAxis type="category" dataKey="role" width={100} tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                  <YAxis
+                    type="category"
+                    dataKey="label"
+                    width={112}
+                    interval={0}
+                    tick={{ fill: '#d1d5db', fontSize: 11 }}
+                  />
                   <Tooltip
                     {...TOOLTIP_BASE}
                     cursor={BAR_CURSOR}
@@ -1287,7 +1516,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
           {/* Health score + Contributor funnel */}
           {(healthScore || funnelData.length > 0) && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className={pairGrid(Boolean(healthScore) && funnelData.length > 0)}>
               {healthScore && (
                 <div className="card">
                   <h3 className="text-sm font-semibold gradient-heading mb-4 flex items-center gap-1.5">
@@ -1354,7 +1583,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
           {/* Geographic distribution + Language landscape */}
           {(locationData.length > 0 || languageData.length > 0) && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className={pairGrid(locationData.length > 0 && languageData.length > 0)}>
               {locationData.length > 0 && (
                 <div className="card">
                   <h3 className="text-sm font-semibold gradient-heading mb-3 flex items-center gap-1.5">
@@ -1392,7 +1621,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
 
           {/* Org mapping + Email domain analysis */}
           {(orgData.length > 0 || emailDomainData.length > 0) && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className={pairGrid(orgData.length > 0 && emailDomainData.length > 0)}>
               {orgData.length > 0 && (
                 <div className="card">
                   <h3 className="text-sm font-semibold gradient-heading mb-3 flex items-center gap-1.5">
@@ -1744,7 +1973,7 @@ export default function ResultsView({ jobs, activeJobId, setActiveJobId, groupJo
                 ))}
               </div>
             </div>
-            <div className="space-y-2">
+            <div className="space-y-2" data-pdf-rows>
               {Array.isArray(topUsers) && topUsers.map((u, i) => {
                 const stat = (u as unknown as Record<string, unknown>)[topBy]
                 return (
@@ -1943,6 +2172,14 @@ function SummaryCard({
       </div>
     </div>
   )
+}
+
+/** Class list for a two-up chart row. Each of these rows renders its two cards
+ *  conditionally, so when only one has data the other grid cell stays empty and
+ *  leaves a card-sized hole beside it. Collapse to a single full-width column in
+ *  that case rather than laying out a phantom second column. */
+function pairGrid(both: boolean): string {
+  return `grid grid-cols-1 gap-4${both ? ' lg:grid-cols-2' : ''}`
 }
 
 function ChartInfo({ text }: { text: string }) {

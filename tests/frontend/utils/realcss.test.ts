@@ -22,6 +22,15 @@ describe.skipIf(!cssFile)('built stylesheet', () => {
     expect(css).toContain('oklch(')
   })
 
+  it('detects the color-mix values the real stylesheet emits', () => {
+    // Tailwind v4 compiles every opacity modifier (bg-white/5, hover:bg-white/10)
+    // to color-mix(in oklab, …). `color(` does not match `color-mix(`, so these
+    // passed the gate untouched and reached html2canvas.
+    const mixes = [...css.matchAll(/[a-z-]+:\s*(color-mix\([^;}]*\))/g)].map(m => m[1])
+    expect(mixes.length).toBeGreaterThan(0)
+    expect(mixes.every(hasUnsupportedColor)).toBe(true)
+  })
+
   it('overrides every oklch custom property the real stylesheet defines', () => {
     const style = document.createElement('style')
     style.textContent = css

@@ -44,7 +44,10 @@ Key features:
 - **Sortable, filterable data table** — powered by TanStack Table with per-column filtering and a global search modal
 - **User detail drawer** — click any row to expand a full profile panel with all fetched fields
 - **Job comparison** — side-by-side diff of two completed jobs showing unique, shared, and overlapping users with statistics
-- **Data export** — download full results as JSON or CSV from any completed job
+- **Data export** — download full results as JSON, CSV, Excel or Markdown from any completed job
+- **PDF report** — a paginated report with a cover page naming the repository, when it was
+  collected, the per-role yield and which roles returned nothing; pages break between
+  sections rather than through them
 - **Multi-job management** — rename, tag, cancel, and browse all past collection jobs from a single view
 - **Import** — load previously exported JSON back into the app to re-analyse or compare without re-fetching
 
@@ -125,7 +128,7 @@ docker compose up --build
 | DELETE | `/jobs/{job_id}` | Delete a job |
 | PATCH | `/jobs/{job_id}` | Rename a job (body: `{"label": "..."}`) |
 | PATCH | `/jobs/{job_id}/tags` | Update tags on a job (body: `{"tags": [...]}`) |
-| GET | `/results/{job_id}` | Paginated user data — accepts `?page=1&page_size=200`, all filter params, and returns any `warnings` recorded during the fetch |
+| GET | `/results/{job_id}` | Paginated user data — accepts `?page=1&page_size=200`, all filter params, and returns any `warnings` recorded during the fetch plus `role_counts` (usernames contributed per requested role; `0` means the role was asked for and returned nothing) |
 | GET | `/results/{job_id}/summary` | Aggregated summary stats (cached after first call) |
 | GET | `/results/{job_id}/top` | Top N users by field |
 | POST | `/compare` | Compare two jobs |
@@ -306,10 +309,26 @@ npm run test:coverage # with coverage report
 
 Frontend tests use **Vitest** + **@testing-library/react** with a jsdom environment.
 
+### Browser
+
+```bash
+cd frontend
+npm run build          # the check reads the real built stylesheet
+npm run test:browser   # requires: npm i -D playwright && npx playwright install chromium
+```
+
+One check (`tests/browser/pdf-export.mjs`) runs in real Chromium, because jsdom cannot
+model what the PDF export depends on: it does not resolve `color-mix()`, does not
+serialise computed colours in oklab, and does not run CSS transitions. It renders every
+utility class the report code can emit and asserts the colour shim leaves nothing
+html2canvas cannot parse, that page breaks land on section boundaries, that pages are
+packed, and that a PDF is actually produced. It is **not** part of `npm test` and skips
+with exit `0` when Playwright, its browser, or a build is missing.
+
 ### Coverage
 
-**318 passed backend**, **214 frontend**. Neither suite makes a real network call — a
-guard asserts this for the backend, and the frontend stubs `fetch`.
+**330 passed backend**, **273 frontend**, plus the browser check. Neither suite makes a
+real network call — a guard asserts this for the backend, and the frontend stubs `fetch`.
 
 | Area | Suite |
 |---|---|
@@ -319,8 +338,9 @@ guard asserts this for the backend, and the frontend stubs `fetch`.
 | Performance | `test_performance` — metadata-only reads, executor limits, SQLite contention, persisted warnings, `Retry-After`, retention |
 | Worker | `test_worker` — per-role error classification |
 | Repo hygiene | `test_repo_hygiene` — conflict markers, requirements parse, lockfile sync |
-| Frontend utils | `api`, `colors`, `csv`, `errors`, `estimate`, `localResults`, `segments`, `apiFilters` |
-| Frontend components | `UserTable`, `RoleBadges` |
+| Frontend utils | `api`, `colors`, `contrast`, `csv`, `errors`, `estimate`, `localResults`, `pdfPages`, `pdfTitlePage`, `realcss`, `segments`, `apiFilters` |
+| Frontend components | `UserTable`, `RoleBadges`, `WorldMap` (location resolution) |
+| Browser (real Chromium) | `tests/browser/pdf-export.mjs` — colour shim, page breaks, page packing, PDF output |
 
 ## Changelog
 See [CHANGELOG.md](CHANGELOG.md) for a full history of additions, changes, fixes, and security improvements.
