@@ -1,7 +1,7 @@
 fastapi>=0.141.1
 uvicorn[standard]>=0.52.4
 python-dotenv>=1.2.3
-sse-starlette>=3.4.8
+sse-starlette>=3.4.11
 aiosqlite>=0.22.1
 # Postgres backend for the job store. Only imported when DATABASE_URL is set;
 # without it the app falls back to SQLite (see backend/store.py).
