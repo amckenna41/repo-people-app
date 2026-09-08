@@ -13,4 +13,4 @@ cryptography>=50.0.1
 # Pinned to an exact PyPI release for reproducible builds across every deploy
 # target (local, Vercel, Cloud Run, CI). Bump deliberately — Dependabot opens a
 # PR when a new release is published (.github/dependabot.yml).
-repo-people==1.1.0
+repo-people==1.1.1
